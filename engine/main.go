@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // פונקציה שסורקת את התיקייה ומחזירה רשימת שמות קבצים
@@ -79,7 +80,26 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dstPath := filepath.Join("shared_files", fileName)
+	ext := filepath.Ext(fileName)
+	base := strings.TrimSuffix(fileName, ext)
+	finalName := fileName
+	serial := 1
+
+	for {
+		dstPath := filepath.Join("shared_files", finalName)
+		_, err := os.Stat(dstPath)
+		if os.IsNotExist(err) {
+			break
+		}
+		if err != nil {
+			http.Error(w, "Unable to check existing files", http.StatusInternalServerError)
+			return
+		}
+		finalName = fmt.Sprintf("%s (%d)%s", base, serial, ext)
+		serial++
+	}
+
+	dstPath := filepath.Join("shared_files", finalName)
 	dst, err := os.Create(dstPath)
 	if err != nil {
 		http.Error(w, "Unable to save file", http.StatusInternalServerError)
