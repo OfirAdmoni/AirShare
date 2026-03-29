@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'dart:convert';
 import 'dart:io';
+import 'package:file_picker/file_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
@@ -76,6 +77,48 @@ class _FileListScreenState extends State<FileListScreen> {
     }
   }
 
+  Future<void> pickAndUploadFile() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(withData: true);
+      if (result == null || result.files.isEmpty) {
+        return;
+      }
+
+      final picked = result.files.first;
+      final request = http.MultipartRequest(
+        'POST',
+        Uri.parse('http://localhost:8080/upload'),
+      );
+
+      if (picked.path != null) {
+        request.files.add(await http.MultipartFile.fromPath('file', picked.path!));
+      } else if (picked.bytes != null) {
+        request.files.add(
+          http.MultipartFile.fromBytes('file', picked.bytes!, filename: picked.name),
+        );
+      } else {
+        throw Exception('Could not read selected file');
+      }
+
+      final streamedResponse = await request.send();
+      if (streamedResponse.statusCode != 201) {
+        throw Exception('Upload failed (${streamedResponse.statusCode})');
+      }
+
+      await fetchFiles();
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Uploaded: ${picked.name}')));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Upload error: $e')));
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -102,8 +145,8 @@ class _FileListScreenState extends State<FileListScreen> {
               },
             ),
       floatingActionButton: FloatingActionButton(
-        onPressed: fetchFiles,
-        child: const Icon(Icons.refresh),
+        onPressed: pickAndUploadFile,
+        child: const Icon(Icons.add),
       ),
     );
   }
