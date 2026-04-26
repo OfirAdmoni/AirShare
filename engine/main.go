@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -118,10 +119,56 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Uploaded"))
 }
 
-func startMDNSServer(port int) (*mdns.Server, error) {
-	hostName, err := os.Hostname()
+func getLocalIPv4() (net.IP, error) {
+	interfaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
+	}
+
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+
+			ip = ip.To4()
+			if ip == nil {
+				continue
+			}
+
+			return ip, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no non-loopback IPv4 address found")
+}
+
+func startMDNSServer(port int) (*mdns.Server, net.IP, error) {
+	hostName, err := os.Hostname()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	localIP, err := getLocalIPv4()
+	if err != nil {
+		return nil, nil, err
 	}
 
 	service, err := mdns.NewMDNSService(
@@ -130,19 +177,22 @@ func startMDNSServer(port int) (*mdns.Server, error) {
 		"",
 		"",
 		port,
-		nil,
-		[]string{fmt.Sprintf("hostname=%s", hostName)},
+		[]net.IP{localIP},
+		[]string{
+			fmt.Sprintf("hostname=%s", hostName),
+			fmt.Sprintf("ip=%s", localIP.String()),
+		},
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	server, err := mdns.NewServer(&mdns.Config{Zone: service})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return server, nil
+	return server, localIP, nil
 }
 
 func main() {
@@ -153,14 +203,17 @@ func main() {
 	http.HandleFunc("/download", downloadFile)
 	http.HandleFunc("/upload", uploadFile)
 
-	mdnsServer, err := startMDNSServer(8080)
+	mdnsServer, localIP, err := startMDNSServer(8080)
 	if err != nil {
-		fmt.Printf("Failed to start mDNS: %v\n", err)
+		fmt.Printf("ERROR: Failed to start mDNS server: %v\n", err)
 	} else {
 		defer mdnsServer.Shutdown()
+		fmt.Printf("mDNS is broadcasting on IP: %s\n", localIP.String())
 		fmt.Println("mDNS service started: _airshare._tcp on port 8080")
 	}
 
 	fmt.Println("AirShare Engine is scanning 'shared_files' on port 8080...")
-	http.ListenAndServe("0.0.0.0:8080", nil)
+	if err := http.ListenAndServe("0.0.0.0:8080", nil); err != nil {
+		fmt.Printf("ERROR: HTTP server failed on 0.0.0.0:8080: %v\n", err)
+	}
 }
