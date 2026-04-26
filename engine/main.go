@@ -125,6 +125,8 @@ func getLocalIPv4() (net.IP, error) {
 		return nil, err
 	}
 
+	var fallbackIPs []net.IP
+
 	for _, iface := range interfaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
@@ -153,11 +155,26 @@ func getLocalIPv4() (net.IP, error) {
 				continue
 			}
 
-			return ip, nil
+			ipStr := ip.String()
+			if strings.HasPrefix(ipStr, "169.254.") || strings.HasPrefix(ipStr, "192.168.56.") {
+				continue
+			}
+
+			// Prefer common real LAN ranges first (Wi-Fi/home router/VPN).
+			if strings.HasPrefix(ipStr, "192.168.1.") || strings.HasPrefix(ipStr, "10.") {
+				return ip, nil
+			}
+
+			// Keep other non-virtual, non-link-local candidates as fallback.
+			fallbackIPs = append(fallbackIPs, ip)
 		}
 	}
 
-	return nil, fmt.Errorf("no non-loopback IPv4 address found")
+	if len(fallbackIPs) > 0 {
+		return fallbackIPs[0], nil
+	}
+
+	return nil, fmt.Errorf("no suitable non-loopback IPv4 address found")
 }
 
 func startMDNSServer(port int) (*mdns.Server, net.IP, error) {
@@ -208,6 +225,7 @@ func main() {
 		fmt.Printf("ERROR: Failed to start mDNS server: %v\n", err)
 	} else {
 		defer mdnsServer.Shutdown()
+		fmt.Printf("REAL Wi-Fi IP detected: %s\n", localIP.String())
 		fmt.Printf("mDNS is broadcasting on IP: %s\n", localIP.String())
 		fmt.Println("mDNS service started: _airshare._tcp on port 8080")
 	}
