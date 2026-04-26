@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/hashicorp/mdns"
 )
 
 // פונקציה שסורקת את התיקייה ומחזירה רשימת שמות קבצים
@@ -116,6 +118,33 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Uploaded"))
 }
 
+func startMDNSServer(port int) (*mdns.Server, error) {
+	hostName, err := os.Hostname()
+	if err != nil {
+		return nil, err
+	}
+
+	service, err := mdns.NewMDNSService(
+		hostName,
+		"_airshare._tcp",
+		"",
+		"",
+		port,
+		nil,
+		[]string{fmt.Sprintf("hostname=%s", hostName)},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	server, err := mdns.NewServer(&mdns.Config{Zone: service})
+	if err != nil {
+		return nil, err
+	}
+
+	return server, nil
+}
+
 func main() {
 	// יצירת תיקייה אם היא לא קיימת (למקרה ששכחת)
 	os.Mkdir("shared_files", 0755)
@@ -124,6 +153,14 @@ func main() {
 	http.HandleFunc("/download", downloadFile)
 	http.HandleFunc("/upload", uploadFile)
 
+	mdnsServer, err := startMDNSServer(8080)
+	if err != nil {
+		fmt.Printf("Failed to start mDNS: %v\n", err)
+	} else {
+		defer mdnsServer.Shutdown()
+		fmt.Println("mDNS service started: _airshare._tcp on port 8080")
+	}
+
 	fmt.Println("AirShare Engine is scanning 'shared_files' on port 8080...")
-	http.ListenAndServe(":8080", nil)
+	http.ListenAndServe("0.0.0.0:8080", nil)
 }
