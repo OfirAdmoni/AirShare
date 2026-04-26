@@ -18,12 +18,16 @@ class AirShareApp extends StatelessWidget {
     return MaterialApp(
       title: 'AirShare',
       theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
-      home: DiscoveryPage(
-        onServerSelected: (host) {
-          Navigator.of(context).pushReplacement(
-            MaterialPageRoute(builder: (_) => FileListScreen(serverHost: host)),
-          );
-        },
+      home: Builder(
+        builder: (navigatorContext) => DiscoveryPage(
+          onServerSelected: (host) {
+            Navigator.of(navigatorContext).pushReplacement(
+              MaterialPageRoute(
+                builder: (_) => FileListScreen(serverHost: host),
+              ),
+            );
+          },
+        ),
       ),
     );
   }
