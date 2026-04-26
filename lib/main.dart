@@ -66,11 +66,11 @@ class _FileListScreenState extends State<FileListScreen> {
 
   Future<Directory> _resolveDownloadDirectory() async {
     if (Platform.isAndroid) {
-      final downloadsDir = await getDownloadsDirectory();
-      if (downloadsDir != null) {
-        return downloadsDir;
+      final airShareDir = Directory('/storage/emulated/0/Download/AirShare');
+      if (!await airShareDir.exists()) {
+        await airShareDir.create(recursive: true);
       }
-      throw Exception('Could not access Downloads directory');
+      return airShareDir;
     }
 
     if (Platform.isIOS) {
