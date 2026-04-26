@@ -44,6 +44,9 @@ class FileListScreen extends StatefulWidget {
 
 class _FileListScreenState extends State<FileListScreen> {
   List<dynamic> files = [];
+  bool isDownloading = false;
+  double downloadProgress = 0;
+  String? downloadingFileName;
 
   String get baseUrl => 'http://${widget.serverHost}:8080';
 
@@ -61,24 +64,71 @@ class _FileListScreenState extends State<FileListScreen> {
     }
   }
 
+  Future<Directory> _resolveDownloadDirectory() async {
+    if (Platform.isAndroid) {
+      final downloadsDir = await getDownloadsDirectory();
+      if (downloadsDir != null) {
+        return downloadsDir;
+      }
+      throw Exception('Could not access Downloads directory');
+    }
+
+    if (Platform.isIOS) {
+      return getApplicationDocumentsDirectory();
+    }
+
+    final fallbackDir = await getDownloadsDirectory();
+    if (fallbackDir != null) {
+      return fallbackDir;
+    }
+    return getApplicationDocumentsDirectory();
+  }
+
   Future<void> downloadFile(String fileName) async {
+    setState(() {
+      isDownloading = true;
+      downloadProgress = 0;
+      downloadingFileName = fileName;
+    });
+
+    final client = http.Client();
     try {
       final uri = Uri.parse(
         '$baseUrl/download?name=${Uri.encodeComponent(fileName)}',
       );
-      final response = await http.get(uri);
+      final request = http.Request('GET', uri);
+      final response = await client.send(request);
 
-      if (response.statusCode != 200) {
+      if (response.statusCode != HttpStatus.ok) {
         throw Exception('Download failed (${response.statusCode})');
       }
 
-      final downloadsDir = await getDownloadsDirectory();
-      if (downloadsDir == null) {
-        throw Exception('Could not access Downloads directory');
+      final targetDir = await _resolveDownloadDirectory();
+      if (!await targetDir.exists()) {
+        await targetDir.create(recursive: true);
       }
 
-      final outputFile = File('${downloadsDir.path}${Platform.pathSeparator}$fileName');
-      await outputFile.writeAsBytes(response.bodyBytes);
+      final outputFile = File(
+        '${targetDir.path}${Platform.pathSeparator}$fileName',
+      );
+      final sink = outputFile.openWrite();
+
+      final totalBytes = response.contentLength;
+      var receivedBytes = 0;
+
+      await for (final chunk in response.stream) {
+        sink.add(chunk);
+        receivedBytes += chunk.length;
+
+        if (totalBytes != null && totalBytes > 0 && mounted) {
+          setState(() {
+            downloadProgress = receivedBytes / totalBytes;
+          });
+        }
+      }
+
+      await sink.flush();
+      await sink.close();
 
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -89,6 +139,14 @@ class _FileListScreenState extends State<FileListScreen> {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('Download error: $e')));
+    } finally {
+      client.close();
+      if (!mounted) return;
+      setState(() {
+        isDownloading = false;
+        downloadProgress = 0;
+        downloadingFileName = null;
+      });
     }
   }
 
@@ -142,23 +200,47 @@ class _FileListScreenState extends State<FileListScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final content = files.isEmpty
+        ? const Center(child: Text("No files shared or Engine is offline"))
+        : ListView.builder(
+            itemCount: files.length,
+            itemBuilder: (context, index) {
+              return ListTile(
+                leading: const Icon(Icons.file_present),
+                title: Text(files[index]),
+                trailing: IconButton(
+                  icon: const Icon(Icons.download),
+                  onPressed: () => downloadFile(files[index] as String),
+                ),
+              );
+            },
+          );
+
     return Scaffold(
       appBar: AppBar(title: Text('AirShare - ${widget.serverHost}')),
-      body: files.isEmpty
-          ? const Center(child: Text("No files shared or Engine is offline"))
-          : ListView.builder(
-              itemCount: files.length,
-              itemBuilder: (context, index) {
-                return ListTile(
-                  leading: const Icon(Icons.file_present),
-                  title: Text(files[index]),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.download),
-                    onPressed: () => downloadFile(files[index] as String),
-                  ),
-                );
-              },
+      body: Column(
+        children: [
+          if (isDownloading)
+            Material(
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Downloading ${downloadingFileName ?? "file"}...',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    LinearProgressIndicator(value: downloadProgress),
+                  ],
+                ),
+              ),
             ),
+          Expanded(child: content),
+        ],
+      ),
       floatingActionButton: FloatingActionButton(
         onPressed: pickAndUploadFile,
         child: const Icon(Icons.add),
