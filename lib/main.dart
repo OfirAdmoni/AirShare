@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
+import 'package:air_share/discovery_page.dart';
 
 void main() {
   runApp(const AirShareApp());
@@ -17,13 +18,21 @@ class AirShareApp extends StatelessWidget {
     return MaterialApp(
       title: 'AirShare',
       theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
-      home: const FileListScreen(),
+      home: DiscoveryPage(
+        onServerSelected: (host) {
+          Navigator.of(context).pushReplacement(
+            MaterialPageRoute(builder: (_) => FileListScreen(serverHost: host)),
+          );
+        },
+      ),
     );
   }
 }
 
 class FileListScreen extends StatefulWidget {
-  const FileListScreen({super.key});
+  const FileListScreen({required this.serverHost, super.key});
+
+  final String serverHost;
 
   @override
   State<FileListScreen> createState() => _FileListScreenState();
@@ -32,10 +41,12 @@ class FileListScreen extends StatefulWidget {
 class _FileListScreenState extends State<FileListScreen> {
   List<dynamic> files = [];
 
+  String get baseUrl => 'http://${widget.serverHost}:8080';
+
   // פונקציה שפונה למנוע ה-Go ומבקשת את רשימת הקבצים
   Future<void> fetchFiles() async {
     try {
-      final response = await http.get(Uri.parse('http://localhost:8080/files'));
+      final response = await http.get(Uri.parse('$baseUrl/files'));
       if (response.statusCode == 200) {
         setState(() {
           files = json.decode(response.body);
@@ -49,7 +60,7 @@ class _FileListScreenState extends State<FileListScreen> {
   Future<void> downloadFile(String fileName) async {
     try {
       final uri = Uri.parse(
-        'http://localhost:8080/download?name=${Uri.encodeComponent(fileName)}',
+        '$baseUrl/download?name=${Uri.encodeComponent(fileName)}',
       );
       final response = await http.get(uri);
 
@@ -87,7 +98,7 @@ class _FileListScreenState extends State<FileListScreen> {
       final picked = result.files.first;
       final request = http.MultipartRequest(
         'POST',
-        Uri.parse('http://localhost:8080/upload'),
+        Uri.parse('$baseUrl/upload'),
       );
 
       if (picked.path != null) {
@@ -128,7 +139,7 @@ class _FileListScreenState extends State<FileListScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('AirShare - Shared Files')),
+      appBar: AppBar(title: Text('AirShare - ${widget.serverHost}')),
       body: files.isEmpty
           ? const Center(child: Text("No files shared or Engine is offline"))
           : ListView.builder(
