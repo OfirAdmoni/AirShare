@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
@@ -47,6 +48,9 @@ class _FileListScreenState extends State<FileListScreen> {
   bool isDownloading = false;
   double downloadProgress = 0;
   String? downloadingFileName;
+  bool isUploading = false;
+  double uploadProgress = 0;
+  String? uploadingFileName;
 
   String get baseUrl => 'http://${widget.serverHost}:8080';
 
@@ -158,20 +162,48 @@ class _FileListScreenState extends State<FileListScreen> {
       }
 
       final picked = result.files.first;
+      int totalBytes;
+      Stream<List<int>> uploadStream;
+
+      if (picked.path != null) {
+        final sourceFile = File(picked.path!);
+        totalBytes = await sourceFile.length();
+        uploadStream = sourceFile.openRead();
+      } else if (picked.bytes != null) {
+        totalBytes = picked.bytes!.length;
+        uploadStream = Stream.value(picked.bytes!);
+      } else {
+        throw Exception('Could not read selected file');
+      }
+
+      var uploadedBytes = 0;
+      uploadStream = uploadStream.transform(
+        StreamTransformer<List<int>, List<int>>.fromHandlers(
+          handleData: (chunk, sink) {
+            uploadedBytes += chunk.length;
+            if (mounted && totalBytes > 0) {
+              setState(() {
+                uploadProgress = uploadedBytes / totalBytes;
+              });
+            }
+            sink.add(chunk);
+          },
+        ),
+      );
+
+      setState(() {
+        isUploading = true;
+        uploadProgress = 0;
+        uploadingFileName = picked.name;
+      });
+
       final request = http.MultipartRequest(
         'POST',
         Uri.parse('$baseUrl/upload'),
       );
-
-      if (picked.path != null) {
-        request.files.add(await http.MultipartFile.fromPath('file', picked.path!));
-      } else if (picked.bytes != null) {
-        request.files.add(
-          http.MultipartFile.fromBytes('file', picked.bytes!, filename: picked.name),
-        );
-      } else {
-        throw Exception('Could not read selected file');
-      }
+      request.files.add(
+        http.MultipartFile('file', uploadStream, totalBytes, filename: picked.name),
+      );
 
       final streamedResponse = await request.send();
       if (streamedResponse.statusCode != 201) {
@@ -189,6 +221,13 @@ class _FileListScreenState extends State<FileListScreen> {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('Upload error: $e')));
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        isUploading = false;
+        uploadProgress = 0;
+        uploadingFileName = null;
+      });
     }
   }
 
@@ -220,6 +259,24 @@ class _FileListScreenState extends State<FileListScreen> {
       appBar: AppBar(title: Text('AirShare - ${widget.serverHost}')),
       body: Column(
         children: [
+          if (isUploading)
+            Material(
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Uploading ${uploadingFileName ?? "file"}...',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    LinearProgressIndicator(value: uploadProgress),
+                  ],
+                ),
+              ),
+            ),
           if (isDownloading)
             Material(
               color: Theme.of(context).colorScheme.surfaceContainerHighest,
