@@ -1,292 +1,126 @@
-import 'package:flutter/material.dart';
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
-import 'package:multicast_dns/multicast_dns.dart';
-import 'package:nsd/nsd.dart';
 
+import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
+
+import 'package:air_share/air_share_constants.dart';
+import 'package:air_share/ble_transport.dart';
+import 'package:air_share/wlan_link_manager.dart';
+
+/// Receiver: BLE scan only until [onLinkReady] completes (handshake + WLAN).
 class DiscoveryPage extends StatefulWidget {
-  const DiscoveryPage({required this.onHubSelected, super.key});
+  const DiscoveryPage({required this.onLinkReady, super.key});
 
-  final ValueChanged<String> onHubSelected;
+  final Future<void> Function(HandshakePayload payload) onLinkReady;
 
   @override
   State<DiscoveryPage> createState() => _DiscoveryPageState();
 }
 
 class _DiscoveryPageState extends State<DiscoveryPage> {
-  static const String _serviceType = '_airshare._tcp';
-  static const int _fallbackDiscoveryPort = 45454;
-  static const String _discoveryProbe = 'AIRSHARE_DISCOVERY_PROBE';
-  static const String _discoveryResponse = 'AIRSHARE_DISCOVERY_RESPONSE';
-
-  Discovery? _discovery;
-  MDnsClient? _mdnsClient;
-  Timer? _windowsScanTimer;
-  Timer? _udpProbeTimer;
-  RawDatagramSocket? _udpSocket;
+  StreamSubscription<List<BlePeer>>? _scanSubscription;
+  final List<BlePeer> _peers = [];
   bool _isScanning = false;
-  bool _usingWindowsUdpFallback = false;
-  final List<_DiscoveredHub> _hubs = [];
-  final Set<String> _localIps = {};
+  bool _isHandshaking = false;
+  String _status = 'Peer Discovery via BLE';
+  double _pulseScale = 1.0;
+  Timer? _pulseTimer;
 
   @override
   void initState() {
     super.initState();
-    _initializeDiscovery();
-  }
-
-  Future<void> _initializeDiscovery() async {
-    await _captureLocalIps();
-    await _startDiscovery();
+    _startPulseAnimation();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _startDiscovery());
   }
 
   @override
   void dispose() {
     _stopDiscovery();
+    _pulseTimer?.cancel();
     super.dispose();
   }
 
-  Future<void> _startDiscovery() async {
-    if (_isScanning) return;
-
-    try {
-      if (Platform.isWindows) {
-        await _startWindowsDiscovery();
-        return;
-      }
-
-      final discovery = await startDiscovery(
-        _serviceType,
-        ipLookupType: IpLookupType.any,
-      );
-
-      if (!mounted) {
-        await stopDiscovery(discovery);
-        return;
-      }
-
+  void _startPulseAnimation() {
+    _pulseTimer?.cancel();
+    var grow = true;
+    _pulseTimer = Timer.periodic(const Duration(milliseconds: 600), (_) {
+      if (!mounted) return;
       setState(() {
-        _discovery = discovery;
-        _isScanning = true;
+        _pulseScale = grow ? 1.08 : 1.0;
       });
+      grow = !grow;
+    });
+  }
 
-      discovery.addListener(() {
+  /// Android: BLE scan needs Location services enabled (system requirement).
+  Future<bool> _ensureAndroidLocationForBle() async {
+    if (!Platform.isAndroid) return true;
+    var enabled = await Geolocator.isLocationServiceEnabled();
+    if (!mounted) return false;
+    if (enabled) return true;
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Turn on Location'),
+        content: const Text(
+          'Android requires Location services (GPS) to be on for Bluetooth LE scanning. '
+          'Without it, peer discovery usually finds no devices.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Continue anyway'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              Navigator.of(ctx).pop();
+              await Geolocator.openLocationSettings();
+            },
+            child: const Text('Open Location settings'),
+          ),
+        ],
+      ),
+    );
+    enabled = await Geolocator.isLocationServiceEnabled();
+    return enabled;
+  }
+
+  Future<void> _startDiscovery() async {
+    try {
+      await _ensureAndroidLocationForBle();
+      if (!mounted) return;
+
+      await BleTransport.instance.startScanning();
+      _scanSubscription?.cancel();
+      _scanSubscription = BleTransport.instance.scanPeers().listen((peers) {
         if (!mounted) return;
-        setState(() {});
+        setState(() {
+          _peers
+            ..clear()
+            ..addAll(peers);
+          _isScanning = true;
+          _status = 'Peer Discovery via BLE';
+        });
+      });
+      setState(() {
+        _isScanning = true;
       });
     } catch (e) {
       if (!mounted) return;
       debugPrint('[Discovery] start failed: $e');
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('Network discovery error: $e')));
-    }
-  }
-
-  Future<void> _startWindowsDiscovery() async {
-    try {
-      _mdnsClient = MDnsClient();
-      await _mdnsClient!.start();
-      _isScanning = true;
-      _usingWindowsUdpFallback = false;
-      await _scanWindowsHubs();
-      _windowsScanTimer = Timer.periodic(const Duration(seconds: 4), (_) async {
-        try {
-          await _scanWindowsHubs();
-        } on SocketException catch (error) {
-          debugPrint('[Discovery][Windows] IPv4 multicast scan socket error: $error');
-          if (_isWindowsSocket10042(error)) {
-            await _switchToWindowsUdpFallback(error);
-            return;
-          }
-        } catch (error) {
-          debugPrint('[Discovery][Windows] periodic scan failed: $error');
-        }
-      });
-      if (mounted) {
-        setState(() {});
-      }
-    } on SocketException catch (error) {
-      debugPrint('[Discovery][Windows] mDNS startup failed: $error');
-      if (_isWindowsSocket10042(error)) {
-        await _switchToWindowsUdpFallback(error);
-        return;
-      }
-      _isScanning = false;
-      rethrow;
-    } catch (error) {
-      debugPrint('[Discovery][Windows] discovery initialization failed: $error');
-      _isScanning = false;
-      rethrow;
-    }
-  }
-
-  Future<void> _scanWindowsHubs() async {
-    final client = _mdnsClient;
-    if (client == null) return;
-
-    final Map<String, _DiscoveredHub> nextHubs = {};
-    final ptrStream = client.lookup<PtrResourceRecord>(
-      ResourceRecordQuery.serverPointer('$_serviceType.local'),
-    );
-
-    await for (final ptr in ptrStream) {
-      final srvStream = client.lookup<SrvResourceRecord>(
-        ResourceRecordQuery.service(ptr.domainName),
-      );
-      await for (final srv in srvStream) {
-        final ipStream = client.lookup<IPAddressResourceRecord>(
-          ResourceRecordQuery.addressIPv4(srv.target),
-        );
-        await for (final ip in ipStream) {
-          final host = ip.address.address;
-          if (_isSelfHost(host)) {
-            continue;
-          }
-          nextHubs[host] = _DiscoveredHub(host: host, port: srv.port);
-        }
-      }
-    }
-
-    if (!mounted) return;
-    setState(() {
-      _hubs
-        ..clear()
-        ..addAll(nextHubs.values);
-    });
-  }
-
-  Future<void> _captureLocalIps() async {
-    _localIps
-      ..clear()
-      ..add('127.0.0.1')
-      ..add('localhost');
-    try {
-      final interfaces = await NetworkInterface.list(
-        includeLoopback: true,
-        type: InternetAddressType.IPv4,
-      );
-      for (final interface in interfaces) {
-        for (final address in interface.addresses) {
-          _localIps.add(address.address);
-        }
-      }
-    } catch (error) {
-      debugPrint('[Discovery] Unable to enumerate local IPv4 interfaces: $error');
-    }
-  }
-
-  bool _isSelfHost(String host) => _localIps.contains(host);
-
-  bool _isWindowsSocket10042(SocketException error) {
-    return error.osError?.errorCode == 10042 ||
-        error.toString().contains('10042');
-  }
-
-  Future<void> _switchToWindowsUdpFallback(SocketException error) async {
-    debugPrint('[Discovery][Windows] switching to UDP fallback after 10042: $error');
-    _windowsScanTimer?.cancel();
-    _windowsScanTimer = null;
-    _mdnsClient?.stop();
-    _mdnsClient = null;
-    await _startWindowsUdpFallback();
-  }
-
-  Future<void> _startWindowsUdpFallback() async {
-    try {
-      _udpSocket?.close();
-      _udpSocket = await RawDatagramSocket.bind(
-        InternetAddress.anyIPv4,
-        0,
-        reuseAddress: true,
-        reusePort: false,
-      );
-      _udpSocket!.broadcastEnabled = true;
-      _isScanning = true;
-      _usingWindowsUdpFallback = true;
-
-      _udpSocket!.listen((event) {
-        if (event != RawSocketEvent.read) return;
-        final datagram = _udpSocket!.receive();
-        if (datagram == null) return;
-        final payload = utf8.decode(datagram.data, allowMalformed: true);
-        try {
-          final decoded = jsonDecode(payload);
-          if (decoded is! Map<String, dynamic>) return;
-          if (decoded['type'] != _discoveryResponse) return;
-          final host = datagram.address.address;
-          if (_isSelfHost(host)) return;
-          final port = decoded['port'] is int ? decoded['port'] as int : 8080;
-
-          if (!mounted) return;
-          setState(() {
-            final exists = _hubs.any((hub) => hub.host == host && hub.port == port);
-            if (!exists) {
-              _hubs.add(_DiscoveredHub(host: host, port: port));
-            }
-          });
-        } catch (parseError) {
-          debugPrint('[Discovery][Windows][UDP] response parse error: $parseError');
-        }
-      });
-
-      await _sendUdpProbe();
-      _udpProbeTimer?.cancel();
-      _udpProbeTimer = Timer.periodic(const Duration(seconds: 3), (_) async {
-        await _sendUdpProbe();
-      });
-      if (mounted) {
-        setState(() {});
-      }
-    } catch (error) {
-      debugPrint('[Discovery][Windows][UDP] fallback startup failed: $error');
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Network discovery fallback error: $error')),
-      );
-    }
-  }
-
-  Future<void> _sendUdpProbe() async {
-    final socket = _udpSocket;
-    if (socket == null) return;
-    final payload = utf8.encode(_discoveryProbe);
-    socket.send(payload, InternetAddress('255.255.255.255'), _fallbackDiscoveryPort);
-
-    for (final ip in _localIps.where((ip) => ip != '127.0.0.1' && ip != 'localhost')) {
-      final parts = ip.split('.');
-      if (parts.length != 4) continue;
-      final broadcast = '${parts[0]}.${parts[1]}.${parts[2]}.255';
-      try {
-        socket.send(payload, InternetAddress(broadcast), _fallbackDiscoveryPort);
-      } catch (_) {
-        // Continue probing other interfaces.
-      }
+      ).showSnackBar(SnackBar(content: Text('Peer discovery error: $e')));
     }
   }
 
   Future<void> _stopDiscovery() async {
-    _windowsScanTimer?.cancel();
-    _windowsScanTimer = null;
-    _udpProbeTimer?.cancel();
-    _udpProbeTimer = null;
-
-    _udpSocket?.close();
-    _udpSocket = null;
-    _usingWindowsUdpFallback = false;
-
-    if (_mdnsClient != null) {
-      _mdnsClient!.stop();
-      _mdnsClient = null;
-    }
-
-    final discovery = _discovery;
-    if (discovery != null) {
-      _discovery = null;
-      _isScanning = false;
-      await stopDiscovery(discovery);
-    }
+    await BleTransport.instance.stopScanning();
+    await _scanSubscription?.cancel();
+    _scanSubscription = null;
 
     if (mounted) {
       setState(() {
@@ -295,62 +129,97 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     }
   }
 
+  Future<void> _selectPeer(BlePeer peer) async {
+    try {
+      setState(() {
+        _isHandshaking = true;
+        _status = 'Waiting for approval on sender…';
+      });
+
+      final payload = await BleTransport.instance.establishSecureHandshake(peer);
+
+      if (!mounted) return;
+      setState(() {
+        _status = 'Connecting to peer WLAN…';
+      });
+      await WlanLinkManager.instance.connectToHubWlan(
+        ssid: payload.ssid,
+        password: payload.password,
+      );
+      if (!mounted) return;
+      setState(() {
+        _status = 'WLAN link active';
+      });
+
+      await widget.onLinkReady(payload);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _status = 'Peer Discovery via BLE';
+      });
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Secure handshake failed: $e')));
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _isHandshaking = false;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    final services = (_discovery?.services ?? const <Service>[]).where((service) {
-      final host = service.host?.replaceAll(RegExp(r'\.$'), '');
-      if (host == null || host.isEmpty) return true;
-      return !_isSelfHost(host);
-    }).toList();
-    final hasDesktopHubs = _hubs.isNotEmpty;
-
     return Scaffold(
-      appBar: AppBar(title: const Text('Network Discovery')),
+      appBar: AppBar(title: const Text('Peer Discovery via BLE')),
       body: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Active Directory', style: Theme.of(context).textTheme.titleMedium),
+            Text(_status, style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text(
+              'Service UUID: $kAirShareBleServiceUuid',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
             const SizedBox(height: 8),
             Expanded(
-              child: services.isEmpty && !hasDesktopHubs
+              child: _peers.isEmpty
                   ? Center(
-                      child: Text(
-                        _isScanning
-                            ? (_usingWindowsUdpFallback
-                                  ? 'Scanning local network for hubs (IPv4 fallback)...'
-                                  : 'Scanning local network for hubs...')
-                            : 'No hubs discovered',
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          AnimatedScale(
+                            scale: _pulseScale,
+                            duration: const Duration(milliseconds: 500),
+                            child: const Icon(Icons.bluetooth_searching, size: 42),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            _isHandshaking
+                                ? 'Establishing secure link…'
+                                : _isScanning
+                                ? 'Peer Discovery via BLE in progress…'
+                                : 'No senders discovered',
+                          ),
+                        ],
                       ),
                     )
                   : ListView.builder(
-                      itemCount: Platform.isWindows ? _hubs.length : services.length,
+                      itemCount: _peers.length,
                       itemBuilder: (context, index) {
-                        if (Platform.isWindows) {
-                          final hub = _hubs[index];
-                          return ListTile(
-                            leading: const Icon(Icons.hub),
-                            title: Text(hub.host),
-                            subtitle: Text('Hub endpoint :${hub.port}'),
-                            onTap: () => widget.onHubSelected(hub.host),
-                          );
-                        }
-
-                        final service = services[index];
-                        final hubHost = service.host?.replaceAll(RegExp(r'\.$'), '');
-                        final displayTarget =
-                            (hubHost != null && hubHost.isNotEmpty)
-                            ? hubHost
-                            : (service.name ?? 'Unknown hub');
+                        final peer = _peers[index];
 
                         return ListTile(
                           leading: const Icon(Icons.hub),
-                          title: Text(displayTarget),
-                          subtitle: Text('Hub endpoint :${service.port ?? 8080}'),
-                          onTap: hubHost == null || hubHost.isEmpty
-                              ? null
-                              : () => widget.onHubSelected(hubHost),
+                          title: Text(peer.friendlyName),
+                          subtitle: Text(
+                            peer.serviceUuid == kAirShareBleServiceUuid
+                                ? 'AirShare hub • $kAirShareBleServiceUuid'
+                                : 'UUID ${peer.serviceUuid}',
+                          ),
+                          onTap: _isHandshaking ? null : () => _selectPeer(peer),
                         );
                       },
                     ),
@@ -367,11 +236,4 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       ),
     );
   }
-}
-
-class _DiscoveredHub {
-  const _DiscoveredHub({required this.host, required this.port});
-
-  final String host;
-  final int port;
 }
