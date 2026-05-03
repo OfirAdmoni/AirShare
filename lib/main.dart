@@ -6,20 +6,32 @@ import 'package:file_picker/file_picker.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:air_share/discovery_page.dart';
+import 'package:air_share/hub_status.dart';
+import 'package:air_share/local_hub_runtime.dart';
 
 void main() {
   runApp(const AirShareApp());
 }
 
-class AirShareApp extends StatelessWidget {
+class AirShareApp extends StatefulWidget {
   const AirShareApp({super.key});
 
   @override
+  State<AirShareApp> createState() => _AirShareAppState();
+}
+
+class _AirShareAppState extends State<AirShareApp> {
+  final HubStatus _hubStatus = HubStatus();
+
+  @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'AirShare',
-      theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
-      home: const ModeSelectionPage(),
+    return HubStatusScope(
+      status: _hubStatus,
+      child: MaterialApp(
+        title: 'AirShare',
+        theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
+        home: const ModeSelectionPage(),
+      ),
     );
   }
 }
@@ -111,8 +123,10 @@ class _FileListScreenState extends State<FileListScreen> {
   bool isUploading = false;
   double uploadProgress = 0;
   String? uploadingFileName;
+  StreamSubscription<String>? _ingressSubscription;
 
   String get baseUrl => 'http://${widget.hubHost}:8080';
+  HubStatus get _hubStatus => HubStatusScope.of(context);
 
   // פונקציה שפונה למנוע ה-Go ומבקשת את רשימת הקבצים
   Future<void> fetchFiles() async {
@@ -124,7 +138,7 @@ class _FileListScreenState extends State<FileListScreen> {
         });
       }
     } catch (e) {
-      print("Error connecting to engine: $e");
+      debugPrint('Data directory query failed: $e');
     }
   }
 
@@ -202,7 +216,7 @@ class _FileListScreenState extends State<FileListScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('Download error: $e')));
+      ).showSnackBar(SnackBar(content: Text('Data egress error: $e')));
     } finally {
       client.close();
       if (!mounted) return;
@@ -280,7 +294,7 @@ class _FileListScreenState extends State<FileListScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('Upload error: $e')));
+      ).showSnackBar(SnackBar(content: Text('Data ingress error: $e')));
     } finally {
       if (!mounted) return;
       setState(() {
@@ -294,25 +308,28 @@ class _FileListScreenState extends State<FileListScreen> {
   @override
   void initState() {
     super.initState();
-    fetchFiles();
-    if (widget.isHubMode) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Hub mode selected. Ensure local Go service is running with mDNS advertising.',
-            ),
-          ),
-        );
-      });
-    }
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      if (widget.isHubMode && (Platform.isAndroid || Platform.isIOS)) {
+        await LocalHubRuntime.instance.ensureStarted(_hubStatus);
+        _ingressSubscription = LocalHubRuntime.instance.ingressEvents.listen((_) {
+          fetchFiles();
+        });
+      }
+      await fetchFiles();
+    });
+  }
+
+  @override
+  void dispose() {
+    _ingressSubscription?.cancel();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final content = files.isEmpty
-        ? const Center(child: Text('No shared files available or service offline'))
+        ? const Center(child: Text('Active Directory is empty or service offline'))
         : ListView.builder(
             itemCount: files.length,
             itemBuilder: (context, index) {
@@ -342,7 +359,7 @@ class _FileListScreenState extends State<FileListScreen> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Uploading ${uploadingFileName ?? "file"}...',
+                      'Data Ingress: ${uploadingFileName ?? "file"}',
                       style: Theme.of(context).textTheme.bodyMedium,
                     ),
                     const SizedBox(height: 8),
@@ -360,7 +377,7 @@ class _FileListScreenState extends State<FileListScreen> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      'Downloading ${downloadingFileName ?? "file"}...',
+                      'Data Egress: ${downloadingFileName ?? "file"}',
                       style: Theme.of(context).textTheme.bodyMedium,
                     ),
                     const SizedBox(height: 8),
@@ -370,6 +387,25 @@ class _FileListScreenState extends State<FileListScreen> {
               ),
             ),
           Expanded(child: content),
+          if (widget.isHubMode)
+            AnimatedBuilder(
+              animation: _hubStatus,
+              builder: (context, _) {
+                final isError = _hubStatus.lifecycle == HubLifecycle.error;
+                return Container(
+                  width: double.infinity,
+                  color: isError
+                      ? Theme.of(context).colorScheme.errorContainer
+                      : Theme.of(context).colorScheme.surfaceContainerHighest,
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  child: Text(
+                    isError && _hubStatus.lastError != null
+                        ? '${_hubStatus.message}: ${_hubStatus.lastError}'
+                        : _hubStatus.message,
+                  ),
+                );
+              },
+            ),
         ],
       ),
       floatingActionButton: FloatingActionButton(

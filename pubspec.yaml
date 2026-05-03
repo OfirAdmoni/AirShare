@@ -32,6 +32,7 @@ dependencies:
   path_provider: ^2.1.5
   file_picker: ^10.1.9
   nsd: ^4.0.4
+  multicast_dns: ^0.3.3
   flutter:
     sdk: flutter
 
