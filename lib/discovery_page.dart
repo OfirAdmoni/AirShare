@@ -2,9 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:nsd/nsd.dart';
 
 class DiscoveryPage extends StatefulWidget {
-  const DiscoveryPage({required this.onServerSelected, super.key});
+  const DiscoveryPage({required this.onHubSelected, super.key});
 
-  final ValueChanged<String> onServerSelected;
+  final ValueChanged<String> onHubSelected;
 
   @override
   State<DiscoveryPage> createState() => _DiscoveryPageState();
@@ -55,7 +55,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       if (!mounted) return;
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(SnackBar(content: Text('Discovery error: $e')));
+      ).showSnackBar(SnackBar(content: Text('Network discovery error: $e')));
     }
   }
 
@@ -73,33 +73,47 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     final services = _discovery?.services ?? const <Service>[];
 
     return Scaffold(
-      appBar: AppBar(title: const Text('AirShare - Discover Servers')),
-      body: services.isEmpty
-          ? Center(
-              child: Text(
-                _isScanning ? 'Scanning local network...' : 'No servers found',
-              ),
-            )
-          : ListView.builder(
-              itemCount: services.length,
-              itemBuilder: (context, index) {
-                final service = services[index];
-                final host = service.host?.replaceAll(RegExp(r'\.$'), '');
-                final displayTarget =
-                    (host != null && host.isNotEmpty)
-                    ? host
-                    : (service.name ?? 'Unknown server');
+      appBar: AppBar(title: const Text('Network Discovery')),
+      body: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Active Directory', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 8),
+            Expanded(
+              child: services.isEmpty
+                  ? Center(
+                      child: Text(
+                        _isScanning
+                            ? 'Scanning local network for hubs...'
+                            : 'No hubs discovered',
+                      ),
+                    )
+                  : ListView.builder(
+                      itemCount: services.length,
+                      itemBuilder: (context, index) {
+                        final service = services[index];
+                        final hubHost = service.host?.replaceAll(RegExp(r'\.$'), '');
+                        final displayTarget =
+                            (hubHost != null && hubHost.isNotEmpty)
+                            ? hubHost
+                            : (service.name ?? 'Unknown hub');
 
-                return ListTile(
-                  leading: const Icon(Icons.computer),
-                  title: Text(displayTarget),
-                  subtitle: Text('Port ${service.port ?? 8080}'),
-                  onTap: host == null || host.isEmpty
-                      ? null
-                      : () => widget.onServerSelected(host),
-                );
-              },
+                        return ListTile(
+                          leading: const Icon(Icons.hub),
+                          title: Text(displayTarget),
+                          subtitle: Text('Hub endpoint :${service.port ?? 8080}'),
+                          onTap: hubHost == null || hubHost.isEmpty
+                              ? null
+                              : () => widget.onHubSelected(hubHost),
+                        );
+                      },
+                    ),
             ),
+          ],
+        ),
+      ),
       floatingActionButton: FloatingActionButton(
         onPressed: () async {
           await _stopDiscovery();

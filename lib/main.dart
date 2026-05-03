@@ -19,15 +19,68 @@ class AirShareApp extends StatelessWidget {
     return MaterialApp(
       title: 'AirShare',
       theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
-      home: Builder(
-        builder: (navigatorContext) => DiscoveryPage(
-          onServerSelected: (host) {
-            Navigator.of(navigatorContext).pushReplacement(
-              MaterialPageRoute(
-                builder: (_) => FileListScreen(serverHost: host),
-              ),
-            );
-          },
+      home: const ModeSelectionPage(),
+    );
+  }
+}
+
+class ModeSelectionPage extends StatelessWidget {
+  const ModeSelectionPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('AirShare Transfer Console')),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 360),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                ElevatedButton.icon(
+                  onPressed: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => const FileListScreen(
+                          hubHost: '127.0.0.1',
+                          modeTitle: 'Receive Files',
+                          isHubMode: true,
+                        ),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.move_to_inbox),
+                  label: const Text('Receive Files'),
+                ),
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => DiscoveryPage(
+                          onHubSelected: (hubHost) {
+                            Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (_) => FileListScreen(
+                                  hubHost: hubHost,
+                                  modeTitle: 'Send Files',
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.send),
+                  label: const Text('Send Files'),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -35,9 +88,16 @@ class AirShareApp extends StatelessWidget {
 }
 
 class FileListScreen extends StatefulWidget {
-  const FileListScreen({required this.serverHost, super.key});
+  const FileListScreen({
+    required this.hubHost,
+    required this.modeTitle,
+    this.isHubMode = false,
+    super.key,
+  });
 
-  final String serverHost;
+  final String hubHost;
+  final String modeTitle;
+  final bool isHubMode;
 
   @override
   State<FileListScreen> createState() => _FileListScreenState();
@@ -52,7 +112,7 @@ class _FileListScreenState extends State<FileListScreen> {
   double uploadProgress = 0;
   String? uploadingFileName;
 
-  String get baseUrl => 'http://${widget.serverHost}:8080';
+  String get baseUrl => 'http://${widget.hubHost}:8080';
 
   // פונקציה שפונה למנוע ה-Go ומבקשת את רשימת הקבצים
   Future<void> fetchFiles() async {
@@ -234,13 +294,25 @@ class _FileListScreenState extends State<FileListScreen> {
   @override
   void initState() {
     super.initState();
-    fetchFiles(); // נטען את הקבצים ברגע שהאפליקציה עולה
+    fetchFiles();
+    if (widget.isHubMode) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Hub mode selected. Ensure local Go service is running with mDNS advertising.',
+            ),
+          ),
+        );
+      });
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final content = files.isEmpty
-        ? const Center(child: Text("No files shared or Engine is offline"))
+        ? const Center(child: Text('No shared files available or service offline'))
         : ListView.builder(
             itemCount: files.length,
             itemBuilder: (context, index) {
@@ -256,7 +328,9 @@ class _FileListScreenState extends State<FileListScreen> {
           );
 
     return Scaffold(
-      appBar: AppBar(title: Text('AirShare - ${widget.serverHost}')),
+      appBar: AppBar(
+        title: Text('${widget.modeTitle} • Peer ${widget.hubHost}'),
+      ),
       body: Column(
         children: [
           if (isUploading)
