@@ -28,8 +28,10 @@ environment:
 # the latest version available on pub.dev. To see which dependencies have newer
 # versions available, run `flutter pub outdated`.
 dependencies:
+  device_info_plus: ^11.2.0
   geolocator: ^13.0.2
   http: ^1.1.0
+  shared_preferences: ^2.3.3
   path_provider: ^2.1.5
   file_picker: ^10.1.9
   nsd: ^4.0.4

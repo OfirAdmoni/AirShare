@@ -216,7 +216,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                           title: Text(peer.friendlyName),
                           subtitle: Text(
                             peer.serviceUuid == kAirShareBleServiceUuid
-                                ? 'AirShare hub • $kAirShareBleServiceUuid'
+                                ? 'Transfer hub • $kAirShareBleServiceUuid'
                                 : 'UUID ${peer.serviceUuid}',
                           ),
                           onTap: _isHandshaking ? null : () => _selectPeer(peer),

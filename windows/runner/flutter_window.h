@@ -42,7 +42,8 @@ class FlutterWindow : public Win32Window {
   void EstablishSecureHandshake(
       const flutter::EncodableMap& args,
       flutter::MethodResult<flutter::EncodableValue>* result);
-  void StartHubAdvertising(flutter::MethodResult<flutter::EncodableValue>* result);
+  void StartHubAdvertising(const flutter::EncodableMap* args,
+                           flutter::MethodResult<flutter::EncodableValue>* result);
   void StopHubAdvertising(flutter::MethodResult<flutter::EncodableValue>* result);
   void StopHubAdvertisingInternal();
   void ApproveConnection(const flutter::EncodableMap& args,

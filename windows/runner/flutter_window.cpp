@@ -20,6 +20,33 @@
 #include "flutter/generated_plugin_registrant.h"
 
 namespace {
+void TrimAsciiWhitespace(std::string& s) {
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) {
+    s.pop_back();
+  }
+  while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) {
+    s.erase(s.begin());
+  }
+}
+
+std::string GetHostComputerNameUtf8() {
+  wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1] = {};
+  DWORD n = static_cast<DWORD>(MAX_COMPUTERNAME_LENGTH + 1);
+  if (!GetComputerNameW(buf, &n) || n == 0) {
+    return {};
+  }
+  buf[n] = L'\0';
+  const int required =
+      WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
+  if (required <= 1) {
+    return {};
+  }
+  std::string out(static_cast<size_t>(required - 1), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, buf, -1, out.data(), required, nullptr,
+                      nullptr);
+  return out;
+}
+
 constexpr char kBleTransportChannel[] = "air_share/ble_transport";
 constexpr char kBleScanEventsChannel[] = "air_share/ble_scan_events";
 constexpr char kBleUiChannel[] = "air_share/ble_ui";
@@ -146,7 +173,9 @@ void FlutterWindow::InitializeNativeChannels() {
           return;
         }
         if (call.method_name() == "startHubAdvertising") {
-          StartHubAdvertising(result.get());
+          const auto* args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          StartHubAdvertising(args, result.get());
           return;
         }
         if (call.method_name() == "stopHubAdvertising") {
@@ -255,7 +284,7 @@ void FlutterWindow::StartBleScanning(
       const std::string friendly_name =
           WinrtStringToUtf8(args.Advertisement().LocalName());
       discovered_peers_[bt_addr] = {
-          peer_id, friendly_name.empty() ? "AirShare Peer" : friendly_name};
+          peer_id, friendly_name.empty() ? "Nearby peer" : friendly_name};
       PublishDiscoveredPeers();
     });
 
@@ -409,6 +438,7 @@ void FlutterWindow::EstablishSecureHandshake(
 }
 
 void FlutterWindow::StartHubAdvertising(
+    const flutter::EncodableMap* args,
     flutter::MethodResult<flutter::EncodableValue>* result) {
   using namespace winrt::Windows::Devices::Bluetooth;
   using namespace winrt::Windows::Devices::Bluetooth::GenericAttributeProfile;
@@ -428,7 +458,7 @@ void FlutterWindow::StartHubAdvertising(
     GattLocalCharacteristicParameters params;
     params.CharacteristicProperties(GattCharacteristicProperties::Read |
                                     GattCharacteristicProperties::Notify);
-    params.UserDescription(L"AirShare secure handshake");
+    params.UserDescription(L"Secure handshake payload");
 
     auto char_result =
         gatt_provider_.Service()
@@ -479,56 +509,63 @@ void FlutterWindow::StartHubAdvertising(
 
     constexpr int kBleAdvPduMax = 31;
     constexpr int kPrimaryFlagsAnd128UuidEstimate = 3 + 18;
-    if (kPrimaryFlagsAnd128UuidEstimate > kBleAdvPduMax) {
-      OutputDebugStringW(
-          L"[AirShareNative] BLE primary advertisement estimate exceeds 31 bytes; aborting.\n");
-      StopHubAdvertisingInternal();
-      result->Error("ble_adv_oversize", "Primary BLE advertisement estimate exceeds 31 bytes.");
-      return;
-    }
+    static_assert(kPrimaryFlagsAnd128UuidEstimate <= 31,
+                  "primary advertisement flags + 128-bit UUID must fit legacy 31-byte PDU");
     try {
-      auto adapter = winrt::Windows::Devices::Bluetooth::BluetoothAdapter::GetDefaultAsync().get();
-      if (adapter) {
-        std::wstring wname(adapter.Name().c_str());
-        if (wname.size() > 10) {
-          wname.resize(10);
-        }
-        while (wname.size() > 1) {
-          const std::string u8 =
-              WinrtStringToUtf8(winrt::hstring(wname.c_str()));
-          const int scan_est = static_cast<int>(2 + u8.size());
-          if (scan_est <= kBleAdvPduMax) {
-            break;
+      std::string friendly_u8;
+      if (args) {
+        const auto it = args->find(flutter::EncodableValue("friendlyName"));
+        if (it != args->end()) {
+          try {
+            friendly_u8 = std::get<std::string>(it->second);
+          } catch (...) {
           }
-          wname.pop_back();
         }
-        const std::string u8_final =
-            wname.empty() ? std::string()
-                          : WinrtStringToUtf8(winrt::hstring(wname.c_str()));
-        const int scan_ad_estimate =
-            u8_final.empty() ? 0 : static_cast<int>(2 + u8_final.size());
-        if (scan_ad_estimate > kBleAdvPduMax) {
-          OutputDebugStringW(
-              L"[AirShareNative] BLE scan-response name still too large; refusing StartAdvertising.\n");
-          StopHubAdvertisingInternal();
-          result->Error(
-              "ble_adv_oversize",
-              "BLE scan response would exceed 31 bytes; shorten the PC Bluetooth device name.");
-          return;
-        }
-        const std::wstring wlog =
-            L"[AirShareNative] BLE adv verify: primary~" +
-            std::to_wstring(kPrimaryFlagsAnd128UuidEstimate) + L"B (flags+service UUID), scan~" +
-            std::to_wstring(scan_ad_estimate) + L"B (truncated broadcast name), max PDU=" +
-            std::to_wstring(kBleAdvPduMax) + L"\n";
-        OutputDebugStringW(wlog.c_str());
-      } else {
-        OutputDebugStringW(
-            L"[AirShareNative] BLE adv verify: no default adapter; primary~21B (flags+UUID).\n");
       }
+      TrimAsciiWhitespace(friendly_u8);
+      if (friendly_u8.empty()) {
+        friendly_u8 = GetHostComputerNameUtf8();
+        TrimAsciiWhitespace(friendly_u8);
+      }
+      if (friendly_u8.empty()) {
+        friendly_u8 = "Windows";
+      }
+      winrt::hstring h_label = winrt::to_hstring(friendly_u8);
+      std::wstring wname(h_label.c_str());
+      if (wname.size() > 10) {
+        wname.resize(10);
+      }
+      while (wname.size() > 1) {
+        const std::string u8 =
+            WinrtStringToUtf8(winrt::hstring(wname.c_str()));
+        const int scan_est = static_cast<int>(2 + u8.size());
+        if (scan_est <= kBleAdvPduMax) {
+          break;
+        }
+        wname.pop_back();
+      }
+      const std::string u8_final =
+          wname.empty() ? std::string()
+                        : WinrtStringToUtf8(winrt::hstring(wname.c_str()));
+      const int scan_ad_estimate =
+          u8_final.empty() ? 0 : static_cast<int>(2 + u8_final.size());
+      if (scan_ad_estimate > kBleAdvPduMax) {
+        OutputDebugStringW(
+            L"[AirShareNative] BLE scan-response name still too large; refusing StartAdvertising.\n");
+        StopHubAdvertisingInternal();
+        result->Error("ble_adv_oversize",
+                      "BLE scan response would exceed 31 bytes; shorten the device name.");
+        return;
+      }
+      const std::wstring wlog =
+          L"[AirShareNative] BLE adv verify: primary~" +
+          std::to_wstring(kPrimaryFlagsAnd128UuidEstimate) + L"B (flags+service UUID), scan~" +
+          std::to_wstring(scan_ad_estimate) + L"B (Flutter/local name, truncated for PDU), max PDU=" +
+          std::to_wstring(kBleAdvPduMax) + L"\n";
+      OutputDebugStringW(wlog.c_str());
     } catch (...) {
       OutputDebugStringW(
-          L"[AirShareNative] BLE adv verify: adapter check failed; continuing with StartAdvertising.\n");
+          L"[AirShareNative] BLE adv verify: name check failed; continuing with StartAdvertising.\n");
     }
 
     GattServiceProviderAdvertisingParameters adv_params;

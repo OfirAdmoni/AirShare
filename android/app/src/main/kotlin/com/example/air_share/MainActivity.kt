@@ -480,10 +480,14 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             result.error("ble_unavailable", "Bluetooth LE advertiser is unavailable.", null)
             return
         }
-        val rawFriendlyName = call.argument<String>("friendlyName") ?: "AirShare Hub"
-        var broadcastLabel = rawFriendlyName.take(10).trim()
+        val fromFlutter = call.argument<String>("friendlyName")?.trim().orEmpty()
+        val modelFallback = Build.MODEL.trim().ifBlank {
+            Build.PRODUCT.trim().ifBlank { "Android" }
+        }
+        val baseName = if (fromFlutter.isNotEmpty()) fromFlutter else modelFallback
+        var broadcastLabel = baseName.take(10).trim()
         if (broadcastLabel.isEmpty()) {
-            broadcastLabel = "AirShare"
+            broadcastLabel = modelFallback.take(10).trim().ifEmpty { "?" }
         }
         while (broadcastLabel.toByteArray(StandardCharsets.UTF_8).size > 29) {
             broadcastLabel = broadcastLabel.dropLast(1)
