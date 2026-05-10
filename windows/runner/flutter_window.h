@@ -14,12 +14,27 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "win32_window.h"
+
+// Move-only tasks for posting to the Win32 / Flutter platform thread (std::function
+// cannot store lambdas that capture std::unique_ptr on MSVC).
+struct AirSharePlatformTask {
+  virtual void Run() = 0;
+  virtual ~AirSharePlatformTask() = default;
+};
+
+template <typename F>
+struct AirShareLambdaPlatformTask final : AirSharePlatformTask {
+  F fn;
+  explicit AirShareLambdaPlatformTask(F&& f) : fn(std::forward<F>(f)) {}
+  void Run() override { fn(); }
+};
 
 // A window that does nothing but host a Flutter view.
 class FlutterWindow : public Win32Window {
@@ -61,6 +76,16 @@ class FlutterWindow : public Win32Window {
   std::string WinrtStringToUtf8(const winrt::hstring& value) const;
   void NotifyFlutterConnectionRequest(const std::string& friendly_name,
                                       const std::string& session_id);
+  // Runs on the Win32 message-thread (same thread Flutter expects for channels).
+  void DispatchToPlatformThread(std::unique_ptr<AirSharePlatformTask> task);
+
+  template <typename F>
+  void DispatchToPlatformThread(F&& f) {
+    DispatchToPlatformThread(
+        std::unique_ptr<AirSharePlatformTask>(new AirShareLambdaPlatformTask<
+                                              std::decay_t<F>>(std::forward<F>(f))));
+  }
+
   void CancelApprovalTimeout();
   void ScheduleApprovalTimeout();
   void ClearPendingReadState();

@@ -83,6 +83,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private var pendingReadDevice: BluetoothDevice? = null
     private var pendingReadRequestId: Int? = null
     private var pendingReadOffset: Int = 0
+    private var handshakePayload: ByteArray = ByteArray(0)
 
     private val approvalTimeoutHandler = Handler(Looper.getMainLooper())
     private var approvalTimeoutRunnable: Runnable? = null
@@ -152,26 +153,63 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             offset: Int,
             characteristic: BluetoothGattCharacteristic,
         ) {
+            Log.i(
+                "AirShareNative",
+                "Android | GATT | Read Request received for UUID: ${characteristic.uuid}",
+            )
             if (characteristic.uuid == endpointCharacteristicUuid) {
                 val payload = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
-                gattServer?.sendResponse(
+                val sent = gattServer?.sendResponse(
                     device,
                     requestId,
                     BluetoothGatt.GATT_SUCCESS,
                     offset,
                     payload,
+                ) == true
+                Log.i(
+                    "AirShareNative",
+                    "Android | GATT | Sending Response: ${String(payload, StandardCharsets.UTF_8)} (Length: ${payload.size})",
                 )
+                if (!sent) {
+                    Log.w("AirShareNative", "Android | GATT | sendResponse failed for endpoint payload")
+                }
                 return
             }
             if (characteristic.uuid != handshakeCharacteristicUuid) return
-            if (pendingReadDevice != null) {
-                gattServer?.sendResponse(
+            if (handshakePayload.isNotEmpty()) {
+                val sent = gattServer?.sendResponse(
                     device,
                     requestId,
-                    BluetoothGatt.GATT_FAILURE,
+                    BluetoothGatt.GATT_SUCCESS,
                     offset,
-                    null,
+                    handshakePayload,
+                ) == true
+                val payloadText = String(handshakePayload, StandardCharsets.UTF_8)
+                Log.i(
+                    "AirShareNative",
+                    "Android | GATT | Sending Response: $payloadText (Length: ${handshakePayload.size})",
                 )
+                if (!sent) {
+                    Log.w("AirShareNative", "Android | GATT | sendResponse failed for approved payload")
+                }
+                return
+            }
+            if (pendingReadDevice != null) {
+                val emptyPayload = ByteArray(0)
+                val sent = gattServer?.sendResponse(
+                    device,
+                    requestId,
+                    BluetoothGatt.GATT_SUCCESS,
+                    offset,
+                    emptyPayload,
+                ) == true
+                Log.i(
+                    "AirShareNative",
+                    "Android | GATT | Sending Response:  (Length: 0)",
+                )
+                if (!sent) {
+                    Log.w("AirShareNative", "Android | GATT | sendResponse failed for empty pending payload")
+                }
                 return
             }
 
@@ -193,6 +231,21 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                         "deviceAddress" to device.address,
                     ),
                 )
+            }
+            val emptyPayload = ByteArray(0)
+            val sent = gattServer?.sendResponse(
+                device,
+                requestId,
+                BluetoothGatt.GATT_SUCCESS,
+                offset,
+                emptyPayload,
+            ) == true
+            Log.i(
+                "AirShareNative",
+                "Android | GATT | Sending Response:  (Length: 0)",
+            )
+            if (!sent) {
+                Log.w("AirShareNative", "Android | GATT | sendResponse failed for initial empty payload")
             }
         }
 
@@ -301,6 +354,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        Log.i(
+            "AirShareNative",
+            "Android | UUID Verify | Service: $serviceUuid | Characteristic: $handshakeCharacteristicUuid",
+        )
         bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager?.adapter
         bleScanner = bluetoothAdapter?.bluetoothLeScanner
@@ -367,6 +424,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 )
                 gattServer?.cancelConnection(device)
             }
+            handshakePayload = ByteArray(0)
+            handshakeCharacteristic?.value = null
             clearPendingRead()
             Log.i("AirShareNative", "Peer Handshake Blocked: connection declined by operator")
             result.success(null)
@@ -380,9 +439,14 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             result.error("handshake_not_ready", "WLAN credentials are not available yet.", null)
             return
         }
+        handshakePayload = payload.copyOf()
+        Log.i(
+            "AirShareNative",
+            "Android | approveConnection | handshakePayload length=${handshakePayload.size} body=${String(handshakePayload, StandardCharsets.UTF_8).take(200)}",
+        )
 
         val characteristic = handshakeCharacteristic
-        characteristic?.value = payload
+        characteristic?.value = handshakePayload
 
         val device = pendingReadDevice
         val requestId = pendingReadRequestId
@@ -398,7 +462,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 requestId,
                 BluetoothGatt.GATT_SUCCESS,
                 pendingReadOffset,
-                payload,
+                handshakePayload,
             )
             Log.i("AirShareNative", "Peer Handshake Released for ${device.address}")
         } else {
@@ -439,6 +503,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 )
             }
             gattServer?.cancelConnection(device)
+            handshakePayload = ByteArray(0)
+            handshakeCharacteristic?.value = null
             clearPendingRead()
         }
         approvalTimeoutHandler.postDelayed(approvalTimeoutRunnable!!, 30_000)
@@ -457,18 +523,24 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     }
 
     private fun buildHandshakePayloadOrNull(): ByteArray? {
-        val ssid = pendingHotspotSsid
-        val password = pendingHotspotPassword
-        val hubIp = pendingHubIp
-        if (ssid.isNullOrBlank() || password.isNullOrBlank() || hubIp.isNullOrBlank()) {
+        val hubIp = pendingHubIp?.trim().orEmpty()
+        if (hubIp.isBlank()) {
+            Log.w("AirShareNative", "Android | Handshake build skipped: pendingHubIp is empty")
             return null
         }
-        return JSONObject().apply {
+        val ssid = pendingHotspotSsid?.trim().orEmpty()
+        val password = pendingHotspotPassword?.trim().orEmpty()
+        val json = JSONObject().apply {
             put("ssid", ssid)
             put("password", password)
             put("hubIp", hubIp)
             put("hubPort", pendingHubPort)
-        }.toString().toByteArray(StandardCharsets.UTF_8)
+        }.toString()
+        Log.i(
+            "AirShareNative",
+            "Android | Handshake JSON built | hubIp=$hubIp port=$pendingHubPort ssid_len=${ssid.length} pwd_len=${password.length}",
+        )
+        return json.toByteArray(StandardCharsets.UTF_8)
     }
 
     private fun requiredPermissions(): Array<String> {
@@ -637,6 +709,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }
         handshakeCharacteristic = characteristic
         endpointCharacteristic = endpoint
+        handshakePayload = ByteArray(0)
         handshakeCharacteristic?.value = null
         endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
 
@@ -686,6 +759,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         gattServer = null
         handshakeCharacteristic = null
         endpointCharacteristic = null
+        handshakePayload = ByteArray(0)
         result.success(null)
     }
 
@@ -879,6 +953,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     activeHotspotReservation?.close()
                     localHotspotReservation = reservation
                     activeHotspotReservation = reservation
+                    handshakePayload = ByteArray(0)
                     handshakeCharacteristic?.value = null
                     val wifiConfig = reservation.wifiConfiguration
                     val ssid = call.argument<String>("ssid") ?: wifiConfig?.SSID ?: "AirShareLink"
@@ -957,6 +1032,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         gattServer = null
         handshakeCharacteristic = null
         endpointCharacteristic = null
+        handshakePayload = ByteArray(0)
         clearPendingRead()
         pendingHotspotSsid = null
         pendingHotspotPassword = null
