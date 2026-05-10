@@ -21,11 +21,55 @@ class DiscoveryPage extends StatefulWidget {
 class _DiscoveryPageState extends State<DiscoveryPage> {
   StreamSubscription<List<BlePeer>>? _scanSubscription;
   final List<BlePeer> _peers = [];
+  final Set<String> _seenPeers = <String>{};
   bool _isScanning = false;
   bool _isHandshaking = false;
   String _status = 'Peer Discovery via BLE';
   double _pulseScale = 1.0;
   Timer? _pulseTimer;
+  static const int _endpointReadRetries = 5;
+
+  Future<void> _logNetworkInterfaces() async {
+    final interfaces = await NetworkInterface.list(
+      includeLoopback: true,
+      type: InternetAddressType.IPv4,
+    );
+    for (final iface in interfaces) {
+      for (final addr in iface.addresses) {
+        await ConnectionLogger.instance.log(
+          'Network | Interface ${iface.name}: ${addr.address}',
+        );
+      }
+    }
+  }
+
+  bool _isRetriableEmptyEndpointError(Object error) {
+    final msg = error.toString().toLowerCase();
+    return msg.contains('empty') ||
+        msg.contains('malformed') ||
+        msg.contains('invalid_endpoint_payload') ||
+        msg.contains('peer endpoint read returned empty payload');
+  }
+
+  Future<PeerEndpoint> _readEndpointWithRetries(BlePeer peer) async {
+    Object? lastError;
+    for (var attempt = 1; attempt <= _endpointReadRetries; attempt++) {
+      try {
+        return await BleTransport.instance.readPeerEndpoint(peer);
+      } catch (e) {
+        lastError = e;
+        if (!_isRetriableEmptyEndpointError(e) || attempt == _endpointReadRetries) {
+          rethrow;
+        }
+        await ConnectionLogger.instance.log(
+          'BLE | Retrying endpoint read',
+          details: 'attempt=$attempt/$_endpointReadRetries',
+        );
+        await Future<void>.delayed(const Duration(seconds: 2));
+      }
+    }
+    throw Exception('Endpoint read failed: $lastError');
+  }
 
   @override
   void initState() {
@@ -93,15 +137,19 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       await _ensureAndroidLocationForBle();
       if (!mounted) return;
 
+      await _logNetworkInterfaces();
       await ConnectionLogger.instance.log('BLE Scan Start');
       await BleTransport.instance.startScanning();
       _scanSubscription?.cancel();
+      _seenPeers.clear();
       _scanSubscription = BleTransport.instance.scanPeers().listen((peers) {
         for (final peer in peers) {
-          ConnectionLogger.instance.log(
-            'BLE Scan Peer Found',
-            details: '${peer.friendlyName} (${peer.id})',
-          );
+          if (_seenPeers.add(peer.id)) {
+            ConnectionLogger.instance.log(
+              'BLE Scan Peer Found',
+              details: '${peer.friendlyName} (${peer.id})',
+            );
+          }
         }
         if (!mounted) return;
         setState(() {
@@ -140,14 +188,19 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     try {
       setState(() {
         _isHandshaking = true;
-        _status = 'Reading endpoint from peer…';
+        _status = 'Waiting for peer to approve...';
       });
 
       await ConnectionLogger.instance.log(
         'BLE | Reading IP from peer...',
         details: 'peer=${peer.friendlyName} (${peer.id})',
       );
-      final endpoint = await BleTransport.instance.readPeerEndpoint(peer);
+      await BleTransport.instance.establishSecureHandshake(peer);
+      if (!mounted) return;
+      setState(() {
+        _status = 'Reading endpoint from peer…';
+      });
+      final endpoint = await _readEndpointWithRetries(peer);
       await ConnectionLogger.instance.log(
         'BLE | Extracted IP',
         details: '${endpoint.ip}:${endpoint.port}',
@@ -161,6 +214,53 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         'Connection | Triggering auto-connect',
         details: '${endpoint.ip}:${endpoint.port}',
       );
+      try {
+        await ConnectionLogger.instance.log(
+          'Socket Connection Attempt',
+          details: '${endpoint.ip}:${endpoint.port}',
+        );
+        final socket = await Socket.connect(
+          endpoint.ip,
+          endpoint.port,
+          timeout: const Duration(seconds: 5),
+        );
+        await socket.close();
+        await ConnectionLogger.instance.log(
+          'Socket Connection Success',
+          details: '${endpoint.ip}:${endpoint.port}',
+        );
+      } on TimeoutException {
+        await ConnectionLogger.instance.log(
+          'Connection | Timeout trying to reach ${endpoint.ip} - Check if devices are on the same Wi-Fi and if Client Isolation is active.',
+        );
+        if (endpoint.ip.startsWith('10.') || endpoint.ip.startsWith('172.')) {
+          await ConnectionLogger.instance.log(
+            'Network Hint',
+            details: 'Potential Client Isolation detected on this network.',
+          );
+        }
+        rethrow;
+      } on SocketException catch (e) {
+        final looksLikeTimeout = e.message.toLowerCase().contains('timed out') ||
+            e.osError?.message.toLowerCase().contains('timed out') == true;
+        if (looksLikeTimeout) {
+          await ConnectionLogger.instance.log(
+            'Connection | Timeout trying to reach ${endpoint.ip} - Check if devices are on the same Wi-Fi and if Client Isolation is active.',
+          );
+        } else {
+          await ConnectionLogger.instance.log(
+            'Socket Connection Failed',
+            details: e.toString(),
+          );
+        }
+        if (endpoint.ip.startsWith('10.') || endpoint.ip.startsWith('172.')) {
+          await ConnectionLogger.instance.log(
+            'Network Hint',
+            details: 'Potential Client Isolation detected on this network.',
+          );
+        }
+        rethrow;
+      }
       await widget.onEndpointReady(endpoint);
     } catch (e) {
       await ConnectionLogger.instance.log('Handshake Failure', details: e.toString());
@@ -195,6 +295,21 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
               style: Theme.of(context).textTheme.bodySmall,
             ),
             const SizedBox(height: 8),
+            if (_isHandshaking)
+              Row(
+                children: const [
+                  SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text('Waiting for sender to approve the connection...'),
+                  ),
+                ],
+              ),
+            if (_isHandshaking) const SizedBox(height: 8),
             Expanded(
               child: _peers.isEmpty
                   ? Center(
@@ -209,11 +324,15 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                           const SizedBox(height: 8),
                           Text(
                             _isHandshaking
-                                ? 'Establishing secure link…'
+                                ? 'Waiting for sender to approve the connection...'
                                 : _isScanning
                                 ? 'Peer Discovery via BLE in progress…'
                                 : 'No senders discovered',
                           ),
+                          if (_isHandshaking) ...[
+                            const SizedBox(height: 8),
+                            const CircularProgressIndicator(strokeWidth: 2),
+                          ],
                         ],
                       ),
                     )
@@ -226,7 +345,8 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                           leading: const Icon(Icons.hub),
                           title: Text(peer.friendlyName),
                           subtitle: Text(
-                            peer.serviceUuid == kAirShareBleServiceUuid
+                            peer.serviceUuid.toLowerCase() ==
+                                    kAirShareBleServiceUuid.toLowerCase()
                                 ? 'Transfer hub • $kAirShareBleServiceUuid'
                                 : 'UUID ${peer.serviceUuid}',
                           ),

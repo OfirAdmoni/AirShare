@@ -86,10 +86,11 @@ class BleTransport {
   Stream<List<BlePeer>> scanPeers() {
     return _scanChannel.receiveBroadcastStream().map((event) {
       if (event is! List) return const <BlePeer>[];
+      final expectedUuid = kAirShareBleServiceUuid.toLowerCase();
       return event
           .whereType<Map>()
           .map(BlePeer.fromMap)
-          .where((peer) => peer.serviceUuid == kAirShareBleServiceUuid)
+          .where((peer) => peer.serviceUuid.toLowerCase() == expectedUuid)
           .toList();
     });
   }
@@ -126,13 +127,15 @@ class BleTransport {
   }
 
   Future<HandshakePayload> establishSecureHandshake(BlePeer peer) async {
-    final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
+    final raw = await _methodChannel
+        .invokeMethod<Map<dynamic, dynamic>>(
       'establishSecureHandshake',
       {
         'peerId': peer.id,
         'serviceUuid': peer.serviceUuid,
       },
-    );
+    )
+        .timeout(const Duration(seconds: 45));
     if (raw == null) {
       throw Exception('Secure handshake returned empty payload');
     }
@@ -140,13 +143,15 @@ class BleTransport {
   }
 
   Future<PeerEndpoint> readPeerEndpoint(BlePeer peer) async {
-    final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
+    final raw = await _methodChannel
+        .invokeMethod<Map<dynamic, dynamic>>(
       'readPeerEndpoint',
       {
         'peerId': peer.id,
         'serviceUuid': peer.serviceUuid,
       },
-    );
+    )
+        .timeout(const Duration(seconds: 60));
     if (raw == null) {
       throw Exception('Peer endpoint read returned empty payload');
     }

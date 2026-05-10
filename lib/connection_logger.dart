@@ -41,5 +41,14 @@ class ConnectionLogger {
     });
     await _writeChain;
   }
+
+  Future<void> clear() async {
+    _writeChain = _writeChain.then((_) async {
+      final file = await _resolveLogFile();
+      await file.writeAsString('', flush: true);
+      entries.value = <String>[];
+    });
+    await _writeChain;
+  }
 }
 

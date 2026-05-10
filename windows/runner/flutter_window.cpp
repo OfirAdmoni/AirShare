@@ -170,7 +170,7 @@ void FlutterWindow::InitializeNativeChannels() {
                           "Secure handshake arguments are missing.");
             return;
           }
-          EstablishSecureHandshake(*args, result.get());
+          EstablishSecureHandshake(*args, std::move(result));
           return;
         }
         if (call.method_name() == "readPeerEndpoint") {
@@ -180,7 +180,7 @@ void FlutterWindow::InitializeNativeChannels() {
             result->Error("invalid_args", "Endpoint read arguments are missing.");
             return;
           }
-          ReadPeerEndpoint(*args, result.get());
+          ReadPeerEndpoint(*args, std::move(result));
           return;
         }
         if (call.method_name() == "startHubAdvertising") {
@@ -254,9 +254,6 @@ void FlutterWindow::InitializeNativeChannels() {
                 pending_hub_port_ = static_cast<int>(*p64);
               }
             }
-          }
-          if (gatt_endpoint_) {
-            gatt_endpoint_.StaticValue(BuildEndpointBuffer());
           }
           result->Success(flutter::EncodableValue(flutter::EncodableMap{
               {flutter::EncodableValue("ssid"),
@@ -368,7 +365,7 @@ void FlutterWindow::StopBleScanning(
 
 void FlutterWindow::EstablishSecureHandshake(
     const flutter::EncodableMap& args,
-    flutter::MethodResult<flutter::EncodableValue>* result) {
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   using namespace winrt::Windows::Devices::Bluetooth;
   using namespace winrt::Windows::Devices::Bluetooth::GenericAttributeProfile;
 
@@ -377,15 +374,17 @@ void FlutterWindow::EstablishSecureHandshake(
     result->Error("invalid_peer", "Peer id is required.");
     return;
   }
-
-  try {
-    const auto peer_id = std::get<std::string>(peer_id_it->second);
-    const uint64_t bt_address = _strtoui64(peer_id.c_str(), nullptr, 10);
-    auto ble_device = BluetoothLEDevice::FromBluetoothAddressAsync(bt_address).get();
-    if (!ble_device) {
-      result->Error("peer_not_found", "Unable to open BLE peer.");
-      return;
-    }
+  const auto args_copy = args;
+  std::thread([this, args_copy, result = std::move(result)]() mutable {
+    try {
+      const auto peer_id_it = args_copy.find(flutter::EncodableValue("peerId"));
+      const auto peer_id = std::get<std::string>(peer_id_it->second);
+      const uint64_t bt_address = _strtoui64(peer_id.c_str(), nullptr, 10);
+      auto ble_device = BluetoothLEDevice::FromBluetoothAddressAsync(bt_address).get();
+      if (!ble_device) {
+        result->Error("peer_not_found", "Unable to open BLE peer.");
+        return;
+      }
 
     auto service_uuid = winrt::guid(kAirShareServiceUuid);
     GattDeviceServicesResult services_result{nullptr};
@@ -420,21 +419,60 @@ void FlutterWindow::EstablishSecureHandshake(
       return;
     }
 
-    auto read_result = chars_result.Characteristics().GetAt(0).ReadValueAsync().get();
-    if (read_result.Status() != GattCommunicationStatus::Success) {
-      result->Error("handshake_read_failed", "Unable to read handshake payload.");
-      return;
-    }
+    std::vector<uint8_t> bytes;
+    bool handshake_ready = false;
+    for (int attempt = 1; attempt <= 15; ++attempt) {
+      GattReadResult read_result{nullptr};
+      try {
+        read_result = chars_result.Characteristics()
+                          .GetAt(0)
+                          .ReadValueAsync(BluetoothCacheMode::Uncached)
+                          .get();
+      } catch (const winrt::hresult_error& e) {
+        const std::wstring msg = L"[AirShareNative] Native | Handshake read attempt " +
+                                 std::to_wstring(attempt) +
+                                 L"... Status: Fail (" + e.message().c_str() + L")\n";
+        OutputDebugStringW(msg.c_str());
+        if (attempt < 15) {
+          std::this_thread::sleep_for(std::chrono::seconds(2));
+          continue;
+        }
+        result->Error("handshake_read_failed", "Unable to read handshake payload.");
+        return;
+      }
+      if (read_result.Status() != GattCommunicationStatus::Success) {
+        const std::wstring msg = L"[AirShareNative] Native | Handshake read attempt " +
+                                 std::to_wstring(attempt) + L"... Status: Fail\n";
+        OutputDebugStringW(msg.c_str());
+        if (attempt < 15) {
+          std::this_thread::sleep_for(std::chrono::seconds(2));
+          continue;
+        }
+        result->Error("handshake_read_failed", "Unable to read handshake payload.");
+        return;
+      }
 
-    auto buffer = read_result.Value();
-    winrt::Windows::Storage::Streams::DataReader reader =
-        winrt::Windows::Storage::Streams::DataReader::FromBuffer(buffer);
-    const uint32_t len = reader.UnconsumedBufferLength();
-    std::vector<uint8_t> bytes(len);
-    if (len > 0) {
-      reader.ReadBytes(bytes);
+      auto buffer = read_result.Value();
+      winrt::Windows::Storage::Streams::DataReader reader =
+          winrt::Windows::Storage::Streams::DataReader::FromBuffer(buffer);
+      const uint32_t len = reader.UnconsumedBufferLength();
+      bytes.assign(len, 0);
+      if (len > 0) {
+        reader.ReadBytes(bytes);
+        const std::wstring msg = L"[AirShareNative] Native | Handshake read attempt " +
+                                 std::to_wstring(attempt) + L"... Status: Success\n";
+        OutputDebugStringW(msg.c_str());
+        handshake_ready = true;
+        break;
+      }
+      const std::wstring msg = L"[AirShareNative] Native | Handshake read attempt " +
+                               std::to_wstring(attempt) + L"... Status: Empty\n";
+      OutputDebugStringW(msg.c_str());
+      if (attempt < 15) {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+      }
     }
-    if (len == 0) {
+    if (!handshake_ready) {
       result->Error("handshake_pending", "Handshake pending UI approval.");
       return;
     }
@@ -480,15 +518,16 @@ void FlutterWindow::EstablishSecureHandshake(
          flutter::EncodableValue(extract_int("hubPort", json, 8080))},
     };
     OutputDebugStringW(L"[AirShareNative] Peer Handshake Released (client read).\n");
-    result->Success(flutter::EncodableValue(payload));
-  } catch (const winrt::hresult_error& e) {
-    result->Error("handshake_error", WinrtStringToUtf8(e.message()));
-  }
+      result->Success(flutter::EncodableValue(payload));
+    } catch (const winrt::hresult_error& e) {
+      result->Error("handshake_error", WinrtStringToUtf8(e.message()));
+    }
+  }).detach();
 }
 
 void FlutterWindow::ReadPeerEndpoint(
     const flutter::EncodableMap& args,
-    flutter::MethodResult<flutter::EncodableValue>* result) {
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   using namespace winrt::Windows::Devices::Bluetooth;
   using namespace winrt::Windows::Devices::Bluetooth::GenericAttributeProfile;
 
@@ -497,15 +536,17 @@ void FlutterWindow::ReadPeerEndpoint(
     result->Error("invalid_peer", "Peer id is required.");
     return;
   }
-
-  try {
-    const auto peer_id = std::get<std::string>(peer_id_it->second);
-    const uint64_t bt_address = _strtoui64(peer_id.c_str(), nullptr, 10);
-    auto ble_device = BluetoothLEDevice::FromBluetoothAddressAsync(bt_address).get();
-    if (!ble_device) {
-      result->Error("peer_not_found", "Unable to open BLE peer.");
-      return;
-    }
+  const auto args_copy = args;
+  std::thread([this, args_copy, result = std::move(result)]() mutable {
+    try {
+      const auto peer_id_it = args_copy.find(flutter::EncodableValue("peerId"));
+      const auto peer_id = std::get<std::string>(peer_id_it->second);
+      const uint64_t bt_address = _strtoui64(peer_id.c_str(), nullptr, 10);
+      auto ble_device = BluetoothLEDevice::FromBluetoothAddressAsync(bt_address).get();
+      if (!ble_device) {
+        result->Error("peer_not_found", "Unable to open BLE peer.");
+        return;
+      }
 
     auto service_uuid = winrt::guid(kAirShareServiceUuid);
     auto services_result = ble_device.GetGattServicesForUuidAsync(service_uuid).get();
@@ -554,13 +595,14 @@ void FlutterWindow::ReadPeerEndpoint(
       result->Error("invalid_endpoint_payload", "Endpoint payload malformed.");
       return;
     }
-    result->Success(flutter::EncodableValue(flutter::EncodableMap{
-        {flutter::EncodableValue("ip"), flutter::EncodableValue(ip)},
-        {flutter::EncodableValue("port"), flutter::EncodableValue(port)},
-    }));
-  } catch (const winrt::hresult_error& e) {
-    result->Error("endpoint_error", WinrtStringToUtf8(e.message()));
-  }
+      result->Success(flutter::EncodableValue(flutter::EncodableMap{
+          {flutter::EncodableValue("ip"), flutter::EncodableValue(ip)},
+          {flutter::EncodableValue("port"), flutter::EncodableValue(port)},
+      }));
+    } catch (const winrt::hresult_error& e) {
+      result->Error("endpoint_error", WinrtStringToUtf8(e.message()));
+    }
+  }).detach();
 }
 
 void FlutterWindow::StartHubAdvertising(
@@ -611,7 +653,6 @@ void FlutterWindow::StartHubAdvertising(
       return;
     }
     gatt_endpoint_ = endpoint_result.Characteristic();
-    gatt_endpoint_.StaticValue(BuildEndpointBuffer());
     endpoint_read_token_ = gatt_endpoint_.ReadRequested(
         [this](GattLocalCharacteristic const&, GattReadRequestedEventArgs args) {
           auto deferral = args.GetDeferral();
@@ -723,9 +764,13 @@ void FlutterWindow::StartHubAdvertising(
     GattServiceProviderAdvertisingParameters adv_params;
     adv_params.IsConnectable(true);
     adv_params.IsDiscoverable(true);
+    OutputDebugStringW(
+        L"[AirShareNative] Starting GATT advertising with primary packet carrying service UUID 6E400001-B5A3-F393-E0A9-E50E24DCCA9E.\n");
     gatt_provider_.StartAdvertising(adv_params);
     is_advertising_ = true;
     OutputDebugStringW(L"[AirShareNative] Hub BLE advertising started (GATT server).\n");
+    OutputDebugStringW(
+        L"[AirShareNative] Firewall hint: allow inbound TCP 8080 (example: netsh advfirewall firewall add rule name=\"AirShare 8080\" dir=in action=allow protocol=TCP localport=8080).\n");
     result->Success(flutter::EncodableValue());
   } catch (const winrt::hresult_error& e) {
     result->Error("ble_advertise_failed", WinrtStringToUtf8(e.message()));
@@ -834,9 +879,6 @@ void FlutterWindow::UpdateHubEndpoint(
     } else if (const auto p64 = std::get_if<int64_t>(&port_it->second)) {
       pending_hub_port_ = static_cast<int>(*p64);
     }
-  }
-  if (gatt_endpoint_) {
-    gatt_endpoint_.StaticValue(BuildEndpointBuffer());
   }
   result->Success(flutter::EncodableValue());
 }

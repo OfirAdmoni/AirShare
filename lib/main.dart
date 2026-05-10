@@ -7,6 +7,7 @@ import 'package:air_share/device_branding.dart';
 import 'package:air_share/discovery_page.dart';
 import 'package:air_share/file_list_screen.dart';
 import 'package:air_share/file_zone_session.dart';
+import 'package:air_share/hub_endpoint_state.dart';
 import 'package:air_share/hub_status.dart';
 import 'package:air_share/sender_staging_page.dart';
 
@@ -62,6 +63,19 @@ class _AirShareAppState extends State<AirShareApp> {
           ],
         ),
       );
+      if (approved == true) {
+        final pendingIp = HubEndpointState.instance.pendingIp;
+        if (pendingIp != null && pendingIp.isNotEmpty) {
+          await BleTransport.instance.updateHubEndpoint(
+            ip: pendingIp,
+            port: HubEndpointState.instance.pendingPort,
+          );
+          await ConnectionLogger.instance.log(
+            'Connection | Advertising real IP',
+            details: '$pendingIp:${HubEndpointState.instance.pendingPort}',
+          );
+        }
+      }
       await BleTransport.instance.approveConnection(approved: approved == true);
       await ConnectionLogger.instance.log(
         'Connection Request Decision',
@@ -375,13 +389,42 @@ class _ManualConnectionPageState extends State<ManualConnectionPage> {
   }
 }
 
-class ConnectionLogPage extends StatelessWidget {
+class ConnectionLogPage extends StatefulWidget {
   const ConnectionLogPage({super.key});
+
+  @override
+  State<ConnectionLogPage> createState() => _ConnectionLogPageState();
+}
+
+class _ConnectionLogPageState extends State<ConnectionLogPage> {
+  bool _clearing = false;
+
+  Future<void> _clearLogs() async {
+    setState(() => _clearing = true);
+    try {
+      await ConnectionLogger.instance.clear();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Logs cleared')),
+      );
+    } finally {
+      if (mounted) setState(() => _clearing = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Connection Audit Log')),
+      appBar: AppBar(
+        title: const Text('Connection Audit Log'),
+        actions: [
+          IconButton(
+            tooltip: 'Clear Logs',
+            onPressed: _clearing ? null : _clearLogs,
+            icon: const Icon(Icons.delete_outline),
+          ),
+        ],
+      ),
       body: ValueListenableBuilder<List<String>>(
         valueListenable: ConnectionLogger.instance.entries,
         builder: (context, lines, _) {

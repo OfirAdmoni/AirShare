@@ -41,9 +41,9 @@ class FlutterWindow : public Win32Window {
   void StopBleScanning(flutter::MethodResult<flutter::EncodableValue>* result);
   void EstablishSecureHandshake(
       const flutter::EncodableMap& args,
-      flutter::MethodResult<flutter::EncodableValue>* result);
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void ReadPeerEndpoint(const flutter::EncodableMap& args,
-                        flutter::MethodResult<flutter::EncodableValue>* result);
+                        std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void StartHubAdvertising(const flutter::EncodableMap* args,
                            flutter::MethodResult<flutter::EncodableValue>* result);
   void StopHubAdvertising(flutter::MethodResult<flutter::EncodableValue>* result);

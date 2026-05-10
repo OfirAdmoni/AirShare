@@ -387,6 +387,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         val device = pendingReadDevice
         val requestId = pendingReadRequestId
         if (device != null && requestId != null && characteristic != null) {
+            val notified = gattServer?.notifyCharacteristicChanged(device, characteristic, false) == true
+            if (!notified) {
+                Log.w("AirShareNative", "Handshake notify not sent immediately after approval update.")
+            } else {
+                Log.i("AirShareNative", "Handshake notify sent immediately after approval update.")
+            }
             gattServer?.sendResponse(
                 device,
                 requestId,
@@ -394,11 +400,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 pendingReadOffset,
                 payload,
             )
-            val notified = gattServer?.notifyCharacteristicChanged(device, characteristic, false) == true
-            if (!notified) {
-                Log.w("AirShareNative", "Handshake notify not sent (no subscription or stack limitation).")
-            }
             Log.i("AirShareNative", "Peer Handshake Released for ${device.address}")
+        } else {
+            Log.w("AirShareNative", "Peer Handshake Released but no pending device/read request was available.")
         }
 
         clearPendingRead()
