@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'dart:io';
 
 import 'package:air_share/ble_transport.dart';
+import 'package:air_share/connection_logger.dart';
 import 'package:air_share/device_branding.dart';
 import 'package:air_share/discovery_page.dart';
 import 'package:air_share/file_list_screen.dart';
@@ -28,12 +30,18 @@ class _AirShareAppState extends State<AirShareApp> {
   @override
   void initState() {
     super.initState();
+    ConnectionLogger.instance.initialize();
+    ConnectionLogger.instance.log('Application Start');
     BleTransport.instance.setUiHandler((call) async {
       if (call.method != 'notifyConnectionRequest') {
         return null;
       }
       final args = call.arguments as Map<dynamic, dynamic>? ?? {};
       final friendlyName = (args['friendlyName'] ?? 'Unknown Device').toString();
+      await ConnectionLogger.instance.log(
+        'Connection Request Prompted',
+        details: 'peer=$friendlyName',
+      );
       final ctx = _navigatorKey.currentContext;
       if (ctx == null) return null;
       final approved = await showDialog<bool>(
@@ -55,6 +63,10 @@ class _AirShareAppState extends State<AirShareApp> {
         ),
       );
       await BleTransport.instance.approveConnection(approved: approved == true);
+      await ConnectionLogger.instance.log(
+        'Connection Request Decision',
+        details: approved == true ? 'approved' : 'declined',
+      );
       return null;
     });
   }
@@ -177,20 +189,25 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
                 ],
                 ElevatedButton.icon(
                   onPressed: () {
+                    ConnectionLogger.instance.log('Receiver Flow Opened');
                     Navigator.of(context).push<void>(
                       MaterialPageRoute<void>(
                         builder: (discoveryContext) => DiscoveryPage(
-                          onLinkReady: (payload) async {
+                          onEndpointReady: (endpoint) async {
+                            await ConnectionLogger.instance.log(
+                              'Connection | Triggering auto-connect',
+                              details: 'hub=${endpoint.ip}:${endpoint.port}',
+                            );
                             final n = FileZoneSessionScope.of(discoveryContext);
                             n.value = FileZoneSession(
-                              hubHost: payload.hubIp,
-                              hubPort: payload.hubPort,
+                              hubHost: endpoint.ip,
+                              hubPort: endpoint.port,
                             );
                             await Navigator.of(discoveryContext).push<void>(
                               MaterialPageRoute<void>(
                                 builder: (_) => FileListScreen(
-                                  hubHost: payload.hubIp,
-                                  hubPort: payload.hubPort,
+                                  hubHost: endpoint.ip,
+                                  hubPort: endpoint.port,
                                   modeTitle: 'Receive Files',
                                   isHubMode: false,
                                 ),
@@ -208,6 +225,7 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
                 const SizedBox(height: 12),
                 OutlinedButton.icon(
                   onPressed: () {
+                    ConnectionLogger.instance.log('Sender Flow Opened');
                     Navigator.of(context).push<void>(
                       MaterialPageRoute<void>(
                         builder: (_) => const SenderStagingPage(),
@@ -217,10 +235,168 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
                   icon: const Icon(Icons.send),
                   label: const Text('Send Files'),
                 ),
+                const SizedBox(height: 12),
+                OutlinedButton.icon(
+                  onPressed: () {
+                    Navigator.of(context).push<void>(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const ManualConnectionPage(),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.link),
+                  label: const Text('Connect Manually'),
+                ),
+                const SizedBox(height: 12),
+                TextButton.icon(
+                  onPressed: () {
+                    Navigator.of(context).push<void>(
+                      MaterialPageRoute<void>(
+                        builder: (_) => const ConnectionLogPage(),
+                      ),
+                    );
+                  },
+                  icon: const Icon(Icons.article_outlined),
+                  label: const Text('Log View'),
+                ),
               ],
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+class ManualConnectionPage extends StatefulWidget {
+  const ManualConnectionPage({super.key});
+
+  @override
+  State<ManualConnectionPage> createState() => _ManualConnectionPageState();
+}
+
+class _ManualConnectionPageState extends State<ManualConnectionPage> {
+  final TextEditingController _ipController = TextEditingController();
+  final TextEditingController _portController = TextEditingController(text: '8080');
+  bool _connecting = false;
+
+  @override
+  void dispose() {
+    _ipController.dispose();
+    _portController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _connect() async {
+    final ip = _ipController.text.trim();
+    final port = int.tryParse(_portController.text.trim());
+    if (ip.isEmpty || port == null || port <= 0 || port > 65535) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter a valid IP and port')),
+      );
+      return;
+    }
+    setState(() => _connecting = true);
+    await ConnectionLogger.instance.log(
+      'Socket Connection Attempt',
+      details: 'manual target=$ip:$port',
+    );
+    try {
+      final socket = await Socket.connect(
+        ip,
+        port,
+        timeout: const Duration(seconds: 3),
+      );
+      await socket.close();
+      await ConnectionLogger.instance.log('Socket Connection Success', details: '$ip:$port');
+    } catch (e) {
+      await ConnectionLogger.instance.log('Socket Connection Failed', details: e.toString());
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Connection check failed: $e')),
+      );
+      setState(() => _connecting = false);
+      return;
+    }
+
+    if (!mounted) return;
+    final notifier = FileZoneSessionScope.of(context);
+    notifier.value = FileZoneSession(hubHost: ip, hubPort: port);
+    await ConnectionLogger.instance.log('Manual Session Initialized', details: '$ip:$port');
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => FileListScreen(
+          hubHost: ip,
+          hubPort: port,
+          modeTitle: 'Manual Connection',
+          isHubMode: false,
+        ),
+      ),
+    );
+    notifier.value = null;
+    if (mounted) setState(() => _connecting = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Manual Connection')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            TextField(
+              controller: _ipController,
+              decoration: const InputDecoration(
+                labelText: 'IP Address',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _portController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Port',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: _connecting ? null : _connect,
+              icon: const Icon(Icons.power),
+              label: const Text('Connect'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ConnectionLogPage extends StatelessWidget {
+  const ConnectionLogPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Connection Audit Log')),
+      body: ValueListenableBuilder<List<String>>(
+        valueListenable: ConnectionLogger.instance.entries,
+        builder: (context, lines, _) {
+          if (lines.isEmpty) {
+            return const Center(child: Text('No logs yet'));
+          }
+          return ListView.builder(
+            padding: const EdgeInsets.all(12),
+            itemCount: lines.length,
+            itemBuilder: (context, index) => Padding(
+              padding: const EdgeInsets.symmetric(vertical: 3),
+              child: Text(lines[index], style: const TextStyle(fontSize: 12)),
+            ),
+          );
+        },
       ),
     );
   }

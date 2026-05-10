@@ -55,6 +55,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
     private val serviceUuid: UUID = UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
     private val handshakeCharacteristicUuid: UUID = UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+    private val endpointCharacteristicUuid: UUID = UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
     private val clientConfigDescriptorUuid: UUID =
         UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
@@ -70,8 +71,14 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
     private var gattServer: BluetoothGattServer? = null
     private var handshakeCharacteristic: BluetoothGattCharacteristic? = null
+    private var endpointCharacteristic: BluetoothGattCharacteristic? = null
     private var activeGattClient: BluetoothGatt? = null
     private var isScanning = false
+    private var isAdvertising = false
+    private var pendingAdvertiseSettings: AdvertiseSettings? = null
+    private var pendingAdvertiseData: AdvertiseData? = null
+    private var pendingScanResponseData: AdvertiseData? = null
+    private var pendingAdvertiseResult: MethodChannel.Result? = null
 
     private var pendingReadDevice: BluetoothDevice? = null
     private var pendingReadRequestId: Int? = null
@@ -84,7 +91,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private var pendingHotspotPassword: String? = null
     private var pendingHubIp: String? = null
     private var pendingHubPort: Int = 8080
+    private var advertisedEndpoint: String = ""
 
+    private var activeHotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
     private var localHotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
     private var connectivityCallback: ConnectivityManager.NetworkCallback? = null
 
@@ -120,10 +129,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+            isAdvertising = true
             Log.i("AirShareNative", "BLE advertising started")
         }
 
         override fun onStartFailure(errorCode: Int) {
+            isAdvertising = false
             Log.e("AirShareNative", "BLE advertising failed: code=$errorCode")
         }
     }
@@ -141,6 +152,17 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             offset: Int,
             characteristic: BluetoothGattCharacteristic,
         ) {
+            if (characteristic.uuid == endpointCharacteristicUuid) {
+                val payload = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
+                gattServer?.sendResponse(
+                    device,
+                    requestId,
+                    BluetoothGatt.GATT_SUCCESS,
+                    offset,
+                    payload,
+                )
+                return
+            }
             if (characteristic.uuid != handshakeCharacteristicUuid) return
             if (pendingReadDevice != null) {
                 gattServer?.sendResponse(
@@ -238,6 +260,43 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 )
             }
         }
+
+        override fun onServiceAdded(status: Int, service: BluetoothGattService) {
+            if (service.uuid != serviceUuid) return
+            val result = pendingAdvertiseResult ?: return
+            val advertiser = bleAdvertiser
+            val settings = pendingAdvertiseSettings
+            val advertiseData = pendingAdvertiseData
+            val scanResponse = pendingScanResponseData
+
+            pendingAdvertiseResult = null
+            pendingAdvertiseSettings = null
+            pendingAdvertiseData = null
+            pendingScanResponseData = null
+
+            if (status != BluetoothGatt.GATT_SUCCESS ||
+                advertiser == null ||
+                settings == null ||
+                advertiseData == null ||
+                scanResponse == null
+            ) {
+                isAdvertising = false
+                Log.e("AirShareNative", "Failed to add GATT service before advertising. status=$status")
+                result.error("gatt_service_add_failed", "Failed to add GATT service.", null)
+                return
+            }
+
+            try {
+                isAdvertising = true
+                advertiser.startAdvertising(settings, advertiseData, scanResponse, advertiseCallback)
+                Log.i("AirShareNative", "Hub BLE advertising active with UUID: $serviceUuid")
+                result.success(null)
+            } catch (e: Exception) {
+                isAdvertising = false
+                Log.e("AirShareNative", "Unable to start BLE advertising after service add: ${e.message}")
+                result.error("ble_advertise_failed", e.message, null)
+            }
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -283,6 +342,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             "startHubAdvertising" -> ensurePermissionsThenExecute(result) { startHubAdvertising(call, result) }
             "stopHubAdvertising" -> stopHubAdvertising(result)
             "establishSecureHandshake" -> ensurePermissionsThenExecute(result) { establishSecureHandshake(call, result) }
+            "readPeerEndpoint" -> ensurePermissionsThenExecute(result) { readPeerEndpoint(call, result) }
+            "updateHubEndpoint" -> updateHubEndpoint(call, result)
             "approveConnection" -> approveConnection(call, result)
             "startTemporaryHotspot" -> ensurePermissionsThenExecute(result) { startTemporaryHotspot(call, result) }
             "connectToHubWlan" -> ensurePermissionsThenExecute(result) { connectToHubWlan(call, result) }
@@ -341,6 +402,20 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }
 
         clearPendingRead()
+        result.success(null)
+    }
+
+    private fun updateHubEndpoint(call: MethodCall, result: MethodChannel.Result) {
+        val ip = call.argument<String>("ip")?.trim().orEmpty()
+        val port = call.argument<Int>("port") ?: 8080
+        if (ip.isEmpty()) {
+            result.error("invalid_endpoint", "ip is required", null)
+            return
+        }
+        pendingHubIp = ip
+        pendingHubPort = port
+        advertisedEndpoint = "$ip:$port"
+        endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
         result.success(null)
     }
 
@@ -480,11 +555,19 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             result.error("ble_unavailable", "Bluetooth LE advertiser is unavailable.", null)
             return
         }
+        if (isAdvertising || pendingAdvertiseResult != null) {
+            Log.w("AirShareNative", "BLE advertising already active or starting; start request ignored")
+            result.success(null)
+            return
+        }
         val fromFlutter = call.argument<String>("friendlyName")?.trim().orEmpty()
         val modelFallback = Build.MODEL.trim().ifBlank {
             Build.PRODUCT.trim().ifBlank { "Android" }
         }
         val baseName = if (fromFlutter.isNotEmpty()) fromFlutter else modelFallback
+        if (pendingHubIp != null && pendingHubIp!!.isNotBlank()) {
+            advertisedEndpoint = "${pendingHubIp}:${pendingHubPort}"
+        }
         var broadcastLabel = baseName.take(10).trim()
         if (broadcastLabel.isEmpty()) {
             broadcastLabel = modelFallback.take(10).trim().ifEmpty { "?" }
@@ -529,12 +612,18 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
             BluetoothGattCharacteristic.PERMISSION_READ,
         )
+        val endpoint = BluetoothGattCharacteristic(
+            endpointCharacteristicUuid,
+            BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_WRITE,
+            BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE,
+        )
         val cccd = BluetoothGattDescriptor(
             clientConfigDescriptorUuid,
             BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE,
         )
         characteristic.addDescriptor(cccd)
         service.addCharacteristic(characteristic)
+        service.addCharacteristic(endpoint)
 
         gattServer?.close()
         gattServer = bluetoothManager?.openGattServer(this, gattServerCallback)
@@ -542,9 +631,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             result.error("gatt_server_error", "Unable to open GATT server.", null)
             return
         }
-        gattServer?.addService(service)
         handshakeCharacteristic = characteristic
+        endpointCharacteristic = endpoint
         handshakeCharacteristic?.value = null
+        endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
 
         val advertiseSettings = AdvertiseSettings.Builder()
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
@@ -562,18 +652,36 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             "AirShareNative",
             "Hub BLE adv: primary≈${primaryAdEstimate}b (flags+UUID only), scan≈${scanAdEstimate}b (name='$broadcastLabel'), service=$serviceUuid",
         )
+        pendingAdvertiseSettings = advertiseSettings
+        pendingAdvertiseData = advertiseData
+        pendingScanResponseData = scanResponse
+        pendingAdvertiseResult = result
 
-        advertiser.startAdvertising(advertiseSettings, advertiseData, scanResponse, advertiseCallback)
-        Log.i("AirShareNative", "Hub BLE advertising active with UUID: $serviceUuid")
-        result.success(null)
+        val added = gattServer?.addService(service) == true
+        if (!added) {
+            pendingAdvertiseSettings = null
+            pendingAdvertiseData = null
+            pendingScanResponseData = null
+            pendingAdvertiseResult = null
+            isAdvertising = false
+            result.error("gatt_service_add_failed", "Unable to register GATT service.", null)
+            return
+        }
+        Log.i("AirShareNative", "Waiting for GATT service registration before advertising")
     }
 
     private fun stopHubAdvertising(result: MethodChannel.Result) {
         bleAdvertiser?.stopAdvertising(advertiseCallback)
+        isAdvertising = false
+        pendingAdvertiseSettings = null
+        pendingAdvertiseData = null
+        pendingScanResponseData = null
+        pendingAdvertiseResult = null
         clearPendingRead()
         gattServer?.close()
         gattServer = null
         handshakeCharacteristic = null
+        endpointCharacteristic = null
         result.success(null)
     }
 
@@ -663,17 +771,110 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         })
     }
 
+    private fun readPeerEndpoint(call: MethodCall, result: MethodChannel.Result) {
+        val peerId = call.argument<String>("peerId")
+        if (peerId.isNullOrBlank()) {
+            result.error("invalid_peer", "Peer id is required.", null)
+            return
+        }
+        val device = bluetoothAdapter?.getRemoteDevice(peerId)
+        if (device == null) {
+            result.error("peer_not_found", "Unable to resolve peer device.", null)
+            return
+        }
+
+        activeGattClient?.close()
+        activeGattClient = device.connectGatt(this, false, object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    gatt.discoverServices()
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    if (status != BluetoothGatt.GATT_SUCCESS) {
+                        result.error("endpoint_disconnect", "Disconnected while reading endpoint.", null)
+                    }
+                    gatt.close()
+                }
+            }
+
+            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    result.error("service_discovery_failed", "Unable to discover endpoint service.", null)
+                    gatt.close()
+                    return
+                }
+                val service = gatt.getService(serviceUuid)
+                val characteristic = service?.getCharacteristic(endpointCharacteristicUuid)
+                if (characteristic == null) {
+                    result.error("endpoint_characteristic_missing", "Endpoint characteristic missing.", null)
+                    gatt.close()
+                    return
+                }
+                if (!gatt.readCharacteristic(characteristic)) {
+                    result.error("endpoint_read_start_failed", "Failed to start endpoint read.", null)
+                    gatt.close()
+                }
+            }
+
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray,
+                status: Int,
+            ) {
+                if (characteristic.uuid != endpointCharacteristicUuid) return
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    result.error("endpoint_read_failed", "Endpoint read failed.", null)
+                    gatt.close()
+                    return
+                }
+                val endpoint = String(value, StandardCharsets.UTF_8).trim()
+                val parts = endpoint.split(":")
+                if (parts.size < 2) {
+                    result.error("invalid_endpoint_payload", "Endpoint payload malformed: $endpoint", null)
+                    gatt.close()
+                    return
+                }
+                val ip = parts[0].trim()
+                val port = parts[1].trim().toIntOrNull()
+                if (ip.isEmpty() || port == null) {
+                    result.error("invalid_endpoint_payload", "Endpoint payload malformed: $endpoint", null)
+                    gatt.close()
+                    return
+                }
+                result.success(mapOf("ip" to ip, "port" to port))
+                gatt.close()
+            }
+
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int,
+            ) {
+                onCharacteristicRead(gatt, characteristic, characteristic.value ?: ByteArray(0), status)
+            }
+        })
+    }
+
     private fun startTemporaryHotspot(call: MethodCall, result: MethodChannel.Result) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             result.error("unsupported", "LocalOnlyHotspot requires Android 8.0+.", null)
+            return
+        }
+        if (activeHotspotReservation != null) {
+            Log.w("AirShareNative", "LocalOnlyHotspot already active; ignoring duplicate start request")
+            val ssid = pendingHotspotSsid ?: call.argument<String>("ssid") ?: "AirShareLink"
+            val password = pendingHotspotPassword ?: call.argument<String>("password") ?: "AirShare@2026"
+            val hubIp = pendingHubIp ?: resolveLocalIpv4Address()
+            result.success(mapOf("ssid" to ssid, "password" to password, "hubIp" to hubIp))
             return
         }
         val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         try {
             wifiManager.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
                 override fun onStarted(reservation: WifiManager.LocalOnlyHotspotReservation) {
-                    localHotspotReservation?.close()
+                    activeHotspotReservation?.close()
                     localHotspotReservation = reservation
+                    activeHotspotReservation = reservation
                     handshakeCharacteristic?.value = null
                     val wifiConfig = reservation.wifiConfiguration
                     val ssid = call.argument<String>("ssid") ?: wifiConfig?.SSID ?: "AirShareLink"
@@ -685,6 +886,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     pendingHotspotPassword = password
                     pendingHubIp = hubIp
                     pendingHubPort = call.argument<Int>("hubPort") ?: 8080
+                    advertisedEndpoint = "$hubIp:$pendingHubPort"
+                    endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
                     Log.i("AirShareNative", "Internal Link Established: hotspot active")
                     result.success(
                         mapOf("ssid" to ssid, "password" to password, "hubIp" to hubIp),
@@ -692,6 +895,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 }
 
                 override fun onFailed(reason: Int) {
+                    activeHotspotReservation = null
+                    localHotspotReservation = null
                     result.error("hotspot_failed", "Hotspot failed with reason=$reason", null)
                 }
             }, null)
@@ -739,15 +944,23 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private fun stopInternalLink(result: MethodChannel.Result) {
         stopScanning(MethodChannelResultProxy())
         bleAdvertiser?.stopAdvertising(advertiseCallback)
+        isAdvertising = false
+        pendingAdvertiseSettings = null
+        pendingAdvertiseData = null
+        pendingScanResponseData = null
+        pendingAdvertiseResult = null
         gattServer?.close()
         gattServer = null
         handshakeCharacteristic = null
+        endpointCharacteristic = null
         clearPendingRead()
         pendingHotspotSsid = null
         pendingHotspotPassword = null
         pendingHubIp = null
         activeGattClient?.close()
         activeGattClient = null
+        activeHotspotReservation?.close()
+        activeHotspotReservation = null
         localHotspotReservation?.close()
         localHotspotReservation = null
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager

@@ -6,13 +6,13 @@ import 'package:geolocator/geolocator.dart';
 
 import 'package:air_share/air_share_constants.dart';
 import 'package:air_share/ble_transport.dart';
-import 'package:air_share/wlan_link_manager.dart';
+import 'package:air_share/connection_logger.dart';
 
-/// Receiver: BLE scan only until [onLinkReady] completes (handshake + WLAN).
+/// Receiver: BLE scan and endpoint extraction until [onEndpointReady] completes.
 class DiscoveryPage extends StatefulWidget {
-  const DiscoveryPage({required this.onLinkReady, super.key});
+  const DiscoveryPage({required this.onEndpointReady, super.key});
 
-  final Future<void> Function(HandshakePayload payload) onLinkReady;
+  final Future<void> Function(PeerEndpoint endpoint) onEndpointReady;
 
   @override
   State<DiscoveryPage> createState() => _DiscoveryPageState();
@@ -93,9 +93,16 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       await _ensureAndroidLocationForBle();
       if (!mounted) return;
 
+      await ConnectionLogger.instance.log('BLE Scan Start');
       await BleTransport.instance.startScanning();
       _scanSubscription?.cancel();
       _scanSubscription = BleTransport.instance.scanPeers().listen((peers) {
+        for (final peer in peers) {
+          ConnectionLogger.instance.log(
+            'BLE Scan Peer Found',
+            details: '${peer.friendlyName} (${peer.id})',
+          );
+        }
         if (!mounted) return;
         setState(() {
           _peers
@@ -133,26 +140,30 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     try {
       setState(() {
         _isHandshaking = true;
-        _status = 'Waiting for approval on sender…';
+        _status = 'Reading endpoint from peer…';
       });
 
-      final payload = await BleTransport.instance.establishSecureHandshake(peer);
-
-      if (!mounted) return;
-      setState(() {
-        _status = 'Connecting to peer WLAN…';
-      });
-      await WlanLinkManager.instance.connectToHubWlan(
-        ssid: payload.ssid,
-        password: payload.password,
+      await ConnectionLogger.instance.log(
+        'BLE | Reading IP from peer...',
+        details: 'peer=${peer.friendlyName} (${peer.id})',
       );
+      final endpoint = await BleTransport.instance.readPeerEndpoint(peer);
+      await ConnectionLogger.instance.log(
+        'BLE | Extracted IP',
+        details: '${endpoint.ip}:${endpoint.port}',
+      );
+
       if (!mounted) return;
       setState(() {
-        _status = 'WLAN link active';
+        _status = 'Triggering auto-connect…';
       });
-
-      await widget.onLinkReady(payload);
+      await ConnectionLogger.instance.log(
+        'Connection | Triggering auto-connect',
+        details: '${endpoint.ip}:${endpoint.port}',
+      );
+      await widget.onEndpointReady(endpoint);
     } catch (e) {
+      await ConnectionLogger.instance.log('Handshake Failure', details: e.toString());
       if (!mounted) return;
       setState(() {
         _status = 'Peer Discovery via BLE';

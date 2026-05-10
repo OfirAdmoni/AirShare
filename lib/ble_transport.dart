@@ -50,6 +50,25 @@ class HandshakePayload {
   }
 }
 
+class PeerEndpoint {
+  const PeerEndpoint({
+    required this.ip,
+    required this.port,
+  });
+
+  final String ip;
+  final int port;
+
+  factory PeerEndpoint.fromMap(Map<dynamic, dynamic> map) {
+    final portRaw = map['port'];
+    final port = portRaw is int ? portRaw : int.tryParse('${portRaw ?? ''}') ?? 8080;
+    return PeerEndpoint(
+      ip: (map['ip'] ?? '').toString(),
+      port: port,
+    );
+  }
+}
+
 class BleTransport {
   BleTransport._();
 
@@ -118,5 +137,32 @@ class BleTransport {
       throw Exception('Secure handshake returned empty payload');
     }
     return HandshakePayload.fromMap(raw);
+  }
+
+  Future<PeerEndpoint> readPeerEndpoint(BlePeer peer) async {
+    final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
+      'readPeerEndpoint',
+      {
+        'peerId': peer.id,
+        'serviceUuid': peer.serviceUuid,
+      },
+    );
+    if (raw == null) {
+      throw Exception('Peer endpoint read returned empty payload');
+    }
+    return PeerEndpoint.fromMap(raw);
+  }
+
+  Future<void> updateHubEndpoint({
+    required String ip,
+    required int port,
+  }) async {
+    await _methodChannel.invokeMethod(
+      'updateHubEndpoint',
+      {
+        'ip': ip,
+        'port': port,
+      },
+    );
   }
 }

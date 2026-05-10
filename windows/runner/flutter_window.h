@@ -42,11 +42,15 @@ class FlutterWindow : public Win32Window {
   void EstablishSecureHandshake(
       const flutter::EncodableMap& args,
       flutter::MethodResult<flutter::EncodableValue>* result);
+  void ReadPeerEndpoint(const flutter::EncodableMap& args,
+                        flutter::MethodResult<flutter::EncodableValue>* result);
   void StartHubAdvertising(const flutter::EncodableMap* args,
                            flutter::MethodResult<flutter::EncodableValue>* result);
   void StopHubAdvertising(flutter::MethodResult<flutter::EncodableValue>* result);
   void StopHubAdvertisingInternal();
   void ApproveConnection(const flutter::EncodableMap& args,
+                         flutter::MethodResult<flutter::EncodableValue>* result);
+  void UpdateHubEndpoint(const flutter::EncodableMap& args,
                          flutter::MethodResult<flutter::EncodableValue>* result);
   void ConnectToHubWlan(const flutter::EncodableMap& args,
                         flutter::MethodResult<flutter::EncodableValue>* result);
@@ -61,6 +65,7 @@ class FlutterWindow : public Win32Window {
   void ScheduleApprovalTimeout();
   void ClearPendingReadState();
   winrt::Windows::Storage::Streams::IBuffer BuildHandshakeBuffer() const;
+  winrt::Windows::Storage::Streams::IBuffer BuildEndpointBuffer() const;
 
   // The project to run.
   flutter::DartProject project_;
@@ -87,7 +92,10 @@ class FlutterWindow : public Win32Window {
       gatt_provider_{nullptr};
   winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattLocalCharacteristic
       gatt_handshake_{nullptr};
+  winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattLocalCharacteristic
+      gatt_endpoint_{nullptr};
   std::optional<winrt::event_token> handshake_read_token_;
+  std::optional<winrt::event_token> endpoint_read_token_;
   bool is_advertising_ = false;
 
   winrt::Windows::Foundation::IDeferral pending_read_deferral_{nullptr};

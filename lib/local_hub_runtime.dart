@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:path_provider/path_provider.dart';
 
+import 'connection_logger.dart';
 import 'hub_status.dart';
 
 class LocalHubRuntime {
@@ -43,6 +44,10 @@ class LocalHubRuntime {
         maxAttempts: 10,
       );
       _activePort = _server!.port;
+      await ConnectionLogger.instance.log(
+        'HTTP Server Start',
+        details: 'bound_port=$_activePort',
+      );
       _server!.listen((request) async {
         try {
           await _routeRequest(request, sharedDir.path);
