@@ -13,10 +13,12 @@ import (
 	"github.com/hashicorp/mdns"
 )
 
+const sharedFilesDir = "shared_files"
+
 // פונקציה שסורקת את התיקייה ומחזירה רשימת שמות קבצים
 func getFiles(w http.ResponseWriter, r *http.Request) {
 	// שנהי את הנתיב הזה לנתיב של התיקייה שיצרת בשולחן העבודה
-	dirPath := "./shared_files"
+	dirPath := "./" + sharedFilesDir
 
 	files, err := os.ReadDir(dirPath)
 	if err != nil {
@@ -47,7 +49,7 @@ func downloadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filePath := filepath.Join("shared_files", fileName)
+	filePath := filepath.Join(sharedFilesDir, fileName)
 	info, err := os.Stat(filePath)
 	if err != nil || info.IsDir() {
 		http.Error(w, "File not found", http.StatusNotFound)
@@ -83,26 +85,12 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ext := filepath.Ext(fileName)
-	base := strings.TrimSuffix(fileName, ext)
-	finalName := fileName
-	serial := 1
-
-	for {
-		dstPath := filepath.Join("shared_files", finalName)
-		_, err := os.Stat(dstPath)
-		if os.IsNotExist(err) {
-			break
-		}
-		if err != nil {
-			http.Error(w, "Unable to check existing files", http.StatusInternalServerError)
-			return
-		}
-		finalName = fmt.Sprintf("%s (%d)%s", base, serial, ext)
-		serial++
+	if err := os.MkdirAll(sharedFilesDir, 0755); err != nil {
+		http.Error(w, "Unable to prepare shared directory", http.StatusInternalServerError)
+		return
 	}
 
-	dstPath := filepath.Join("shared_files", finalName)
+	dstPath := filepath.Join(sharedFilesDir, fileName)
 	dst, err := os.Create(dstPath)
 	if err != nil {
 		http.Error(w, "Unable to save file", http.StatusInternalServerError)
@@ -115,8 +103,13 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte("Uploaded"))
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status":   "ok",
+		"message":  "file uploaded",
+		"fileName": fileName,
+	})
 }
 
 func getLocalIPv4() (net.IP, error) {
@@ -214,7 +207,7 @@ func startMDNSServer(port int) (*mdns.Server, net.IP, error) {
 
 func main() {
 	// יצירת תיקייה אם היא לא קיימת (למקרה ששכחת)
-	os.Mkdir("shared_files", 0755)
+	os.MkdirAll(sharedFilesDir, 0755)
 
 	http.HandleFunc("/files", getFiles)
 	http.HandleFunc("/download", downloadFile)

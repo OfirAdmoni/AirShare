@@ -34,6 +34,8 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>AirShare needs local network access to discover nearby servers.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>AirShare uses location to verify that location services are available for Bluetooth peer scanning (required on some platforms).</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UIApplicationSceneManifest</key>

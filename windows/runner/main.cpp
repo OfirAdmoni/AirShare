@@ -1,6 +1,7 @@
 #include <flutter/dart_project.h>
 #include <flutter/flutter_view_controller.h>
 #include <windows.h>
+#include <winrt/base.h>
 
 #include "flutter_window.h"
 #include "utils.h"
@@ -13,9 +14,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     CreateAndAttachConsole();
   }
 
-  // Initialize COM, so that it is available for use in the library and/or
-  // plugins.
-  ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  // WinRT + worker threads (e.g. BLE): MTA avoids !is_sta_thread() assertions in cppwinrt.
+  winrt::init_apartment(winrt::apartment_type::multi_threaded);
 
   flutter::DartProject project(L"data");
 
@@ -38,6 +38,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     ::DispatchMessage(&msg);
   }
 
-  ::CoUninitialize();
+  winrt::uninit_apartment();
   return EXIT_SUCCESS;
 }
