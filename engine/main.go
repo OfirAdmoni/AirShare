@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -13,15 +14,57 @@ import (
 	"github.com/hashicorp/mdns"
 )
 
-const sharedFilesDir = "shared_files"
+// sharedRootRel is the configured directory (relative or absolute). sharedRootAbs
+// is its cleaned absolute form used for all reads/writes after startup.
+var (
+	sharedRootRel string
+	sharedRootAbs string
+)
+
+func sanitizeClientFileName(raw string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "", fmt.Errorf("empty file name")
+	}
+	// Single path segment only (blocks "a/b", "..\\x", UNC segments in the name).
+	if strings.ContainsAny(raw, `/\`) {
+		return "", fmt.Errorf("path separators in name=%q", raw)
+	}
+	b := filepath.Base(raw)
+	if b != raw {
+		return "", fmt.Errorf("name=%q is not a plain base name (got base=%q)", raw, b)
+	}
+	if b == "." || b == ".." {
+		return "", fmt.Errorf("reserved name %q", b)
+	}
+	return b, nil
+}
+
+func resolveSafeSharedFile(sharedAbs, fileName string) (full string, err error) {
+	full = filepath.Join(sharedAbs, fileName)
+	full, err = filepath.Abs(full)
+	if err != nil {
+		return "", err
+	}
+	sa, err := filepath.Abs(sharedAbs)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(sa, full)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path escapes shared root")
+	}
+	return full, nil
+}
 
 // פונקציה שסורקת את התיקייה ומחזירה רשימת שמות קבצים
 func getFiles(w http.ResponseWriter, r *http.Request) {
-	// שנהי את הנתיב הזה לנתיב של התיקייה שיצרת בשולחן העבודה
-	dirPath := "./" + sharedFilesDir
-
-	files, err := os.ReadDir(dirPath)
+	log.Printf("[files] list request sharedRootAbs=%q", sharedRootAbs)
+	files, err := os.ReadDir(sharedRootAbs)
 	if err != nil {
+		log.Printf("[files] ReadDir failed path=%q err=%v", sharedRootAbs, err)
 		http.Error(w, "Unable to read directory", http.StatusInternalServerError)
 		return
 	}
@@ -37,27 +80,55 @@ func getFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func downloadFile(w http.ResponseWriter, r *http.Request) {
-	fileName := r.URL.Query().Get("name")
-	if fileName == "" {
+	rawName := r.URL.Query().Get("name")
+	log.Printf("[download] request remote=%q raw_query_name=%q sharedRootAbs=%q",
+		r.RemoteAddr, rawName, sharedRootAbs)
+
+	if rawName == "" {
 		http.Error(w, "Missing file name", http.StatusBadRequest)
 		return
 	}
 
-	// Disallow path traversal and nested paths.
-	if filepath.Base(fileName) != fileName {
+	fileName, err := sanitizeClientFileName(rawName)
+	if err != nil {
+		log.Printf("[download] reject name sanitize raw=%q err=%v", rawName, err)
 		http.Error(w, "Invalid file name", http.StatusBadRequest)
 		return
 	}
 
-	filePath := filepath.Join(sharedFilesDir, fileName)
+	filePath, err := resolveSafeSharedFile(sharedRootAbs, fileName)
+	if err != nil {
+		log.Printf("[download] resolve path failed name=%q err=%v", fileName, err)
+		http.Error(w, "Invalid file name", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[download] resolved name=%q filePath=%q", fileName, filePath)
+
 	info, err := os.Stat(filePath)
-	if err != nil || info.IsDir() {
+	if err != nil {
+		log.Printf("[download] stat failed name=%q filePath=%q err=%v", fileName, filePath, err)
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+	if info.IsDir() {
+		log.Printf("[download] not a file name=%q filePath=%q mode=%s", fileName, filePath, info.Mode())
 		http.Error(w, "File not found", http.StatusNotFound)
 		return
 	}
 
+	f, err := openFileReadShared(filePath)
+	if err != nil {
+		log.Printf("[download] open failed name=%q filePath=%q err=%v typ=%T", fileName, filePath, err, err)
+		http.Error(w, "Unable to open file", http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+
+	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileName))
-	http.ServeFile(w, r, filePath)
+	// ServeContent handles Range requests and sets Content-Length; logs copy errors via http.Server.
+	http.ServeContent(w, r, fileName, info.ModTime(), f)
 }
 
 func uploadFile(w http.ResponseWriter, r *http.Request) {
@@ -84,15 +155,29 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid file name", http.StatusBadRequest)
 		return
 	}
+	sfn, serr := sanitizeClientFileName(fileName)
+	if serr != nil {
+		log.Printf("[upload] reject name sanitize raw=%q err=%v", fileName, serr)
+		http.Error(w, "Invalid file name", http.StatusBadRequest)
+		return
+	}
+	fileName = sfn
 
-	if err := os.MkdirAll(sharedFilesDir, 0755); err != nil {
+	if err := os.MkdirAll(sharedRootRel, 0755); err != nil {
 		http.Error(w, "Unable to prepare shared directory", http.StatusInternalServerError)
 		return
 	}
 
-	dstPath := filepath.Join(sharedFilesDir, fileName)
+	dstPath, err := resolveSafeSharedFile(sharedRootAbs, fileName)
+	if err != nil {
+		log.Printf("[upload] invalid path name=%q err=%v", fileName, err)
+		http.Error(w, "Invalid file name", http.StatusBadRequest)
+		return
+	}
+	log.Printf("[upload] writing name=%q dstPath=%q", fileName, dstPath)
 	dst, err := os.Create(dstPath)
 	if err != nil {
+		log.Printf("[upload] Create failed dstPath=%q err=%v typ=%T", dstPath, err, err)
 		http.Error(w, "Unable to save file", http.StatusInternalServerError)
 		return
 	}
@@ -206,8 +291,21 @@ func startMDNSServer(port int) (*mdns.Server, net.IP, error) {
 }
 
 func main() {
-	// יצירת תיקייה אם היא לא קיימת (למקרה ששכחת)
-	os.MkdirAll(sharedFilesDir, 0755)
+	sharedRootRel = strings.TrimSpace(os.Getenv("AIRSHARE_SHARED_DIR"))
+	if sharedRootRel == "" {
+		sharedRootRel = "shared_files"
+	}
+	var err error
+	sharedRootAbs, err = filepath.Abs(sharedRootRel)
+	if err != nil {
+		log.Fatalf("[airshare] cannot resolve shared directory %q: %v", sharedRootRel, err)
+	}
+	log.Printf("[airshare] shared directory logical=%q absolute=%q (override with AIRSHARE_SHARED_DIR)",
+		sharedRootRel, sharedRootAbs)
+
+	if err := os.MkdirAll(sharedRootRel, 0755); err != nil {
+		log.Fatalf("[airshare] mkdir %q: %v", sharedRootRel, err)
+	}
 
 	http.HandleFunc("/files", getFiles)
 	http.HandleFunc("/download", downloadFile)
@@ -223,7 +321,7 @@ func main() {
 		fmt.Println("mDNS service started: _airshare._tcp on port 8080")
 	}
 
-	fmt.Println("AirShare Engine is scanning 'shared_files' on port 8080...")
+	fmt.Printf("AirShare Engine is scanning %q (%q) on port 8080...\n", sharedRootRel, sharedRootAbs)
 	if err := http.ListenAndServe("0.0.0.0:8080", nil); err != nil {
 		fmt.Printf("ERROR: HTTP server failed on 0.0.0.0:8080: %v\n", err)
 	}

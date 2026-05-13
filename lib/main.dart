@@ -65,14 +65,29 @@ class _AirShareAppState extends State<AirShareApp> {
       );
       if (approved == true) {
         final pendingIp = HubEndpointState.instance.pendingIp;
+        final pendingPort = HubEndpointState.instance.pendingPort;
+        await ConnectionLogger.instance.log(
+          'HS | Host | Approve tapped',
+          details:
+              'pendingIp=${pendingIp ?? "(null)"} pendingPort=$pendingPort',
+        );
         if (pendingIp != null && pendingIp.isNotEmpty) {
           await BleTransport.instance.updateHubEndpoint(
             ip: pendingIp,
-            port: HubEndpointState.instance.pendingPort,
+            port: pendingPort,
+          );
+          await ConnectionLogger.instance.log(
+            'HS | Host | updateHubEndpoint(native GATT)',
+            details: '$pendingIp:$pendingPort',
           );
           await ConnectionLogger.instance.log(
             'Connection | Advertising real IP',
-            details: '$pendingIp:${HubEndpointState.instance.pendingPort}',
+            details: '$pendingIp:$pendingPort',
+          );
+        } else {
+          await ConnectionLogger.instance.log(
+            'HS | Host | updateHubEndpoint SKIPPED',
+            details: 'pendingIp empty — handshake JSON may lack hubIp',
           );
         }
       }

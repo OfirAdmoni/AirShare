@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:air_share/air_share_constants.dart';
+import 'package:air_share/handshake_trace.dart';
 import 'package:flutter/services.dart';
 
 class BlePeer {
@@ -29,12 +30,16 @@ class HandshakePayload {
     required this.password,
     required this.hubIp,
     this.hubPort = 8080,
+    this.p2pMac = '',
   });
 
   final String ssid;
   final String password;
   final String hubIp;
   final int hubPort;
+  /// Wi-Fi Direct device address of the hub (e.g. "AA:BB:CC:DD:EE:FF").
+  /// Empty string when the hub did not create a P2P group.
+  final String p2pMac;
 
   factory HandshakePayload.fromMap(Map<dynamic, dynamic> map) {
     final portRaw = map['hubPort'];
@@ -46,8 +51,14 @@ class HandshakePayload {
       password: (map['password'] ?? '').toString(),
       hubIp: (map['hubIp'] ?? '').toString(),
       hubPort: port,
+      p2pMac: (map['p2pMac'] ?? '').toString(),
     );
   }
+
+  /// Log-safe summary (no password or SSID contents).
+  String describeForLog() =>
+      'hubIp=$hubIp hubPort=$hubPort ssid_len=${ssid.length} '
+      'pwd_present=${password.isNotEmpty} p2pMac_present=${p2pMac.isNotEmpty}';
 }
 
 class PeerEndpoint {
@@ -127,35 +138,47 @@ class BleTransport {
   }
 
   Future<HandshakePayload> establishSecureHandshake(BlePeer peer) async {
-    final raw = await _methodChannel
-        .invokeMethod<Map<dynamic, dynamic>>(
-      'establishSecureHandshake',
-      {
-        'peerId': peer.id,
-        'serviceUuid': peer.serviceUuid,
+    final payload = await HandshakeTrace.run(
+      'ClientHello→ServerHello (BLE read handshake JSON)',
+      () async {
+        final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
+          'establishSecureHandshake',
+          {
+            'peerId': peer.id,
+            'serviceUuid': peer.serviceUuid,
+          },
+        );
+        if (raw == null) {
+          throw Exception('Secure handshake returned empty payload');
+        }
+        return HandshakePayload.fromMap(raw);
       },
-    )
-        .timeout(const Duration(seconds: 45));
-    if (raw == null) {
-      throw Exception('Secure handshake returned empty payload');
-    }
-    return HandshakePayload.fromMap(raw);
+      extra: 'peerId=${peer.id} name=${peer.friendlyName}',
+      hardTimeout: const Duration(seconds: 45),
+    );
+    return payload;
   }
 
   Future<PeerEndpoint> readPeerEndpoint(BlePeer peer) async {
-    final raw = await _methodChannel
-        .invokeMethod<Map<dynamic, dynamic>>(
-      'readPeerEndpoint',
-      {
-        'peerId': peer.id,
-        'serviceUuid': peer.serviceUuid,
+    final endpoint = await HandshakeTrace.run(
+      'Auth (BLE read hub endpoint ip:port)',
+      () async {
+        final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
+          'readPeerEndpoint',
+          {
+            'peerId': peer.id,
+            'serviceUuid': peer.serviceUuid,
+          },
+        );
+        if (raw == null) {
+          throw Exception('Peer endpoint read returned empty payload');
+        }
+        return PeerEndpoint.fromMap(raw);
       },
-    )
-        .timeout(const Duration(seconds: 60));
-    if (raw == null) {
-      throw Exception('Peer endpoint read returned empty payload');
-    }
-    return PeerEndpoint.fromMap(raw);
+      extra: 'peerId=${peer.id} name=${peer.friendlyName}',
+      hardTimeout: const Duration(seconds: 60),
+    );
+    return endpoint;
   }
 
   Future<void> updateHubEndpoint({

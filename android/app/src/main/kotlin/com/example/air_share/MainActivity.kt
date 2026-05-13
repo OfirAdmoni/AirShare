@@ -21,13 +21,19 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
+import android.net.wifi.p2p.WifiP2pConfig
+import android.net.wifi.p2p.WifiP2pManager
+import android.net.wifi.WpsInfo
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -97,6 +103,17 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private var activeHotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
     private var localHotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
     private var connectivityCallback: ConnectivityManager.NetworkCallback? = null
+
+    private var wifiP2pManager: WifiP2pManager? = null
+    private var wifiP2pChannel: WifiP2pManager.Channel? = null
+    private var pendingP2pMac: String = ""
+
+    // Guest-side P2P connection state
+    private var guestP2pManager: WifiP2pManager? = null
+    private var guestP2pChannel: WifiP2pManager.Channel? = null
+    private var guestP2pReceiver: BroadcastReceiver? = null
+    private val guestP2pTimeoutHandler = Handler(Looper.getMainLooper())
+    private var guestP2pTimeoutRunnable: Runnable? = null
 
     private val discoveredPeersById = linkedMapOf<String, Map<String, String>>()
 
@@ -404,6 +421,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             "approveConnection" -> approveConnection(call, result)
             "startTemporaryHotspot" -> ensurePermissionsThenExecute(result) { startTemporaryHotspot(call, result) }
             "connectToHubWlan" -> ensurePermissionsThenExecute(result) { connectToHubWlan(call, result) }
+            "startWifiDirectGroup" -> ensurePermissionsThenExecute(result) { startWifiDirectGroup(result) }
+            "stopWifiDirectGroup" -> stopWifiDirectGroup(result)
+            "connectToWifiDirectPeer" -> ensurePermissionsThenExecute(result) { connectToWifiDirectPeer(call, result) }
             "stopInternalLink" -> stopInternalLink(result)
             else -> result.notImplemented()
         }
@@ -530,11 +550,13 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }
         val ssid = pendingHotspotSsid?.trim().orEmpty()
         val password = pendingHotspotPassword?.trim().orEmpty()
+        val p2pMac = pendingP2pMac.trim()
         val json = JSONObject().apply {
             put("ssid", ssid)
             put("password", password)
             put("hubIp", hubIp)
             put("hubPort", pendingHubPort)
+            if (p2pMac.isNotEmpty()) put("p2pMac", p2pMac)
         }.toString()
         Log.i(
             "AirShareNative",
@@ -1049,7 +1071,169 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }
         connectivityCallback = null
         connectivityManager.bindProcessToNetwork(null)
+        val p2pMgr = wifiP2pManager
+        val p2pChan = wifiP2pChannel
+        if (p2pMgr != null && p2pChan != null) {
+            p2pMgr.removeGroup(p2pChan, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {}
+                override fun onFailure(reason: Int) {}
+            })
+        }
+        wifiP2pManager = null
+        wifiP2pChannel = null
+        pendingP2pMac = ""
+        cleanupGuestP2p()
         result.success(null)
+    }
+
+    private fun startWifiDirectGroup(result: MethodChannel.Result) {
+        val mgr = applicationContext.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+        if (mgr == null) {
+            result.error("p2p_unavailable", "WifiP2pManager not available on this device", null)
+            return
+        }
+        val chan = mgr.initialize(this, mainLooper, null)
+        wifiP2pManager = mgr
+        wifiP2pChannel = chan
+
+        // Remove any stale group first, then create a fresh one
+        mgr.removeGroup(chan, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() { doCreateP2pGroup(mgr, chan, result) }
+            override fun onFailure(reason: Int) { doCreateP2pGroup(mgr, chan, result) }
+        })
+    }
+
+    private fun doCreateP2pGroup(
+        mgr: WifiP2pManager,
+        chan: WifiP2pManager.Channel,
+        result: MethodChannel.Result,
+    ) {
+        mgr.createGroup(chan, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                // requestGroupInfo is async; give the framework 500 ms to settle
+                Handler(Looper.getMainLooper()).postDelayed({
+                    mgr.requestGroupInfo(chan) { group ->
+                        if (group == null) {
+                            result.error("p2p_no_group", "Group created but info unavailable", null)
+                            return@requestGroupInfo
+                        }
+                        val ssid     = group.networkName
+                        val psk      = group.passphrase
+                        val ownerIp  = "192.168.49.1"
+                        val ownerMac = group.owner?.deviceAddress?.trim() ?: ""
+                        pendingHotspotSsid     = ssid
+                        pendingHotspotPassword = psk
+                        pendingHubIp           = ownerIp
+                        pendingP2pMac          = ownerMac
+                        advertisedEndpoint     = "$ownerIp:$pendingHubPort"
+                        endpointCharacteristic?.value =
+                            advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
+                        Log.i("AirShareNative", "WifiDirect group ready: ssid=$ssid ownerIp=$ownerIp ownerMac=$ownerMac")
+                        result.success(mapOf("ssid" to ssid, "password" to psk, "hubIp" to ownerIp, "p2pMac" to ownerMac))
+                    }
+                }, 500)
+            }
+
+            override fun onFailure(reason: Int) {
+                result.error("p2p_group_failed", "createGroup failed reason=$reason", null)
+            }
+        })
+    }
+
+    private fun connectToWifiDirectPeer(call: MethodCall, result: MethodChannel.Result) {
+        val peerMac = call.argument<String>("peerMac")?.trim() ?: ""
+        if (peerMac.isEmpty()) {
+            result.error("invalid_mac", "peerMac is required", null)
+            return
+        }
+        val mgr = applicationContext.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+        if (mgr == null) {
+            result.error("p2p_unavailable", "WifiP2pManager not available", null)
+            return
+        }
+        val chan = mgr.initialize(this, mainLooper, null)
+        guestP2pManager = mgr
+        guestP2pChannel = chan
+
+        // Timeout: if the connection broadcast never arrives, fail cleanly after 30 s
+        val timeoutRunnable = Runnable {
+            cleanupGuestP2p()
+            result.error("p2p_timeout", "Wi-Fi Direct connection timed out after 30s", null)
+        }
+        guestP2pTimeoutRunnable = timeoutRunnable
+        guestP2pTimeoutHandler.postDelayed(timeoutRunnable, 30_000)
+
+        val intentFilter = IntentFilter(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
+        var receiver: BroadcastReceiver? = null
+        receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                if (intent.action != WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION) return
+                @Suppress("DEPRECATION")
+                val networkInfo: android.net.NetworkInfo? =
+                    intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO)
+                if (networkInfo?.isConnected != true) return
+                mgr.requestConnectionInfo(chan) { info ->
+                    val ownerIp = info?.groupOwnerAddress?.hostAddress
+                        ?.takeIf { it.isNotEmpty() } ?: "192.168.49.1"
+                    Log.i("AirShareNative", "WifiDirect peer connected, groupOwnerIp=$ownerIp")
+                    guestP2pTimeoutHandler.removeCallbacks(timeoutRunnable)
+                    guestP2pTimeoutRunnable = null
+                    try { unregisterReceiver(receiver) } catch (_: Exception) {}
+                    guestP2pReceiver = null
+                    result.success(ownerIp)
+                }
+            }
+        }
+        guestP2pReceiver = receiver
+        registerReceiver(receiver, intentFilter)
+
+        val config = WifiP2pConfig().apply {
+            deviceAddress = peerMac
+            wps.setup = WpsInfo.PBC
+            groupOwnerIntent = 0  // guest defers; host (group creator) stays owner
+        }
+        mgr.connect(chan, config, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.i("AirShareNative", "WifiDirect connect() initiated for $peerMac — waiting for broadcast")
+            }
+            override fun onFailure(reason: Int) {
+                guestP2pTimeoutHandler.removeCallbacks(timeoutRunnable)
+                guestP2pTimeoutRunnable = null
+                cleanupGuestP2p()
+                result.error("p2p_connect_failed", "connect() failed reason=$reason", null)
+            }
+        })
+    }
+
+    private fun cleanupGuestP2p() {
+        guestP2pTimeoutRunnable?.let { guestP2pTimeoutHandler.removeCallbacks(it) }
+        guestP2pTimeoutRunnable = null
+        try { guestP2pReceiver?.let { unregisterReceiver(it) } } catch (_: Exception) {}
+        guestP2pReceiver = null
+        val mgr = guestP2pManager; val chan = guestP2pChannel
+        if (mgr != null && chan != null) {
+            mgr.removeGroup(chan, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {}
+                override fun onFailure(reason: Int) {}
+            })
+        }
+        guestP2pManager = null
+        guestP2pChannel = null
+    }
+
+    private fun stopWifiDirectGroup(result: MethodChannel.Result) {
+        val mgr  = wifiP2pManager
+        val chan = wifiP2pChannel
+        if (mgr != null && chan != null) {
+            mgr.removeGroup(chan, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { result.success(null) }
+                override fun onFailure(reason: Int) { result.success(null) }
+            })
+        } else {
+            result.success(null)
+        }
+        wifiP2pManager = null
+        wifiP2pChannel = null
     }
 
     private fun resolveLocalIpv4Address(): String {

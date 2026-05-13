@@ -38,6 +38,10 @@ class _FileListScreenState extends State<FileListScreen> {
   double uploadProgress = 0;
   String? uploadingFileName;
   StreamSubscription<String>? _ingressSubscription;
+  StreamSubscription<void>? _guestConnectedSub;
+  bool _guestConnected = false;
+  bool _guestConnectionTimedOut = false;
+  Timer? _guestConnectionTimer;
 
   String get baseUrl => 'http://${widget.hubHost}:${widget.hubPort}';
   HubStatus get _hubStatus => HubStatusScope.of(context);
@@ -256,6 +260,20 @@ class _FileListScreenState extends State<FileListScreen> {
       _ingressSubscription = LocalHubRuntime.instance.ingressEvents.listen((_) {
         fetchFiles();
       });
+      _guestConnectedSub = LocalHubRuntime.instance.firstGuestConnected.listen((_) {
+        if (mounted) {
+          setState(() {
+            _guestConnected = true;
+            _guestConnectionTimedOut = false;
+          });
+          _guestConnectionTimer?.cancel();
+        }
+      });
+      _guestConnectionTimer = Timer(const Duration(seconds: 120), () {
+        if (mounted && !_guestConnected) {
+          setState(() => _guestConnectionTimedOut = true);
+        }
+      });
     }
     await fetchFiles();
   }
@@ -263,6 +281,8 @@ class _FileListScreenState extends State<FileListScreen> {
   @override
   void dispose() {
     _ingressSubscription?.cancel();
+    _guestConnectedSub?.cancel();
+    _guestConnectionTimer?.cancel();
     super.dispose();
   }
 
@@ -322,6 +342,42 @@ class _FileListScreenState extends State<FileListScreen> {
                     ),
                     const SizedBox(height: 8),
                     LinearProgressIndicator(value: downloadProgress),
+                  ],
+                ),
+              ),
+            ),
+          if (widget.isHubMode && !_guestConnected)
+            Material(
+              color: _guestConnectionTimedOut
+                  ? Theme.of(context).colorScheme.errorContainer
+                  : Theme.of(context).colorScheme.secondaryContainer,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                child: Row(
+                  children: [
+                    if (!_guestConnectionTimedOut)
+                      const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    else
+                      Icon(
+                        Icons.warning_amber_rounded,
+                        size: 16,
+                        color: Theme.of(context).colorScheme.onErrorContainer,
+                      ),
+                    const SizedBox(width: 12),
+                    Text(
+                      _guestConnectionTimedOut
+                          ? 'No receiver connected after 2 min — still waiting'
+                          : 'Waiting for receiver to connect…',
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                            color: _guestConnectionTimedOut
+                                ? Theme.of(context).colorScheme.onErrorContainer
+                                : Theme.of(context).colorScheme.onSecondaryContainer,
+                          ),
+                    ),
                   ],
                 ),
               ),
