@@ -5,10 +5,13 @@ import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'connection_logger.dart';
 import 'hub_status.dart';
+import 'shared_file_entry.dart';
+import 'shared_room_manifest.dart';
 
 /// IPv4 all-interfaces listen address. **Not** loopback — required so other phones
 /// on the same LAN can open TCP to the hub (Android hub uses Dart [HttpServer]).
@@ -30,6 +33,27 @@ class LocalHubRuntime {
 
   bool get isRunning => _server != null;
   int get activePort => _activePort;
+  String? get sharedDirPath => _sharedDirPath;
+
+  /// Ensures [sharedDirPath] exists before any manifest or file I/O.
+  Future<void> _ensureSharedDirectoryExists(String sharedDirPath) async {
+    final dir = Directory(sharedDirPath);
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+  }
+
+  /// Records the room creator on the hub (host-only).
+  Future<void> setRoomHostIdentity({
+    required String peerId,
+    required String displayName,
+  }) async {
+    final dir = _sharedDirPath ?? await _resolveSharedDirectoryPath();
+    await _ensureSharedDirectoryExists(dir);
+    final manifest = await SharedRoomManifest.load(dir);
+    manifest.setRoomHost(peerId: peerId, displayName: displayName);
+    await manifest.save(dir);
+  }
   Stream<String> get ingressEvents => _ingressEventsController.stream;
   Stream<void> get firstGuestConnected => _firstGuestController.stream;
 
@@ -43,10 +67,8 @@ class LocalHubRuntime {
 
     try {
       _sharedDirPath ??= await _resolveSharedDirectoryPath();
+      await _ensureSharedDirectoryExists(_sharedDirPath!);
       final sharedDir = Directory(_sharedDirPath!);
-      if (!await sharedDir.exists()) {
-        await sharedDir.create(recursive: true);
-      }
 
       _server = await _bindWithPortFallback(
         address: _hubListenAllIPv4,
@@ -101,25 +123,26 @@ class LocalHubRuntime {
 
   Future<String> _resolveSharedDirectoryPath() async {
     if (Platform.isAndroid) {
-      return '/storage/emulated/0/Download/AirShare';
+      final appDir = await getExternalStorageDirectory();
+      final base = appDir ?? await getApplicationDocumentsDirectory();
+      return p.join(base.path, 'AirShare');
     }
 
     if (Platform.isIOS) {
       final docs = await getApplicationDocumentsDirectory();
-      return '${docs.path}${Platform.pathSeparator}AirShare';
+      return p.join(docs.path, 'AirShare');
     }
 
-    // Windows/Linux/macOS: prefer Downloads/AirShare so hub files align with the
-    // common "Downloads" workflow and match Android's Download/AirShare layout.
+    // Windows/Linux/macOS: prefer Downloads/AirShare for desktop workflows.
     if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
       final downloads = await getDownloadsDirectory();
       if (downloads != null) {
-        return '${downloads.path}${Platform.pathSeparator}AirShare';
+        return p.join(downloads.path, 'AirShare');
       }
     }
 
     final fallback = await getApplicationDocumentsDirectory();
-    return '${fallback.path}${Platform.pathSeparator}AirShare';
+    return p.join(fallback.path, 'AirShare');
   }
 
   /// Single path segment only; normalizes mixed slashes before validation.
@@ -135,10 +158,7 @@ class LocalHubRuntime {
   }
 
   String _joinSharedPath(String dir, String fileName) {
-    final d = dir.endsWith(Platform.pathSeparator)
-        ? dir.substring(0, dir.length - 1)
-        : dir;
-    return '$d${Platform.pathSeparator}$fileName';
+    return p.join(dir, fileName);
   }
 
   Future<HttpServer> _bindWithPortFallback({
@@ -196,24 +216,112 @@ class LocalHubRuntime {
       return;
     }
 
+    if (path == '/files' && method == 'DELETE') {
+      await _handleDelete(request, sharedDirPath);
+      return;
+    }
+
     request.response.statusCode = HttpStatus.notFound;
     request.response.write('Not found');
     await request.response.close();
   }
 
+  String? _headerValue(HttpRequest request, String name) {
+    final values = request.headers[name];
+    if (values == null || values.isEmpty) return null;
+    final trimmed = values.first.trim();
+    return trimmed.isEmpty ? null : trimmed;
+  }
+
   Future<void> _handleFiles(HttpRequest request, String sharedDirPath) async {
     final dir = Directory(sharedDirPath);
     stdout.writeln('[HubRuntime] GET /files list sharedDirPath=$sharedDirPath');
+    final manifest = await SharedRoomManifest.load(sharedDirPath);
     final entities = await dir.list().toList();
-    final fileNames = entities
-        .whereType<File>()
-        .map((file) => file.uri.pathSegments.last)
-        .toList()
-      ..sort();
+    final entries = <SharedFileEntry>[];
+
+    for (final entity in entities) {
+      if (entity is! File) continue;
+      final name = entity.uri.pathSegments.last;
+      if (SharedRoomManifest.isManifestFileName(name)) continue;
+
+      final stat = await entity.stat();
+      var meta = manifest.entryFor(name);
+      if (meta == null) {
+        meta = SharedFileEntry(
+          name: name,
+          senderId: manifest.roomHostPeerId,
+          senderName: manifest.roomHostName.isNotEmpty
+              ? manifest.roomHostName
+              : 'Room host',
+          sharedAt: stat.modified,
+          sizeBytes: stat.size,
+        );
+        manifest.upsertFile(meta);
+      } else if (meta.sizeBytes <= 0) {
+        meta = SharedFileEntry(
+          name: meta.name,
+          senderId: meta.senderId,
+          senderName: meta.senderName,
+          sharedAt: meta.sharedAt,
+          sizeBytes: stat.size,
+        );
+        manifest.upsertFile(meta);
+      }
+      entries.add(meta);
+    }
+
+    entries.sort((a, b) => b.sharedAt.compareTo(a.sharedAt));
+    await manifest.save(sharedDirPath);
 
     request.response.headers.contentType = ContentType.json;
-    request.response.write(jsonEncode(fileNames));
+    request.response.write(jsonEncode(entries.map((e) => e.toJson()).toList()));
     await request.response.close();
+  }
+
+  Future<void> _handleDelete(HttpRequest request, String sharedDirPath) async {
+    final rawName = request.uri.queryParameters['name'] ?? '';
+    final fileName = _sanitizeClientFileName(rawName);
+    if (fileName == null) {
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write('Invalid file name');
+      await request.response.close();
+      return;
+    }
+
+    final requesterPeerId =
+        _headerValue(request, 'x-airshare-requester-peer-id') ?? '';
+    final requesterRole =
+        (_headerValue(request, 'x-airshare-requester-role') ?? 'guest')
+            .toLowerCase();
+    final isHostRequester = requesterRole == 'host';
+
+    final manifest = await SharedRoomManifest.load(sharedDirPath);
+    final meta = manifest.entryFor(fileName);
+    final senderId = meta?.senderId ?? '';
+
+    final allowed = isHostRequester ||
+        (requesterPeerId.isNotEmpty &&
+            senderId.isNotEmpty &&
+            requesterPeerId == senderId);
+    if (!allowed) {
+      request.response.statusCode = HttpStatus.forbidden;
+      request.response.write('You can only delete files you shared');
+      await request.response.close();
+      return;
+    }
+
+    final file = File(_joinSharedPath(sharedDirPath, fileName));
+    if (await file.exists()) {
+      await file.delete();
+    }
+    manifest.removeFile(fileName);
+    await manifest.save(sharedDirPath);
+
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(jsonEncode({'status': 'ok', 'fileName': fileName}));
+    await request.response.close();
+    _ingressEventsController.add('deleted:$fileName');
   }
 
   Future<void> _handleDownload(HttpRequest request, String sharedDirPath) async {
@@ -362,6 +470,25 @@ class LocalHubRuntime {
     stdout.writeln('[HubRuntime] POST /upload name=$fileName outPath=$outPath bytes=${fileBytes.length}');
     final outFile = File(outPath);
     await outFile.writeAsBytes(fileBytes, flush: true);
+
+    final senderId = _headerValue(request, 'x-airshare-sender-id') ?? '';
+    final senderName = _headerValue(request, 'x-airshare-sender-name') ?? 'Unknown';
+    final manifest = await SharedRoomManifest.load(sharedDirPath);
+    if (manifest.roomHostPeerId.isEmpty &&
+        _headerValue(request, 'x-airshare-requester-role') == 'host' &&
+        senderId.isNotEmpty) {
+      manifest.setRoomHost(peerId: senderId, displayName: senderName);
+    }
+    manifest.upsertFile(
+      SharedFileEntry(
+        name: fileName,
+        senderId: senderId,
+        senderName: senderName,
+        sharedAt: DateTime.now().toUtc(),
+        sizeBytes: fileBytes.length,
+      ),
+    );
+    await manifest.save(sharedDirPath);
 
     request.response.headers.contentType = ContentType.json;
     request.response.statusCode = HttpStatus.created;

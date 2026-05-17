@@ -10,9 +10,69 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/mdns"
 )
+
+const manifestFileName = ".airshare_manifest.json"
+
+type sharedFileMeta struct {
+	SenderID   string `json:"senderId"`
+	SenderName string `json:"senderName"`
+	SharedAt   string `json:"sharedAt"`
+	SizeBytes  int64  `json:"sizeBytes"`
+}
+
+type sharedRoomManifest struct {
+	RoomHostPeerID string                    `json:"roomHostPeerId"`
+	RoomHostName   string                    `json:"roomHostName"`
+	Files          map[string]sharedFileMeta `json:"files"`
+}
+
+type sharedFileResponse struct {
+	Name       string `json:"name"`
+	SenderID   string `json:"senderId"`
+	SenderName string `json:"senderName"`
+	SharedAt   string `json:"sharedAt"`
+	SizeBytes  int64  `json:"sizeBytes"`
+}
+
+func loadManifest(sharedAbs string) (*sharedRoomManifest, error) {
+	path := filepath.Join(sharedAbs, manifestFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &sharedRoomManifest{Files: map[string]sharedFileMeta{}}, nil
+		}
+		return nil, err
+	}
+	var m sharedRoomManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return &sharedRoomManifest{Files: map[string]sharedFileMeta{}}, nil
+	}
+	if m.Files == nil {
+		m.Files = map[string]sharedFileMeta{}
+	}
+	return &m, nil
+}
+
+func saveManifest(sharedAbs string, m *sharedRoomManifest) error {
+	path := filepath.Join(sharedAbs, manifestFileName)
+	payload, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, payload, 0644)
+}
+
+func isManifestFileName(name string) bool {
+	return name == manifestFileName
+}
+
+func headerValue(r *http.Request, key string) string {
+	return strings.TrimSpace(r.Header.Get(key))
+}
 
 // sharedRootRel is the configured directory (relative or absolute). sharedRootAbs
 // is its cleaned absolute form used for all reads/writes after startup.
@@ -59,24 +119,116 @@ func resolveSafeSharedFile(sharedAbs, fileName string) (full string, err error) 
 	return full, nil
 }
 
-// פונקציה שסורקת את התיקייה ומחזירה רשימת שמות קבצים
 func getFiles(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[files] list request sharedRootAbs=%q", sharedRootAbs)
-	files, err := os.ReadDir(sharedRootAbs)
+	entries, err := os.ReadDir(sharedRootAbs)
 	if err != nil {
 		log.Printf("[files] ReadDir failed path=%q err=%v", sharedRootAbs, err)
 		http.Error(w, "Unable to read directory", http.StatusInternalServerError)
 		return
 	}
 
-	var fileNames []string
-	for _, file := range files {
-		fileNames = append(fileNames, file.Name())
+	manifest, err := loadManifest(sharedRootAbs)
+	if err != nil {
+		http.Error(w, "Unable to read room manifest", http.StatusInternalServerError)
+		return
 	}
 
-	// הפיכת הרשימה לפורמט JSON - ככה האפליקציה (Flutter) תבין אותנו
+	var response []sharedFileResponse
+	for _, entry := range entries {
+		if entry.IsDir() || isManifestFileName(entry.Name()) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		meta, ok := manifest.Files[entry.Name()]
+		if !ok {
+			hostName := manifest.RoomHostName
+			if hostName == "" {
+				hostName = "Room host"
+			}
+			meta = sharedFileMeta{
+				SenderID:   manifest.RoomHostPeerID,
+				SenderName: hostName,
+				SharedAt:   info.ModTime().UTC().Format(time.RFC3339),
+				SizeBytes:  info.Size(),
+			}
+			manifest.Files[entry.Name()] = meta
+		} else if meta.SizeBytes <= 0 {
+			meta.SizeBytes = info.Size()
+			manifest.Files[entry.Name()] = meta
+		}
+		response = append(response, sharedFileResponse{
+			Name:       entry.Name(),
+			SenderID:   meta.SenderID,
+			SenderName: meta.SenderName,
+			SharedAt:   meta.SharedAt,
+			SizeBytes:  meta.SizeBytes,
+		})
+	}
+	_ = saveManifest(sharedRootAbs, manifest)
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(fileNames)
+	json.NewEncoder(w).Encode(response)
+}
+
+func deleteFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rawName := r.URL.Query().Get("name")
+	fileName, err := sanitizeClientFileName(rawName)
+	if err != nil {
+		http.Error(w, "Invalid file name", http.StatusBadRequest)
+		return
+	}
+
+	requesterPeerID := headerValue(r, "X-AirShare-Requester-Peer-Id")
+	requesterRole := strings.ToLower(headerValue(r, "X-AirShare-Requester-Role"))
+	if requesterRole == "" {
+		requesterRole = "guest"
+	}
+	isHostRequester := requesterRole == "host"
+
+	manifest, err := loadManifest(sharedRootAbs)
+	if err != nil {
+		http.Error(w, "Unable to read room manifest", http.StatusInternalServerError)
+		return
+	}
+	meta, ok := manifest.Files[fileName]
+	senderID := ""
+	if ok {
+		senderID = meta.SenderID
+	}
+	allowed := isHostRequester || (requesterPeerID != "" && senderID != "" && requesterPeerID == senderID)
+	if !allowed {
+		http.Error(w, "You can only delete files you shared", http.StatusForbidden)
+		return
+	}
+
+	filePath, err := resolveSafeSharedFile(sharedRootAbs, fileName)
+	if err != nil {
+		http.Error(w, "Invalid file name", http.StatusBadRequest)
+		return
+	}
+	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+		http.Error(w, "Unable to delete file", http.StatusInternalServerError)
+		return
+	}
+	delete(manifest.Files, fileName)
+	if err := saveManifest(sharedRootAbs, manifest); err != nil {
+		http.Error(w, "Unable to update room manifest", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":   "ok",
+		"fileName": fileName,
+	})
 }
 
 func downloadFile(w http.ResponseWriter, r *http.Request) {
@@ -185,6 +337,37 @@ func uploadFile(w http.ResponseWriter, r *http.Request) {
 
 	if _, err = io.Copy(dst, src); err != nil {
 		http.Error(w, "Unable to write file", http.StatusInternalServerError)
+		return
+	}
+
+	manifest, err := loadManifest(sharedRootAbs)
+	if err != nil {
+		http.Error(w, "Unable to read room manifest", http.StatusInternalServerError)
+		return
+	}
+	senderID := headerValue(r, "X-AirShare-Sender-Id")
+	senderName := headerValue(r, "X-AirShare-Sender-Name")
+	if senderName == "" {
+		senderName = "Unknown"
+	}
+	if manifest.RoomHostPeerID == "" &&
+		strings.ToLower(headerValue(r, "X-AirShare-Requester-Role")) == "host" &&
+		senderID != "" {
+		manifest.RoomHostPeerID = senderID
+		manifest.RoomHostName = senderName
+	}
+	size := int64(0)
+	if stat, statErr := os.Stat(dstPath); statErr == nil {
+		size = stat.Size()
+	}
+	manifest.Files[fileName] = sharedFileMeta{
+		SenderID:   senderID,
+		SenderName: senderName,
+		SharedAt:   time.Now().UTC().Format(time.RFC3339),
+		SizeBytes:  size,
+	}
+	if err := saveManifest(sharedRootAbs, manifest); err != nil {
+		http.Error(w, "Unable to update room manifest", http.StatusInternalServerError)
 		return
 	}
 
@@ -307,7 +490,16 @@ func main() {
 		log.Fatalf("[airshare] mkdir %q: %v", sharedRootRel, err)
 	}
 
-	http.HandleFunc("/files", getFiles)
+	http.HandleFunc("/files", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getFiles(w, r)
+		case http.MethodDelete:
+			deleteFile(w, r)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
 	http.HandleFunc("/download", downloadFile)
 	http.HandleFunc("/upload", uploadFile)
 

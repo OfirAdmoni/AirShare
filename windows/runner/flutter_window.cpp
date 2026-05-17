@@ -245,6 +245,10 @@ void FlutterWindow::InitializeNativeChannels() {
           UpdateHubEndpoint(*args, result.get());
           return;
         }
+        if (call.method_name() == "getLocalPeerId") {
+          GetLocalPeerId(std::move(result));
+          return;
+        }
         result->NotImplemented();
       });
 
@@ -320,6 +324,28 @@ void FlutterWindow::InitializeNativeChannels() {
             ble_scan_sink_.reset();
             return nullptr;
           }));
+}
+
+void FlutterWindow::GetLocalPeerId(
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  using namespace winrt::Windows::Devices::Bluetooth;
+  try {
+    auto adapter = BluetoothAdapter::GetDefaultAsync().get();
+    if (!adapter) {
+      result->Error("no_adapter", "Bluetooth adapter unavailable.");
+      return;
+    }
+    std::stringstream id_stream;
+    id_stream << adapter.BluetoothAddress();
+    flutter::EncodableMap payload;
+    payload[flutter::EncodableValue("peerId")] =
+        flutter::EncodableValue(id_stream.str());
+    result->Success(flutter::EncodableValue(payload));
+  } catch (const winrt::hresult_error& e) {
+    result->Error("local_peer_failed", WinrtStringToUtf8(e.message()));
+  } catch (...) {
+    result->Error("local_peer_failed", "Unable to resolve local peer id.");
+  }
 }
 
 void FlutterWindow::StartBleScanning(
