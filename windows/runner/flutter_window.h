@@ -67,6 +67,8 @@ class FlutterWindow : public Win32Window {
                          flutter::MethodResult<flutter::EncodableValue>* result);
   void UpdateHubEndpoint(const flutter::EncodableMap& args,
                          flutter::MethodResult<flutter::EncodableValue>* result);
+  void GetLocalPeerId(
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void ConnectToHubWlan(const flutter::EncodableMap& args,
                         flutter::MethodResult<flutter::EncodableValue>* result);
   void StopInternalLink(flutter::MethodResult<flutter::EncodableValue>* result);

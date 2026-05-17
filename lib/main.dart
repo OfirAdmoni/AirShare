@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'dart:io';
 
 import 'package:air_share/ble_transport.dart';
@@ -10,6 +11,7 @@ import 'package:air_share/file_zone_session.dart';
 import 'package:air_share/hub_endpoint_state.dart';
 import 'package:air_share/hub_status.dart';
 import 'package:air_share/sender_staging_page.dart';
+import 'package:air_share/ux_prompts.dart';
 
 void main() {
   runApp(const AirShareApp());
@@ -140,6 +142,9 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
   void initState() {
     super.initState();
     _loadBranding();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      UxPrompts.promptBluetoothOnLaunch(context);
+    });
   }
 
   Future<void> _loadBranding() async {
@@ -413,6 +418,28 @@ class ConnectionLogPage extends StatefulWidget {
 
 class _ConnectionLogPageState extends State<ConnectionLogPage> {
   bool _clearing = false;
+  bool _sharing = false;
+
+  Future<void> _shareLogs() async {
+    final lines = ConnectionLogger.instance.entries.value;
+    if (lines.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No logs to share')),
+      );
+      return;
+    }
+    setState(() => _sharing = true);
+    try {
+      await ConnectionLogger.instance.shareDisplayedLogs();
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not share logs: ${e.message ?? e.code}')),
+      );
+    } finally {
+      if (mounted) setState(() => _sharing = false);
+    }
+  }
 
   Future<void> _clearLogs() async {
     setState(() => _clearing = true);
@@ -434,8 +461,19 @@ class _ConnectionLogPageState extends State<ConnectionLogPage> {
         title: const Text('Connection Audit Log'),
         actions: [
           IconButton(
+            tooltip: 'Share Logs',
+            onPressed: _sharing || _clearing ? null : _shareLogs,
+            icon: _sharing
+                ? const SizedBox(
+                    width: 24,
+                    height: 24,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.share_outlined),
+          ),
+          IconButton(
             tooltip: 'Clear Logs',
-            onPressed: _clearing ? null : _clearLogs,
+            onPressed: _clearing || _sharing ? null : _clearLogs,
             icon: const Icon(Icons.delete_outline),
           ),
         ],

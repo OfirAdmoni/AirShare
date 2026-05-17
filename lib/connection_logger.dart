@@ -1,12 +1,16 @@
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 class ConnectionLogger {
   ConnectionLogger._();
 
   static final ConnectionLogger instance = ConnectionLogger._();
+
+  static const MethodChannel _nativeChannel = MethodChannel('air_share/ble_transport');
 
   final ValueNotifier<List<String>> entries = ValueNotifier<List<String>>(<String>[]);
   File? _logFile;
@@ -15,7 +19,7 @@ class ConnectionLogger {
   Future<File> _resolveLogFile() async {
     if (_logFile != null) return _logFile!;
     final dir = await getApplicationDocumentsDirectory();
-    _logFile = File('${dir.path}${Platform.pathSeparator}connection_audit_log.txt');
+    _logFile = File(p.join(dir.path, 'connection_audit_log.txt'));
     if (!await _logFile!.exists()) {
       await _logFile!.create(recursive: true);
     }
@@ -49,6 +53,24 @@ class ConnectionLogger {
       entries.value = <String>[];
     });
     await _writeChain;
+  }
+
+  /// Shares the current in-memory log lines via the native Android share sheet.
+  Future<void> shareDisplayedLogs() async {
+    if (!Platform.isAndroid) {
+      throw PlatformException(
+        code: 'unsupported',
+        message: 'Share logs is only supported on Android',
+      );
+    }
+    final text = entries.value.join('\n');
+    if (text.isEmpty) {
+      throw PlatformException(
+        code: 'empty_logs',
+        message: 'No logs to share',
+      );
+    }
+    await _nativeChannel.invokeMethod<void>('shareLogs', {'text': text});
   }
 }
 

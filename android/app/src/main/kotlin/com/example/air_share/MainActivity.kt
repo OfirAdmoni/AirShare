@@ -25,13 +25,18 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.provider.Settings
+import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.wifi.SoftApConfiguration
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.net.wifi.p2p.WifiP2pConfig
+import android.net.wifi.p2p.WifiP2pGroup
 import android.net.wifi.p2p.WifiP2pManager
 import android.net.wifi.WpsInfo
 import android.os.Build
@@ -51,6 +56,7 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.nio.charset.StandardCharsets
 import java.util.Collections
+import java.util.Locale
 import java.util.UUID
 
 class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
@@ -99,10 +105,24 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private var pendingHubIp: String? = null
     private var pendingHubPort: Int = 8080
     private var advertisedEndpoint: String = ""
+    private var pendingLanIp: String = ""
+    private var pendingP2pIp: String = ""
+    private var pendingHotspotHubIp: String = ""
+    /// True only after LocalOnlyHotspotCallback.onStarted — gates BLE hotspot fields.
+    private var hotspotActive = false
+
+    private var handshakeDeliveryResult: MethodChannel.Result? = null
+    private val hubWlanRequestHandler = Handler(Looper.getMainLooper())
+    private var hubWlanRequestTimeoutRunnable: Runnable? = null
+    private var handshakeDeliveryGatt: BluetoothGatt? = null
+    private var handshakeDelivered = false
+    private val handshakeWaitHandler = Handler(Looper.getMainLooper())
+    private var handshakeWaitRunnable: Runnable? = null
 
     private var activeHotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
     private var localHotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
     private var connectivityCallback: ConnectivityManager.NetworkCallback? = null
+    private var connectivityCallbackRegistered = false
 
     private var wifiP2pManager: WifiP2pManager? = null
     private var wifiP2pChannel: WifiP2pManager.Channel? = null
@@ -299,6 +319,13 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             }
         }
 
+        override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
+            Log.i(
+                "AirShareNative",
+                "Host BLE MTU changed for ${device.address}: $mtu (max ATT payload ≈ ${mtu - 3})",
+            )
+        }
+
         override fun onDescriptorWriteRequest(
             device: BluetoothDevice,
             requestId: Int,
@@ -309,14 +336,25 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             value: ByteArray,
         ) {
             if (descriptor.uuid == clientConfigDescriptorUuid) {
-                if (responseNeeded) {
-                    gattServer?.sendResponse(
-                        device,
-                        requestId,
-                        BluetoothGatt.GATT_SUCCESS,
-                        offset,
-                        value,
-                    )
+                val enableNotify = value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                val enableIndicate = value.contentEquals(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE)
+                descriptor.value = when {
+                    enableNotify || enableIndicate -> value
+                    else -> BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE
+                }
+                Log.i(
+                    "AirShareNative",
+                    "CCCD write from ${device.address}: notify=$enableNotify indicate=$enableIndicate responseNeeded=$responseNeeded",
+                )
+                val sent = gattServer?.sendResponse(
+                    device,
+                    requestId,
+                    BluetoothGatt.GATT_SUCCESS,
+                    0,
+                    null,
+                ) == true
+                if (!sent) {
+                    Log.w("AirShareNative", "CCCD sendResponse failed for ${device.address}")
                 }
                 return
             }
@@ -325,7 +363,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     device,
                     requestId,
                     BluetoothGatt.GATT_FAILURE,
-                    offset,
+                    0,
                     null,
                 )
             }
@@ -418,14 +456,117 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             "establishSecureHandshake" -> ensurePermissionsThenExecute(result) { establishSecureHandshake(call, result) }
             "readPeerEndpoint" -> ensurePermissionsThenExecute(result) { readPeerEndpoint(call, result) }
             "updateHubEndpoint" -> updateHubEndpoint(call, result)
+            "updateConnectionEndpoints" -> updateConnectionEndpoints(call, result)
             "approveConnection" -> approveConnection(call, result)
-            "startTemporaryHotspot" -> ensurePermissionsThenExecute(result) { startTemporaryHotspot(call, result) }
-            "connectToHubWlan" -> ensurePermissionsThenExecute(result) { connectToHubWlan(call, result) }
-            "startWifiDirectGroup" -> ensurePermissionsThenExecute(result) { startWifiDirectGroup(result) }
+            "ensureLocationForWifiTier" -> ensurePermissionsThenExecute(result) { ensureLocationForWifiTier(result) }
+            "startTemporaryHotspot" -> ensurePermissionsThenExecute(result) {
+                ensureLocationReadyForWifiTier(result) { startTemporaryHotspot(call, result) }
+            }
+            "connectToHubWlan" -> ensureWlanPermissionsThenExecute(result) { connectToHubWlan(call, result) }
+            "startWifiDirectGroup" -> ensurePermissionsThenExecute(result) {
+                ensureLocationReadyForWifiTier(result) { startWifiDirectGroupInternal(result) }
+            }
+            "teardownP2pBeforeHotspot" -> teardownP2pBeforeHotspot(result)
+            "stopNativeHotspot" -> stopNativeHotspot(result)
             "stopWifiDirectGroup" -> stopWifiDirectGroup(result)
-            "connectToWifiDirectPeer" -> ensurePermissionsThenExecute(result) { connectToWifiDirectPeer(call, result) }
+            "connectToWifiDirectPeer" -> ensurePermissionsThenExecute(result) {
+                ensureLocationReadyForWifiTier(result) { connectToWifiDirectPeerInternal(call, result) }
+            }
             "stopInternalLink" -> stopInternalLink(result)
+            "isBluetoothEnabled" -> ensurePermissionsThenExecute(result) { isBluetoothEnabled(result) }
+            "requestEnableBluetooth" -> ensurePermissionsThenExecute(result) { requestEnableBluetooth(result) }
+            "openWirelessSettings" -> openWirelessSettings(result)
+            "shareLogs" -> shareLogs(call, result)
+            "getLocalPeerId" -> ensurePermissionsThenExecute(result) { getLocalPeerId(result) }
             else -> result.notImplemented()
+        }
+    }
+
+    private fun resolveBluetoothAdapter(): BluetoothAdapter? {
+        if (bluetoothAdapter == null) {
+            bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+            bluetoothAdapter = bluetoothManager?.adapter
+        }
+        return bluetoothAdapter
+    }
+
+    private fun isBluetoothEnabled(result: MethodChannel.Result) {
+        val adapter = resolveBluetoothAdapter()
+        if (adapter == null) {
+            result.success(false)
+            return
+        }
+        result.success(adapter.isEnabled)
+    }
+
+    private fun requestEnableBluetooth(result: MethodChannel.Result) {
+        val adapter = resolveBluetoothAdapter()
+        if (adapter == null) {
+            result.error("ble_unavailable", "Bluetooth is not available on this device.", null)
+            return
+        }
+        if (adapter.isEnabled) {
+            result.success(mapOf("enabled" to true, "prompted" to false))
+            return
+        }
+        try {
+            @Suppress("DEPRECATION")
+            startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+            Log.i("AirShareNative", "Launched ACTION_REQUEST_ENABLE for Bluetooth")
+            result.success(mapOf("enabled" to false, "prompted" to true))
+        } catch (e: Exception) {
+            result.error("bluetooth_enable_failed", e.message, null)
+        }
+    }
+
+    private fun openWirelessSettings(result: MethodChannel.Result) {
+        try {
+            startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS))
+            result.success(null)
+        } catch (e: Exception) {
+            result.error("settings_intent_failed", e.message, null)
+        }
+    }
+
+    private fun isUsableBtAddress(address: String?): Boolean {
+        if (address.isNullOrBlank()) return false
+        return address.uppercase() != "02:00:00:00:00:00"
+    }
+
+    private fun getLocalPeerId(result: MethodChannel.Result) {
+        val prefs = getSharedPreferences("air_share", Context.MODE_PRIVATE)
+        val adapter = resolveBluetoothAdapter()
+        val btAddr = adapter?.address?.trim()
+        if (isUsableBtAddress(btAddr)) {
+            prefs.edit().putString("local_peer_id", btAddr).apply()
+            result.success(mapOf("peerId" to btAddr))
+            return
+        }
+        var id = prefs.getString("local_peer_id", null)?.trim()
+        if (id.isNullOrEmpty()) {
+            id = java.util.UUID.randomUUID().toString()
+            prefs.edit().putString("local_peer_id", id).apply()
+        }
+        result.success(mapOf("peerId" to id))
+    }
+
+    private fun shareLogs(call: MethodCall, result: MethodChannel.Result) {
+        val logText = call.argument<String>("text")?.trim().orEmpty()
+        if (logText.isEmpty()) {
+            result.error("empty_logs", "No log text to share.", null)
+            return
+        }
+        try {
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                action = Intent.ACTION_SEND
+                putExtra(Intent.EXTRA_TEXT, logText)
+                type = "text/plain"
+            }
+            startActivity(Intent.createChooser(sendIntent, "Share Connection Logs"))
+            result.success(null)
+        } catch (e: Exception) {
+            Log.e("AirShareNative", "shareLogs failed: ${e.message}")
+            result.error("share_failed", e.message, null)
         }
     }
 
@@ -470,20 +611,32 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
         val device = pendingReadDevice
         val requestId = pendingReadRequestId
-        if (device != null && requestId != null && characteristic != null) {
+        if (device != null && characteristic != null) {
             val notified = gattServer?.notifyCharacteristicChanged(device, characteristic, false) == true
-            if (!notified) {
-                Log.w("AirShareNative", "Handshake notify not sent immediately after approval update.")
-            } else {
-                Log.i("AirShareNative", "Handshake notify sent immediately after approval update.")
-            }
-            gattServer?.sendResponse(
-                device,
-                requestId,
-                BluetoothGatt.GATT_SUCCESS,
-                pendingReadOffset,
-                handshakePayload,
+            Log.i(
+                "AirShareNative",
+                "notifyCharacteristicChanged() returned $notified for ${device.address} " +
+                    "(payloadBytes=${handshakePayload.size})",
             )
+            if (!notified) {
+                Log.w(
+                    "AirShareNative",
+                    "Handshake notify failed — client may not have subscribed (CCCD) or MTU too small.",
+                )
+            }
+            if (requestId != null) {
+                val readResponseSent = gattServer?.sendResponse(
+                    device,
+                    requestId,
+                    BluetoothGatt.GATT_SUCCESS,
+                    pendingReadOffset,
+                    handshakePayload,
+                ) == true
+                Log.i(
+                    "AirShareNative",
+                    "Handshake read response sent=$readResponseSent for ${device.address}",
+                )
+            }
             Log.i("AirShareNative", "Peer Handshake Released for ${device.address}")
         } else {
             Log.w("AirShareNative", "Peer Handshake Released but no pending device/read request was available.")
@@ -527,7 +680,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             handshakeCharacteristic?.value = null
             clearPendingRead()
         }
-        approvalTimeoutHandler.postDelayed(approvalTimeoutRunnable!!, 30_000)
+        approvalTimeoutHandler.postDelayed(approvalTimeoutRunnable!!, 45_000)
     }
 
     private fun cancelApprovalTimeout() {
@@ -542,27 +695,159 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         cancelApprovalTimeout()
     }
 
+    private fun handshakePayloadIsReady(json: JSONObject): Boolean {
+        if (json.optString("lan_ip").isNotBlank()) return true
+        if (json.optString("hubIp").isNotBlank()) return true
+        if (json.optString("p2p_ip").isNotBlank()) return true
+        if (json.optString("p2p_mac").isNotBlank() || json.optString("p2pMac").isNotBlank()) return true
+        if (json.optString("hotspot_ssid").isNotBlank() || json.optString("ssid").isNotBlank()) return true
+        return false
+    }
+
+    private fun parseHandshakePayload(json: JSONObject): Map<String, Any> {
+        return mapOf(
+            "lan_ip" to json.optString("lan_ip", json.optString("hubIp", "")),
+            "p2p_ip" to json.optString("p2p_ip", ""),
+            "p2p_mac" to json.optString("p2p_mac", json.optString("p2pMac", "")),
+            "hotspot_ssid" to json.optString("hotspot_ssid", json.optString("ssid", "")),
+            "hotspot_pass" to json.optString("hotspot_pass", json.optString("password", "")),
+            "hotspot_hub_ip" to json.optString("hotspot_hub_ip", ""),
+            "hub_port" to json.optInt("hub_port", json.optInt("hubPort", 8080)),
+        )
+    }
+
+    private fun cancelHandshakeWait() {
+        handshakeWaitRunnable?.let { handshakeWaitHandler.removeCallbacks(it) }
+        handshakeWaitRunnable = null
+    }
+
+    private fun deliverGuestHandshake(gatt: BluetoothGatt, value: ByteArray, source: String) {
+        if (handshakeDelivered) return
+        if (value.isEmpty()) return
+        val payloadString = String(value, StandardCharsets.UTF_8).trim()
+        if (payloadString.isEmpty()) return
+        val payload = try {
+            JSONObject(payloadString)
+        } catch (e: Exception) {
+            Log.w("AirShareNative", "Invalid handshake JSON ($source): ${e.message}")
+            return
+        }
+        if (!handshakePayloadIsReady(payload)) return
+
+        handshakeDelivered = true
+        cancelHandshakeWait()
+        val result = handshakeDeliveryResult ?: return
+        handshakeDeliveryResult = null
+        handshakeDeliveryGatt = null
+        Log.i("AirShareNative", "Peer Handshake Success via $source")
+        result.success(parseHandshakePayload(payload))
+        gatt.close()
+        activeGattClient = null
+    }
+
+    private fun scheduleHandshakeWait(gatt: BluetoothGatt) {
+        cancelHandshakeWait()
+        handshakeWaitRunnable = Runnable {
+            if (handshakeDelivered) return@Runnable
+            val result = handshakeDeliveryResult
+            handshakeDeliveryResult = null
+            handshakeDeliveryGatt = null
+            result?.error(
+                "handshake_timeout",
+                "Timed out waiting for host approval notification.",
+                null,
+            )
+            gatt.close()
+            activeGattClient = null
+        }
+        handshakeWaitHandler.postDelayed(handshakeWaitRunnable!!, 45_000)
+    }
+
     private fun buildHandshakePayloadOrNull(): ByteArray? {
-        val hubIp = pendingHubIp?.trim().orEmpty()
-        if (hubIp.isBlank()) {
-            Log.w("AirShareNative", "Android | Handshake build skipped: pendingHubIp is empty")
+        val lan = pendingLanIp.trim()
+        val p2p = pendingP2pIp.trim()
+        val ssid = if (hotspotActive) pendingHotspotSsid?.trim().orEmpty() else ""
+        val password = if (hotspotActive) pendingHotspotPassword?.trim().orEmpty() else ""
+        val p2pMac = pendingP2pMac.trim()
+        val hotspotHub = if (hotspotActive) pendingHotspotHubIp.trim() else ""
+        if (lan.isBlank() && p2p.isBlank() && ssid.isBlank()) {
+            Log.w("AirShareNative", "Android | Handshake build skipped: no tier endpoints")
             return null
         }
-        val ssid = pendingHotspotSsid?.trim().orEmpty()
-        val password = pendingHotspotPassword?.trim().orEmpty()
-        val p2pMac = pendingP2pMac.trim()
+        val primaryLegacy = when {
+            lan.isNotBlank() -> lan
+            p2p.isNotBlank() -> p2p
+            hotspotHub.isNotBlank() -> hotspotHub
+            else -> pendingHubIp?.trim().orEmpty()
+        }
         val json = JSONObject().apply {
-            put("ssid", ssid)
-            put("password", password)
-            put("hubIp", hubIp)
-            put("hubPort", pendingHubPort)
-            if (p2pMac.isNotEmpty()) put("p2pMac", p2pMac)
+            if (lan.isNotBlank()) put("lan_ip", lan)
+            if (p2p.isNotBlank()) put("p2p_ip", p2p)
+            if (p2pMac.isNotBlank()) put("p2p_mac", p2pMac)
+            if (ssid.isNotBlank()) put("hotspot_ssid", ssid)
+            if (password.isNotBlank()) put("hotspot_pass", password)
+            if (hotspotHub.isNotBlank()) put("hotspot_hub_ip", hotspotHub)
+            put("hub_port", pendingHubPort)
+            if (primaryLegacy.isNotBlank()) {
+                put("hubIp", primaryLegacy)
+                put("hubPort", pendingHubPort)
+            }
+            if (ssid.isNotBlank()) {
+                put("ssid", ssid)
+                put("password", password)
+            }
+            if (p2pMac.isNotBlank()) put("p2pMac", p2pMac)
         }.toString()
         Log.i(
             "AirShareNative",
-            "Android | Handshake JSON built | hubIp=$hubIp port=$pendingHubPort ssid_len=${ssid.length} pwd_len=${password.length}",
+            "Android | Handshake JSON built | lan=$lan p2p=$p2p hotspot_ssid_len=${ssid.length} port=$pendingHubPort",
         )
         return json.toByteArray(StandardCharsets.UTF_8)
+    }
+
+    private fun updateConnectionEndpoints(call: MethodCall, result: MethodChannel.Result) {
+        pendingLanIp = call.argument<String>("lanIp")?.trim().orEmpty()
+        pendingP2pIp = call.argument<String>("p2pIp")?.trim().orEmpty()
+        val incomingP2pMac = call.argument<String>("p2pMac")?.trim().orEmpty()
+        when {
+            isUsableP2pMac(incomingP2pMac) -> pendingP2pMac = incomingP2pMac
+            incomingP2pMac.isEmpty() && isUsableP2pMac(pendingP2pMac) -> {
+                Log.i(
+                    "AirShareNative",
+                    "updateConnectionEndpoints: keeping native P2P MAC $pendingP2pMac",
+                )
+            }
+            incomingP2pMac.isNotEmpty() -> {
+                Log.w(
+                    "AirShareNative",
+                    "updateConnectionEndpoints: ignoring unusable p2pMac from Flutter: $incomingP2pMac",
+                )
+            }
+        }
+        val ssid = call.argument<String>("hotspotSsid")?.trim().orEmpty()
+        val pass = call.argument<String>("hotspotPass")?.trim().orEmpty()
+        if (ssid.isNotEmpty() && pass.isNotEmpty() && hotspotActive) {
+            pendingHotspotSsid = ssid
+            pendingHotspotPassword = pass
+        }
+        val hubFromDart = call.argument<String>("hotspotHubIp")?.trim().orEmpty()
+        if (hubFromDart.isNotEmpty() && hotspotActive) {
+            pendingHotspotHubIp = hubFromDart
+        }
+        pendingHubPort = call.argument<Int>("hubPort") ?: pendingHubPort
+
+        val primary = when {
+            pendingLanIp.isNotBlank() -> pendingLanIp
+            pendingP2pIp.isNotBlank() -> pendingP2pIp
+            pendingHotspotHubIp.isNotBlank() -> pendingHotspotHubIp
+            else -> ""
+        }
+        if (primary.isNotBlank()) {
+            pendingHubIp = primary
+            advertisedEndpoint = "$primary:$pendingHubPort"
+            endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
+        }
+        result.success(null)
     }
 
     private fun requiredPermissions(): Array<String> {
@@ -580,6 +865,88 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             perms += Manifest.permission.NEARBY_WIFI_DEVICES
         }
         return perms.toTypedArray()
+    }
+
+    private fun requiredWlanPermissions(): Array<String> =
+        (requiredPermissions().toList() + listOf(
+            Manifest.permission.CHANGE_NETWORK_STATE,
+            Manifest.permission.CHANGE_WIFI_STATE,
+        )).distinct().toTypedArray()
+
+    private fun isFineLocationGranted(): Boolean =
+        ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+        ) == PackageManager.PERMISSION_GRANTED
+
+    private fun isLocationServicesEnabled(): Boolean {
+        val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            lm.isLocationEnabled
+        } else {
+            lm.isProviderEnabled(LocationManager.GPS_PROVIDER) ||
+                lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+        }
+    }
+
+    private fun isLocationReadyForWifiP2p(): Boolean =
+        isFineLocationGranted() && isLocationServicesEnabled()
+
+    private fun ensureLocationForWifiTier(result: MethodChannel.Result) {
+        if (isLocationReadyForWifiP2p()) {
+            result.success(mapOf("ready" to true))
+        } else if (!isFineLocationGranted()) {
+            result.error(
+                "location_permission_denied",
+                "ACCESS_FINE_LOCATION is required for Wi-Fi Direct.",
+                null,
+            )
+        } else {
+            result.error(
+                "location_disabled",
+                "Location services (GPS) must be enabled for Wi-Fi Direct.",
+                null,
+            )
+        }
+    }
+
+    private fun ensureLocationReadyForWifiTier(
+        result: MethodChannel.Result,
+        onReady: () -> Unit,
+    ) {
+        if (isLocationReadyForWifiP2p()) {
+            onReady()
+            return
+        }
+        if (!isFineLocationGranted()) {
+            result.error(
+                "location_permission_denied",
+                "ACCESS_FINE_LOCATION is required for Wi-Fi Direct.",
+                null,
+            )
+            return
+        }
+        result.error(
+            "location_disabled",
+            "Location services (GPS) must be enabled for Wi-Fi Direct.",
+            null,
+        )
+    }
+
+    private fun ensureWlanPermissionsThenExecute(
+        result: MethodChannel.Result,
+        action: () -> Unit,
+    ) {
+        val missing = requiredWlanPermissions().filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isEmpty()) {
+            action()
+            return
+        }
+        pendingPermissionResult = result
+        pendingPermissionAction = action
+        ActivityCompat.requestPermissions(this, missing.toTypedArray(), 9201)
     }
 
     private fun ensurePermissionsThenExecute(
@@ -797,36 +1164,142 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             return
         }
 
+        cancelHandshakeWait()
+        handshakeDelivered = false
+        handshakeDeliveryResult = result
         activeGattClient?.close()
+        var handshakeSetupStarted = false
+        fun beginHandshakeSetup(gatt: BluetoothGatt) {
+            if (handshakeSetupStarted) return
+            handshakeSetupStarted = true
+            gatt.discoverServices()
+        }
         activeGattClient = device.connectGatt(this, false, object : BluetoothGattCallback() {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
-                    gatt.discoverServices()
+                    Log.i("AirShareNative", "Guest BLE connected — requesting MTU 512")
+                    if (!gatt.requestMtu(512)) {
+                        Log.w("AirShareNative", "requestMtu(512) returned false; continuing with default MTU")
+                        beginHandshakeSetup(gatt)
+                    }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    if (status != BluetoothGatt.GATT_SUCCESS) {
-                        result.error("handshake_disconnect", "Disconnected during handshake.", null)
+                    if (!handshakeDelivered && handshakeDeliveryResult != null) {
+                        handshakeDeliveryResult?.error(
+                            "handshake_disconnect",
+                            "Disconnected during handshake.",
+                            null,
+                        )
+                        handshakeDeliveryResult = null
+                        cancelHandshakeWait()
                     }
                     gatt.close()
+                    if (activeGattClient == gatt) activeGattClient = null
                 }
+            }
+
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    Log.i(
+                        "AirShareNative",
+                        "Guest BLE MTU negotiated: $mtu (max ATT payload ≈ ${mtu - 3})",
+                    )
+                } else {
+                    Log.w(
+                        "AirShareNative",
+                        "Guest BLE MTU request failed status=$status mtu=$mtu; continuing",
+                    )
+                }
+                beginHandshakeSetup(gatt)
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    result.error("service_discovery_failed", "Unable to discover handshake service.", null)
+                    handshakeDeliveryResult?.error(
+                        "service_discovery_failed",
+                        "Unable to discover handshake service.",
+                        null,
+                    )
+                    handshakeDeliveryResult = null
                     gatt.close()
                     return
                 }
                 val service = gatt.getService(serviceUuid)
                 val characteristic = service?.getCharacteristic(handshakeCharacteristicUuid)
                 if (characteristic == null) {
-                    result.error("characteristic_missing", "Handshake characteristic missing.", null)
+                    handshakeDeliveryResult?.error(
+                        "characteristic_missing",
+                        "Handshake characteristic missing.",
+                        null,
+                    )
+                    handshakeDeliveryResult = null
                     gatt.close()
                     return
                 }
-                val initiated = gatt.readCharacteristic(characteristic)
-                if (!initiated) {
-                    result.error("handshake_read_failed", "Failed to start handshake read.", null)
+                handshakeDeliveryGatt = gatt
+                gatt.setCharacteristicNotification(characteristic, true)
+                val descriptor = characteristic.getDescriptor(clientConfigDescriptorUuid)
+                if (descriptor == null) {
+                    if (!gatt.readCharacteristic(characteristic)) {
+                        handshakeDeliveryResult?.error(
+                            "handshake_read_failed",
+                            "Failed to start handshake read.",
+                            null,
+                        )
+                        handshakeDeliveryResult = null
+                        gatt.close()
+                    } else {
+                        scheduleHandshakeWait(gatt)
+                    }
+                    return
+                }
+                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                if (!gatt.writeDescriptor(descriptor)) {
+                    if (!gatt.readCharacteristic(characteristic)) {
+                        handshakeDeliveryResult?.error(
+                            "handshake_notify_failed",
+                            "Failed to enable handshake notifications.",
+                            null,
+                        )
+                        handshakeDeliveryResult = null
+                        gatt.close()
+                    } else {
+                        scheduleHandshakeWait(gatt)
+                    }
+                }
+            }
+
+            override fun onDescriptorWrite(
+                gatt: BluetoothGatt,
+                descriptor: BluetoothGattDescriptor,
+                status: Int,
+            ) {
+                if (descriptor.uuid != clientConfigDescriptorUuid) return
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    handshakeDeliveryResult?.error(
+                        "handshake_notify_failed",
+                        "Failed to subscribe to handshake notifications.",
+                        null,
+                    )
+                    handshakeDeliveryResult = null
                     gatt.close()
+                    return
+                }
+                val characteristic = gatt
+                    .getService(serviceUuid)
+                    ?.getCharacteristic(handshakeCharacteristicUuid)
+                if (characteristic == null) {
+                    handshakeDeliveryResult?.error(
+                        "characteristic_missing",
+                        "Handshake characteristic missing after notify.",
+                        null,
+                    )
+                    handshakeDeliveryResult = null
+                    gatt.close()
+                    return
+                }
+                scheduleHandshakeWait(gatt)
+                if (!gatt.readCharacteristic(characteristic)) {
+                    Log.w("AirShareNative", "Initial handshake read not started; waiting for notify only.")
                 }
             }
 
@@ -838,22 +1311,15 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             ) {
                 if (characteristic.uuid != handshakeCharacteristicUuid) return
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    result.error("handshake_failed", "Secure handshake read failed.", null)
+                    if (!handshakeDelivered) {
+                        handshakeDeliveryResult?.error("handshake_failed", "Secure handshake read failed.", null)
+                        handshakeDeliveryResult = null
+                        cancelHandshakeWait()
+                    }
                     gatt.close()
                     return
                 }
-                val payloadString = String(value, StandardCharsets.UTF_8)
-                val payload = JSONObject(payloadString)
-                Log.i("AirShareNative", "Peer Handshake Success for peer=$peerId")
-                result.success(
-                    mapOf(
-                        "ssid" to payload.optString("ssid", ""),
-                        "password" to payload.optString("password", ""),
-                        "hubIp" to payload.optString("hubIp", ""),
-                        "hubPort" to payload.optInt("hubPort", 8080),
-                    ),
-                )
-                gatt.close()
+                deliverGuestHandshake(gatt, value, "read")
             }
 
             override fun onCharacteristicRead(
@@ -866,6 +1332,26 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     characteristic,
                     characteristic.value ?: ByteArray(0),
                     status,
+                )
+            }
+
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray,
+            ) {
+                if (characteristic.uuid != handshakeCharacteristicUuid) return
+                deliverGuestHandshake(gatt, value, "notify")
+            }
+
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+            ) {
+                onCharacteristicChanged(
+                    gatt,
+                    characteristic,
+                    characteristic.value ?: ByteArray(0),
                 )
             }
         })
@@ -955,19 +1441,127 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         })
     }
 
+    private fun clearHotspotState() {
+        hotspotActive = false
+        pendingHotspotSsid = null
+        pendingHotspotPassword = null
+        pendingHotspotHubIp = ""
+    }
+
+    /**
+     * LocalOnlyHotspot on Android 10+ ignores custom SSID/password — only system values are real.
+     */
+    private fun extractLocalOnlyHotspotCredentials(
+        reservation: WifiManager.LocalOnlyHotspotReservation,
+    ): Pair<String, String> {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                val config: SoftApConfiguration = reservation.softApConfiguration
+                val ssid = config.ssid?.let { wifiSsid ->
+                    try {
+                        wifiSsid.javaClass.getMethod("getUtf8Text").invoke(wifiSsid) as? String
+                    } catch (_: Exception) {
+                            wifiSsid.toString()
+                        }
+                }?.trim('"')?.trim().orEmpty().orEmpty()
+                val password = config.passphrase?.toString()?.trim().orEmpty().orEmpty()
+                if (ssid.isNotEmpty()) {
+                    Log.i(
+                        "AirShareNative",
+                        "Hotspot credentials from softApConfiguration: ssid=$ssid pass_len=${password.length}",
+                    )
+                    return ssid to password
+                }
+            } catch (e: Exception) {
+                Log.w("AirShareNative", "softApConfiguration read failed: ${e.message}")
+            }
+        }
+        @Suppress("DEPRECATION")
+        val wifiConfig = reservation.wifiConfiguration
+        val ssid = wifiConfig?.SSID?.trim('"')?.trim().orEmpty().orEmpty()
+        val password = wifiConfig?.preSharedKey?.trim('"')?.trim().orEmpty().orEmpty()
+        Log.i(
+            "AirShareNative",
+            "Hotspot credentials from wifiConfiguration: ssid=$ssid pass_len=${password.length}",
+        )
+        return ssid to password
+    }
+
+    /// Tears down LocalOnlyHotspot (ap0) so the Wi‑Fi chip is clean for later LAN use.
+    private fun stopNativeHotspot(result: MethodChannel.Result) {
+        try {
+            Log.i("AirShareNative", "stopNativeHotspot: releasing hotspot reservation")
+            hubWlanRequestTimeoutRunnable?.let { hubWlanRequestHandler.removeCallbacks(it) }
+            hubWlanRequestTimeoutRunnable = null
+            val connectivityManager =
+                getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            safeUnregisterHubWlanCallback(connectivityManager)
+            try {
+                connectivityManager.bindProcessToNetwork(null)
+            } catch (e: Exception) {
+                Log.w("AirShareNative", "stopNativeHotspot: bindProcessToNetwork(null): ${e.message}")
+            }
+            try {
+                localHotspotReservation?.close()
+            } catch (e: Exception) {
+                Log.w("AirShareNative", "stopNativeHotspot: local reservation close: ${e.message}")
+            }
+            try {
+                activeHotspotReservation?.close()
+            } catch (e: Exception) {
+                Log.w("AirShareNative", "stopNativeHotspot: active reservation close: ${e.message}")
+            }
+            localHotspotReservation = null
+            activeHotspotReservation = null
+            clearHotspotState()
+            val p2pMgr = wifiP2pManager
+            val p2pChan = wifiP2pChannel
+            if (p2pMgr != null && p2pChan != null) {
+                p2pMgr.removeGroup(p2pChan, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        Log.i("AirShareNative", "stopNativeHotspot: P2P group removed")
+                    }
+                    override fun onFailure(reason: Int) {
+                        Log.w("AirShareNative", "stopNativeHotspot: P2P removeGroup reason=$reason")
+                    }
+                })
+            }
+            wifiP2pManager = null
+            wifiP2pChannel = null
+            pendingP2pMac = ""
+            Log.i("AirShareNative", "stopNativeHotspot: complete")
+            result.success(null)
+        } catch (e: Exception) {
+            Log.e("AirShareNative", "stopNativeHotspot failed: ${e.message}", e)
+            localHotspotReservation = null
+            activeHotspotReservation = null
+            clearHotspotState()
+            result.error("hotspot_teardown_failed", e.message, null)
+        }
+    }
+
     private fun startTemporaryHotspot(call: MethodCall, result: MethodChannel.Result) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             result.error("unsupported", "LocalOnlyHotspot requires Android 8.0+.", null)
             return
         }
-        if (activeHotspotReservation != null) {
-            Log.w("AirShareNative", "LocalOnlyHotspot already active; ignoring duplicate start request")
-            val ssid = pendingHotspotSsid ?: call.argument<String>("ssid") ?: "AirShareLink"
-            val password = pendingHotspotPassword ?: call.argument<String>("password") ?: "AirShare@2026"
-            val hubIp = pendingHubIp ?: resolveLocalIpv4Address()
-            result.success(mapOf("ssid" to ssid, "password" to password, "hubIp" to hubIp))
+        if (activeHotspotReservation != null && hotspotActive) {
+            Log.w("AirShareNative", "LocalOnlyHotspot already active")
+            val ssid = pendingHotspotSsid.orEmpty()
+            val password = pendingHotspotPassword.orEmpty()
+            val hubIp = pendingHotspotHubIp.ifBlank { resolveLocalIpv4Address() }
+            result.success(
+                mapOf(
+                    "ssid" to ssid,
+                    "password" to password,
+                    "hubIp" to hubIp,
+                    "hotspotActive" to true,
+                ),
+            )
             return
         }
+        clearHotspotState()
+        val requestedPort = call.argument<Int>("hubPort") ?: pendingHubPort
         val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         try {
             wifiManager.startLocalOnlyHotspot(object : WifiManager.LocalOnlyHotspotCallback() {
@@ -975,71 +1569,292 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     activeHotspotReservation?.close()
                     localHotspotReservation = reservation
                     activeHotspotReservation = reservation
+                    hotspotActive = true
                     handshakePayload = ByteArray(0)
                     handshakeCharacteristic?.value = null
-                    val wifiConfig = reservation.wifiConfiguration
-                    val ssid = call.argument<String>("ssid") ?: wifiConfig?.SSID ?: "AirShareLink"
-                    val password = call.argument<String>("password")
-                        ?: wifiConfig?.preSharedKey
-                        ?: "AirShare@2026"
-                    val hubIp = resolveLocalIpv4Address()
-                    pendingHotspotSsid = ssid
-                    pendingHotspotPassword = password
-                    pendingHubIp = hubIp
-                    pendingHubPort = call.argument<Int>("hubPort") ?: 8080
-                    advertisedEndpoint = "$hubIp:$pendingHubPort"
+                    val (systemSsid, systemPassword) = extractLocalOnlyHotspotCredentials(reservation)
+                    if (systemSsid.isBlank()) {
+                        Log.e(
+                            "AirShareNative",
+                            "LocalOnlyHotspot onStarted but system SSID is empty — cannot advertise to guest",
+                        )
+                        hotspotActive = false
+                        activeHotspotReservation = null
+                        localHotspotReservation = null
+                        try {
+                            reservation.close()
+                        } catch (_: Exception) {}
+                        result.error(
+                            "hotspot_credentials_unavailable",
+                            "Could not read system-generated hotspot SSID from reservation.",
+                            null,
+                        )
+                        return
+                    }
+                    val hubIp = resolveHotspotHubIpv4Address()
+                    pendingHotspotSsid = systemSsid
+                    pendingHotspotPassword = systemPassword
+                    pendingHotspotHubIp = hubIp
+                    pendingHubPort = requestedPort
+                    if (pendingLanIp.isBlank() && pendingP2pIp.isBlank()) {
+                        pendingHubIp = hubIp
+                    }
+                    val endpointIp = pendingLanIp.ifBlank {
+                        pendingP2pIp.ifBlank { hubIp }
+                    }
+                    advertisedEndpoint = "$endpointIp:$pendingHubPort"
                     endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
-                    Log.i("AirShareNative", "Internal Link Established: hotspot active")
+                    Log.i(
+                        "AirShareNative",
+                        "LocalOnlyHotspot onStarted: system_ssid=$systemSsid hubIp=$hubIp (hotspotActive=true)",
+                    )
                     result.success(
-                        mapOf("ssid" to ssid, "password" to password, "hubIp" to hubIp),
+                        mapOf(
+                            "ssid" to systemSsid,
+                            "password" to systemPassword,
+                            "hubIp" to hubIp,
+                            "hotspotActive" to true,
+                            "systemGenerated" to true,
+                        ),
                     )
                 }
 
                 override fun onFailed(reason: Int) {
                     activeHotspotReservation = null
                     localHotspotReservation = null
+                    clearHotspotState()
+                    Log.e("AirShareNative", "LocalOnlyHotspot onFailed reason=$reason")
                     result.error("hotspot_failed", "Hotspot failed with reason=$reason", null)
                 }
             }, null)
         } catch (se: SecurityException) {
+            clearHotspotState()
             result.error("hotspot_permission", "Missing hotspot permission: ${se.message}", null)
         }
     }
 
-    private fun connectToHubWlan(call: MethodCall, result: MethodChannel.Result) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            result.error("unsupported", "WLAN specifier requires Android 10+.", null)
+    private fun safeUnregisterHubWlanCallback(connectivityManager: ConnectivityManager) {
+        val callback = connectivityCallback
+        if (callback == null) {
+            connectivityCallbackRegistered = false
             return
         }
-        val ssid = call.argument<String>("ssid")
-        val password = call.argument<String>("password")
-        if (ssid.isNullOrBlank() || password.isNullOrBlank()) {
-            result.error("invalid_wlan_credentials", "SSID and password are required.", null)
+        if (!connectivityCallbackRegistered) {
+            connectivityCallback = null
             return
         }
+        try {
+            connectivityManager.unregisterNetworkCallback(callback)
+        } catch (e: IllegalArgumentException) {
+            Log.w(
+                "AirShareNative",
+                "unregisterNetworkCallback ignored (not registered): ${e.message}",
+            )
+        }
+        connectivityCallback = null
+        connectivityCallbackRegistered = false
+    }
 
-        val specifier = WifiNetworkSpecifier.Builder()
-            .setSsid(ssid)
-            .setWpa2Passphrase(password)
-            .build()
-        val request = NetworkRequest.Builder()
-            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-            .setNetworkSpecifier(specifier)
-            .build()
-        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        connectivityCallback?.let { connectivityManager.unregisterNetworkCallback(it) }
-        connectivityCallback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                connectivityManager.bindProcessToNetwork(network)
-                Log.i("AirShareNative", "Internal Link Established: connected to $ssid")
+    private fun connectToHubWlan(call: MethodCall, result: MethodChannel.Result) {
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                result.error("unsupported", "WLAN specifier requires Android 10+.", null)
+                return
+            }
+            if (!isFineLocationGranted()) {
+                Log.e(
+                    "AirShareNative",
+                    "connectToHubWlan: ACCESS_FINE_LOCATION not granted — " +
+                        "WifiNetworkSpecifier dialog cannot appear.",
+                )
+                result.error(
+                    "location_permission_denied",
+                    "ACCESS_FINE_LOCATION must be granted before joining a Wi-Fi network.",
+                    null,
+                )
+                return
+            }
+            if (!isLocationServicesEnabled()) {
+                Log.e(
+                    "AirShareNative",
+                    "connectToHubWlan: location services disabled — " +
+                        "WifiNetworkSpecifier dialog cannot appear.",
+                )
+                result.error(
+                    "location_disabled",
+                    "Location services (GPS) must be enabled to join a Wi-Fi network.",
+                    null,
+                )
+                return
+            }
+
+            val ssid = call.argument<String>("ssid")?.trim()
+            val password = call.argument<String>("password")
+            if (ssid.isNullOrBlank() || password.isNullOrBlank()) {
+                result.error("invalid_wlan_credentials", "SSID and password are required.", null)
+                return
+            }
+
+            val connectivityManager =
+                getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            safeUnregisterHubWlanCallback(connectivityManager)
+            hubWlanRequestTimeoutRunnable?.let { hubWlanRequestHandler.removeCallbacks(it) }
+            hubWlanRequestTimeoutRunnable = null
+
+            val specifier = try {
+                WifiNetworkSpecifier.Builder()
+                    .setSsid(ssid)
+                    .setWpa2Passphrase(password)
+                    .build()
+            } catch (e: Exception) {
+                Log.e("AirShareNative", "connectToHubWlan: specifier build failed: ${e.message}", e)
+                result.error(
+                    "wlan_specifier_failed",
+                    "Failed to build Wi-Fi network specifier: ${e.message}",
+                    null,
+                )
+                return
+            }
+
+            val request = try {
+                NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                    .setNetworkSpecifier(specifier)
+                    .build()
+            } catch (e: Exception) {
+                Log.e("AirShareNative", "connectToHubWlan: NetworkRequest build failed: ${e.message}", e)
+                result.error(
+                    "wlan_request_build_failed",
+                    "Failed to build network request: ${e.message}",
+                    null,
+                )
+                return
+            }
+
+            var resultDelivered = false
+            fun deliverSuccess() {
+                if (resultDelivered) return
+                resultDelivered = true
+                hubWlanRequestTimeoutRunnable?.let { hubWlanRequestHandler.removeCallbacks(it) }
+                hubWlanRequestTimeoutRunnable = null
+                Log.i("AirShareNative", "connectToHubWlan: success for ssid=$ssid")
                 result.success(null)
             }
-
-            override fun onUnavailable() {
-                result.error("wlan_unavailable", "Unable to connect to internal WLAN link.", null)
+            fun deliverError(code: String, message: String, throwable: Throwable? = null) {
+                if (resultDelivered) return
+                resultDelivered = true
+                hubWlanRequestTimeoutRunnable?.let { hubWlanRequestHandler.removeCallbacks(it) }
+                hubWlanRequestTimeoutRunnable = null
+                safeUnregisterHubWlanCallback(connectivityManager)
+                if (throwable != null) {
+                    Log.e("AirShareNative", "connectToHubWlan: $code — $message", throwable)
+                } else {
+                    Log.e("AirShareNative", "connectToHubWlan: $code — $message")
+                }
+                result.error(code, message, null)
             }
+
+            Log.i(
+                "AirShareNative",
+                "connectToHubWlan: requesting network for ssid='$ssid' " +
+                    "(expect system Wi-Fi connection dialog)",
+            )
+
+            connectivityCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    try {
+                        connectivityManager.bindProcessToNetwork(network)
+                        Log.i(
+                            "AirShareNative",
+                            "connectToHubWlan: onAvailable — bound to hub hotspot ssid=$ssid",
+                        )
+                        deliverSuccess()
+                    } catch (e: Exception) {
+                        deliverError(
+                            "wlan_bind_failed",
+                            "Connected but failed to bind process to network: ${e.message}",
+                            e,
+                        )
+                    }
+                }
+
+                override fun onUnavailable() {
+                    deliverError(
+                        "wlan_unavailable",
+                        "System declined the Wi-Fi connection request for ssid=$ssid. " +
+                            "User may have dismissed the dialog or credentials are wrong.",
+                    )
+                }
+
+                override fun onLost(network: Network) {
+                    Log.w("AirShareNative", "connectToHubWlan: onLost ssid=$ssid")
+                }
+
+                override fun onLosing(network: Network, maxMsToLive: Int) {
+                    Log.w(
+                        "AirShareNative",
+                        "connectToHubWlan: onLosing ssid=$ssid maxMsToLive=$maxMsToLive",
+                    )
+                }
+            }
+
+            try {
+                val mainHandler = Handler(Looper.getMainLooper())
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    connectivityManager.requestNetwork(
+                        request,
+                        connectivityCallback!!,
+                        mainHandler,
+                        45_000,
+                    )
+                } else {
+                    connectivityManager.requestNetwork(request, connectivityCallback!!)
+                }
+                connectivityCallbackRegistered = true
+                hubWlanRequestTimeoutRunnable = Runnable {
+                    deliverError(
+                        "wlan_timeout",
+                        "Timed out waiting for user to approve Wi-Fi connection to ssid=$ssid (45s).",
+                    )
+                }
+                hubWlanRequestHandler.postDelayed(hubWlanRequestTimeoutRunnable!!, 45_000)
+                Log.i(
+                    "AirShareNative",
+                    "connectToHubWlan: requestNetwork registered — awaiting user dialog / onAvailable",
+                )
+            } catch (e: SecurityException) {
+                connectivityCallback = null
+                connectivityCallbackRegistered = false
+                deliverError(
+                    "wlan_security_exception",
+                    "SecurityException calling requestNetwork (check Location permission): ${e.message}",
+                    e,
+                )
+            } catch (e: IllegalArgumentException) {
+                connectivityCallback = null
+                connectivityCallbackRegistered = false
+                deliverError(
+                    "wlan_request_invalid",
+                    "IllegalArgumentException calling requestNetwork: ${e.message}",
+                    e,
+                )
+            } catch (e: Exception) {
+                connectivityCallback = null
+                connectivityCallbackRegistered = false
+                deliverError(
+                    "wlan_request_failed",
+                    "requestNetwork failed: ${e.message}",
+                    e,
+                )
+            }
+        } catch (e: Exception) {
+            Log.e("AirShareNative", "connectToHubWlan: unexpected fatal error: ${e.message}", e)
+            result.error(
+                "wlan_connect_failed",
+                "connectToHubWlan failed before requestNetwork: ${e.message}",
+                null,
+            )
         }
-        connectivityManager.requestNetwork(request, connectivityCallback!!)
     }
 
     private fun stopInternalLink(result: MethodChannel.Result) {
@@ -1059,18 +1874,24 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         pendingHotspotSsid = null
         pendingHotspotPassword = null
         pendingHubIp = null
+        pendingLanIp = ""
+        pendingP2pIp = ""
+        pendingHotspotHubIp = ""
+        hotspotActive = false
+        hubWlanRequestTimeoutRunnable?.let { hubWlanRequestHandler.removeCallbacks(it) }
+        hubWlanRequestTimeoutRunnable = null
+        cancelHandshakeWait()
+        handshakeDeliveryResult = null
+        handshakeDeliveryGatt = null
+        handshakeDelivered = false
         activeGattClient?.close()
         activeGattClient = null
-        activeHotspotReservation?.close()
-        activeHotspotReservation = null
-        localHotspotReservation?.close()
-        localHotspotReservation = null
+        stopNativeHotspot(MethodChannelResultProxy())
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        connectivityCallback?.let {
-            connectivityManager.unregisterNetworkCallback(it)
-        }
-        connectivityCallback = null
-        connectivityManager.bindProcessToNetwork(null)
+        safeUnregisterHubWlanCallback(connectivityManager)
+        try {
+            connectivityManager.bindProcessToNetwork(null)
+        } catch (_: Exception) {}
         val p2pMgr = wifiP2pManager
         val p2pChan = wifiP2pChannel
         if (p2pMgr != null && p2pChan != null) {
@@ -1086,7 +1907,48 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         result.success(null)
     }
 
-    private fun startWifiDirectGroup(result: MethodChannel.Result) {
+    private fun clearP2pTierState() {
+        pendingP2pMac = ""
+        pendingP2pIp = ""
+    }
+
+    private fun removeP2pGroupThen(
+        mgr: WifiP2pManager?,
+        chan: WifiP2pManager.Channel?,
+        delayMs: Long,
+        onComplete: () -> Unit,
+    ) {
+        if (mgr == null || chan == null) {
+            clearP2pTierState()
+            Handler(Looper.getMainLooper()).postDelayed({ onComplete() }, delayMs)
+            return
+        }
+        mgr.removeGroup(chan, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                Log.i("AirShareNative", "removeGroup success — waiting ${delayMs}ms for radio reset")
+                clearP2pTierState()
+                Handler(Looper.getMainLooper()).postDelayed({ onComplete() }, delayMs)
+            }
+
+            override fun onFailure(reason: Int) {
+                Log.w("AirShareNative", "removeGroup failed reason=$reason — still waiting ${delayMs}ms")
+                clearP2pTierState()
+                Handler(Looper.getMainLooper()).postDelayed({ onComplete() }, delayMs)
+            }
+        })
+    }
+
+    private fun teardownP2pBeforeHotspot(result: MethodChannel.Result) {
+        val mgr = wifiP2pManager
+        val chan = wifiP2pChannel
+        removeP2pGroupThen(mgr, chan, 500) {
+            wifiP2pManager = null
+            wifiP2pChannel = null
+            result.success(null)
+        }
+    }
+
+    private fun startWifiDirectGroupInternal(result: MethodChannel.Result) {
         val mgr = applicationContext.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
         if (mgr == null) {
             result.error("p2p_unavailable", "WifiP2pManager not available on this device", null)
@@ -1096,10 +1958,120 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         wifiP2pManager = mgr
         wifiP2pChannel = chan
 
-        // Remove any stale group first, then create a fresh one
         mgr.removeGroup(chan, object : WifiP2pManager.ActionListener {
             override fun onSuccess() { doCreateP2pGroup(mgr, chan, result) }
             override fun onFailure(reason: Int) { doCreateP2pGroup(mgr, chan, result) }
+        })
+    }
+
+    private fun isUsableP2pMac(mac: String?): Boolean {
+        val normalized = mac?.trim()?.uppercase(Locale.US).orEmpty()
+        if (normalized.isEmpty()) return false
+        return normalized != "02:00:00:00:00:00" && normalized != "00:00:00:00:00:00"
+    }
+
+    // Real P2P MAC from WifiP2pGroup metadata only — never from NetworkInterface/BT adapter.
+    private fun extractP2pGroupOwnerMac(group: WifiP2pGroup): String {
+        val owner = group.owner
+        if (owner != null && isUsableP2pMac(owner.deviceAddress)) {
+            return owner.deviceAddress.trim()
+        }
+        for (client in group.clientList.orEmpty()) {
+            if (client.isGroupOwner && isUsableP2pMac(client.deviceAddress)) {
+                return client.deviceAddress.trim()
+            }
+        }
+        return ""
+    }
+
+    private fun applyP2pGroupState(group: WifiP2pGroup, ownerMac: String) {
+        val ownerIp = "192.168.49.1"
+        pendingP2pIp = ownerIp
+        pendingP2pMac = ownerMac
+        if (pendingLanIp.isBlank()) {
+            pendingHubIp = ownerIp
+        }
+        val endpointIp = pendingLanIp.ifBlank { ownerIp }
+        advertisedEndpoint = "$endpointIp:$pendingHubPort"
+        endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
+        Log.i(
+            "AirShareNative",
+            "WifiDirect group ready: network=${group.networkName} ownerIp=$ownerIp ownerMac=$ownerMac " +
+                "isGO=${group.isGroupOwner} clients=${group.clientList?.size ?: 0}",
+        )
+    }
+
+    private fun requestP2pGroupInfoWhenReady(
+        mgr: WifiP2pManager,
+        chan: WifiP2pManager.Channel,
+        attempt: Int,
+        maxAttempts: Int,
+        result: MethodChannel.Result,
+    ) {
+        mgr.requestGroupInfo(chan, object : WifiP2pManager.GroupInfoListener {
+            override fun onGroupInfoAvailable(group: WifiP2pGroup?) {
+                if (group == null) {
+                    Log.w(
+                        "AirShareNative",
+                        "onGroupInfoAvailable: group is null (attempt ${attempt + 1}/$maxAttempts)",
+                    )
+                    if (attempt + 1 < maxAttempts) {
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            requestP2pGroupInfoWhenReady(mgr, chan, attempt + 1, maxAttempts, result)
+                        }, 350L * (attempt + 1))
+                    } else {
+                        removeP2pGroupThen(mgr, chan, 500) {
+                            wifiP2pManager = null
+                            wifiP2pChannel = null
+                            result.error(
+                                "p2p_no_group",
+                                "Group created but WifiP2pGroup metadata unavailable",
+                                null,
+                            )
+                        }
+                    }
+                    return
+                }
+
+                val ownerMac = extractP2pGroupOwnerMac(group)
+                if (!isUsableP2pMac(ownerMac)) {
+                    val rawOwner = group.owner?.deviceAddress ?: "null"
+                    Log.w(
+                        "AirShareNative",
+                        "onGroupInfoAvailable: owner MAC not ready '$rawOwner' " +
+                            "(attempt ${attempt + 1}/$maxAttempts) — retrying",
+                    )
+                    if (attempt + 1 < maxAttempts) {
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            requestP2pGroupInfoWhenReady(mgr, chan, attempt + 1, maxAttempts, result)
+                        }, 400L * (attempt + 1))
+                    } else {
+                        removeP2pGroupThen(mgr, chan, 500) {
+                            wifiP2pManager = null
+                            wifiP2pChannel = null
+                            result.error(
+                                "p2p_mac_unavailable",
+                                "Could not obtain valid P2P group owner MAC from WifiP2pGroup.owner",
+                                null,
+                            )
+                        }
+                    }
+                    return
+                }
+
+                applyP2pGroupState(group, ownerMac)
+                val ssid = group.networkName
+                val psk = group.passphrase
+                val ownerIp = pendingP2pIp
+                result.success(
+                    mapOf(
+                        "ssid" to ssid,
+                        "password" to psk,
+                        "hubIp" to ownerIp,
+                        "p2pMac" to ownerMac,
+                    ),
+                )
+            }
         })
     }
 
@@ -1110,37 +2082,23 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     ) {
         mgr.createGroup(chan, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
-                // requestGroupInfo is async; give the framework 500 ms to settle
+                Log.i("AirShareNative", "createGroup success — requesting WifiP2pGroup owner MAC")
                 Handler(Looper.getMainLooper()).postDelayed({
-                    mgr.requestGroupInfo(chan) { group ->
-                        if (group == null) {
-                            result.error("p2p_no_group", "Group created but info unavailable", null)
-                            return@requestGroupInfo
-                        }
-                        val ssid     = group.networkName
-                        val psk      = group.passphrase
-                        val ownerIp  = "192.168.49.1"
-                        val ownerMac = group.owner?.deviceAddress?.trim() ?: ""
-                        pendingHotspotSsid     = ssid
-                        pendingHotspotPassword = psk
-                        pendingHubIp           = ownerIp
-                        pendingP2pMac          = ownerMac
-                        advertisedEndpoint     = "$ownerIp:$pendingHubPort"
-                        endpointCharacteristic?.value =
-                            advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
-                        Log.i("AirShareNative", "WifiDirect group ready: ssid=$ssid ownerIp=$ownerIp ownerMac=$ownerMac")
-                        result.success(mapOf("ssid" to ssid, "password" to psk, "hubIp" to ownerIp, "p2pMac" to ownerMac))
-                    }
-                }, 500)
+                    requestP2pGroupInfoWhenReady(mgr, chan, 0, 10, result)
+                }, 300)
             }
 
             override fun onFailure(reason: Int) {
-                result.error("p2p_group_failed", "createGroup failed reason=$reason", null)
+                removeP2pGroupThen(mgr, chan, 500) {
+                    wifiP2pManager = null
+                    wifiP2pChannel = null
+                    result.error("p2p_group_failed", "createGroup failed reason=$reason", null)
+                }
             }
         })
     }
 
-    private fun connectToWifiDirectPeer(call: MethodCall, result: MethodChannel.Result) {
+    private fun connectToWifiDirectPeerInternal(call: MethodCall, result: MethodChannel.Result) {
         val peerMac = call.argument<String>("peerMac")?.trim() ?: ""
         if (peerMac.isEmpty()) {
             result.error("invalid_mac", "peerMac is required", null)
@@ -1236,11 +2194,36 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         wifiP2pChannel = null
     }
 
-    private fun resolveLocalIpv4Address(): String {
+    private fun isExcludedFromTier1Lan(ifaceName: String): Boolean {
+        val l = ifaceName.lowercase(Locale.US)
+        if (l.startsWith("ap") || l.contains("softap")) return true
+        if (l.contains("p2p")) return true
+        if (l.contains("rndis") || l.contains("usb")) return true
+        if (l.contains("swlan")) return true
+        return false
+    }
+
+    private fun isHotspotHubInterface(ifaceName: String): Boolean {
+        val l = ifaceName.lowercase(Locale.US)
+        return l.startsWith("ap") || l.contains("softap")
+    }
+
+    /// Hub IP on the LocalOnlyHotspot interface (ap0), not wlan0 or p2p.
+    private fun resolveHotspotHubIpv4Address(): String {
         return try {
             val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
             for (iface in interfaces) {
-                if (!iface.isUp || iface.isLoopback) continue
+                if (!iface.isUp || iface.isLoopback || !isHotspotHubInterface(iface.name)) continue
+                for (address in Collections.list(iface.inetAddresses)) {
+                    if (address is Inet4Address && !address.isLoopbackAddress) {
+                        val ip = address.hostAddress ?: continue
+                        Log.i("AirShareNative", "Hotspot hub IP from ${iface.name}: $ip")
+                        return ip
+                    }
+                }
+            }
+            for (iface in interfaces) {
+                if (!iface.isUp || iface.isLoopback || isExcludedFromTier1Lan(iface.name)) continue
                 for (address in Collections.list(iface.inetAddresses)) {
                     if (address is Inet4Address && !address.isLoopbackAddress) {
                         return address.hostAddress ?: "192.168.43.1"
@@ -1252,6 +2235,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             "192.168.43.1"
         }
     }
+
+    private fun resolveLocalIpv4Address(): String = resolveHotspotHubIpv4Address()
 
     override fun onDestroy() {
         stopInternalLink(MethodChannelResultProxy())
