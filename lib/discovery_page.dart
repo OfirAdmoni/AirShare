@@ -4,13 +4,15 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 
-import 'package:network_info_plus/network_info_plus.dart';
-
 import 'package:air_share/air_share_constants.dart';
 import 'package:air_share/ble_transport.dart';
 import 'package:air_share/connection_logger.dart';
+import 'package:air_share/connection_tier.dart';
+import 'package:air_share/guest_connection_guard.dart';
 import 'package:air_share/handshake_trace.dart';
 import 'package:air_share/wlan_link_manager.dart';
+import 'package:air_share/wifi_tier_prerequisites.dart';
+import 'package:flutter/services.dart';
 
 /// Receiver: BLE scan and endpoint extraction until [onEndpointReady] completes.
 class DiscoveryPage extends StatefulWidget {
@@ -22,17 +24,47 @@ class DiscoveryPage extends StatefulWidget {
   State<DiscoveryPage> createState() => _DiscoveryPageState();
 }
 
+enum _GuestDiscoveryPhase {
+  scanning,
+  handshaking,
+  connecting,
+}
+
+/// Static label only — no phase-driven UI churn during hotspot join.
+const String _kHotspotConnectingOverlayMessage =
+    'Connecting to Hub Hotspot...\nPlease approve the system prompt.';
+
 class _DiscoveryPageState extends State<DiscoveryPage> {
   StreamSubscription<List<BlePeer>>? _scanSubscription;
   final List<BlePeer> _peers = [];
   final Set<String> _seenPeers = <String>{};
-  bool _isScanning = false;
-  bool _isHandshaking = false;
+  _GuestDiscoveryPhase _phase = _GuestDiscoveryPhase.scanning;
   String _status = 'Peer Discovery via BLE';
   double _pulseScale = 1.0;
   Timer? _pulseTimer;
-  static const int _endpointReadRetries = 5;
 
+  bool get _connectionUiLocked =>
+      _phase == _GuestDiscoveryPhase.handshaking ||
+      _phase == _GuestDiscoveryPhase.connecting;
+
+  bool get _isScanning => _phase == _GuestDiscoveryPhase.scanning;
+
+  void _setPhase(_GuestDiscoveryPhase phase, String status) {
+    if (!mounted) return;
+    if (GuestConnectionGuard.isActive &&
+        phase == _GuestDiscoveryPhase.scanning &&
+        _phase != _GuestDiscoveryPhase.scanning) {
+      debugPrint(
+        '[Discovery] Blocked phase reset to scanning while connection active '
+        '(requested status: $status)',
+      );
+      return;
+    }
+    setState(() {
+      _phase = phase;
+      _status = status;
+    });
+  }
   Future<void> _logNetworkInterfaces() async {
     final interfaces = await NetworkInterface.list(
       includeLoopback: true,
@@ -47,14 +79,6 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     }
   }
 
-  bool _isRetriableEmptyEndpointError(Object error) {
-    final msg = error.toString().toLowerCase();
-    return msg.contains('empty') ||
-        msg.contains('malformed') ||
-        msg.contains('invalid_endpoint_payload') ||
-        msg.contains('peer endpoint read returned empty payload');
-  }
-
   /// TCP probe failed: slow Wi‑Fi, or AP/client isolation (guest SYN never reaches hub).
   bool _looksLikeTcpTimeout(Object e) {
     if (e is TimeoutException) return true;
@@ -67,88 +91,214 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     return false;
   }
 
-  Future<void> _logTcpVerifyApIsolationHint(PeerEndpoint endpoint) async {
-    await ConnectionLogger.instance.log(
-      'Network | Possible AP Isolation / Wi-Fi blocking P2P traffic. Hotspot fallback required',
-      details:
-          'target=${endpoint.ip}:${endpoint.port} (TCP verify timed out; if hub logs never show HTTP | First inbound, packets may not reach the hub)',
-    );
-  }
-
-  /// On Android hotspot, the host advertises its tethering interface IP (e.g.
-  /// 192.168.45.244) but iptables drops packets to that address from clients.
-  /// The Wi-Fi gateway (e.g. 192.168.45.1) is the routable alias that does
-  /// accept inbound TCP — try it as a fallback when the primary IP times out.
-  /// Derives the likely gateway IP from an advertised host IP by replacing the
-  /// last octet with 1 (e.g. 192.168.45.244 → 192.168.45.1), which matches
-  /// the standard Android hotspot DHCP gateway assignment.
-  String? _deriveGatewayIp(String advertisedIp) {
-    final parts = advertisedIp.split('.');
-    if (parts.length != 4) return null;
-    return '${parts[0]}.${parts[1]}.${parts[2]}.1';
-  }
-
-  Future<PeerEndpoint?> _tryGatewayFallback(PeerEndpoint endpoint) async {
-    String? gatewayIp;
+  Future<PeerEndpoint?> _tryTcpConnect(String ip, int port) async {
     try {
-      gatewayIp = await NetworkInfo().getWifiGatewayIP();
-    } catch (_) {}
-
-    if (gatewayIp == null || gatewayIp.isEmpty) {
-      final derived = _deriveGatewayIp(endpoint.ip);
-      await ConnectionLogger.instance.log(
-        'HS | TCP verify Fallback (Derived Gateway) | TRYING $derived',
-        details: 'native_gateway=null advertised=${endpoint.ip} derived=$derived',
+      await HandshakeTrace.run<void>(
+        'TCP verify (guest → hub HTTP port)',
+        () async {
+          final socket = await Socket.connect(
+            ip,
+            port,
+            timeout: const Duration(seconds: 10),
+          );
+          await socket.close();
+        },
+        extra: '$ip:$port',
+        hardTimeout: const Duration(seconds: 14),
       );
-      gatewayIp = derived;
-    }
-
-    if (gatewayIp == null || gatewayIp == endpoint.ip) {
       await ConnectionLogger.instance.log(
-        'HS | TCP verify Fallback (Gateway) | SKIP',
-        details: 'gatewayIp=${gatewayIp ?? 'null'} advertised=${endpoint.ip}',
+        'Socket Connection Success',
+        details: '$ip:$port',
       );
-      return null;
+      return PeerEndpoint(ip: ip, port: port);
+    } on TimeoutException catch (e) {
+      await ConnectionLogger.instance.log(
+        'Connection | TCP timeout',
+        details: '$ip:$port $e',
+      );
+    } on SocketException catch (e) {
+      if (_looksLikeTcpTimeout(e)) {
+        await ConnectionLogger.instance.log(
+          'Connection | TCP timeout (socket)',
+          details: '$ip:$port $e',
+        );
+      } else {
+        await ConnectionLogger.instance.log(
+          'Socket Connection Failed',
+          details: '$ip:$port $e',
+        );
+      }
     }
-
+    final gateway = ConnectionTier.deriveGatewayIp(ip);
+    if (gateway == null || gateway == ip) return null;
     try {
       await HandshakeTrace.run<void>(
         'TCP verify Fallback (Gateway)',
         () async {
           final socket = await Socket.connect(
-            gatewayIp!,
-            endpoint.port,
+            gateway,
+            port,
             timeout: const Duration(seconds: 10),
           );
           await socket.close();
         },
-        extra: '$gatewayIp:${endpoint.port}',
+        extra: '$gateway:$port',
         hardTimeout: const Duration(seconds: 14),
       );
-      return PeerEndpoint(ip: gatewayIp, port: endpoint.port);
+      await ConnectionLogger.instance.log(
+        'Socket Connection Success',
+        details: 'gateway $gateway:$port',
+      );
+      return PeerEndpoint(ip: gateway, port: port);
     } catch (_) {
       return null;
     }
   }
 
-  Future<PeerEndpoint> _readEndpointWithRetries(BlePeer peer) async {
-    Object? lastError;
-    for (var attempt = 1; attempt <= _endpointReadRetries; attempt++) {
+  void _pauseDiscoverySideEffects() {
+    _pulseTimer?.cancel();
+    _pulseTimer = null;
+  }
+
+  /// Tier 3 only: permissions + WifiNetworkSpecifier (no TCP / Wi‑Fi probes before dialog).
+  Future<void> _joinHostHotspotAp(HandshakePayload payload) async {
+    if (!Platform.isAndroid || !payload.hasHotspot) return;
+
+    await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
+    if (!mounted) throw StateError('unmounted');
+
+    final locationGranted = await WifiTierPrerequisites.ensureFineLocationPermission(
+      context: context,
+    );
+    if (!locationGranted) {
+      throw StateError(
+        'Location permission is required to join the host Wi‑Fi network',
+      );
+    }
+    if (!mounted) throw StateError('unmounted');
+
+    await ConnectionLogger.instance.log(
+      'Connection | Tier 3 hotspot',
+      details: 'ssid_len=${payload.hotspotSsid.length}',
+    );
+    await HandshakeTrace.run<void>(
+      'WLAN connect (guest → hub hotspot via WifiNetworkSpecifier)',
+      () => WlanLinkManager.instance.connectToHubWlan(
+        ssid: payload.hotspotSsid,
+        password: payload.hotspotPass,
+      ),
+      extra: 'ssid_len=${payload.hotspotSsid.length}',
+      hardTimeout: const Duration(seconds: 50),
+    );
+  }
+
+  Future<PeerEndpoint?> _probeHubAfterHotspot(HandshakePayload payload, int port) async {
+    final candidates = <String>[
+      if (payload.hotspotHubIp.isNotEmpty) payload.hotspotHubIp,
+      if (payload.p2pIp.isNotEmpty) payload.p2pIp,
+      '192.168.43.1',
+      '192.168.137.1',
+    ];
+    for (final ip in candidates) {
+      final endpoint = await _tryTcpConnect(ip, port);
+      if (endpoint != null) return endpoint;
+    }
+    return null;
+  }
+
+  Future<PeerEndpoint> _connectViaTierStrategy(HandshakePayload payload) async {
+    final port = payload.hubPort;
+    final skipWifiProbe = GuestConnectionGuard.isActive;
+
+    // Android offline: join hotspot FIRST — no Wi‑Fi scans before system dialog.
+    if (Platform.isAndroid && payload.hasHotspot) {
+      if (!mounted) throw StateError('unmounted');
       try {
-        return await BleTransport.instance.readPeerEndpoint(peer);
-      } catch (e) {
-        lastError = e;
-        if (!_isRetriableEmptyEndpointError(e) || attempt == _endpointReadRetries) {
-          rethrow;
-        }
+        await _joinHostHotspotAp(payload);
+        final hotspotEndpoint = await _probeHubAfterHotspot(payload, port);
+        if (hotspotEndpoint != null) return hotspotEndpoint;
         await ConnectionLogger.instance.log(
-          'BLE | Retrying endpoint read',
-          details: 'attempt=$attempt/$_endpointReadRetries',
+          'Connection | Tier 3 TCP failed after hotspot join',
+          details: 'no hub reachable on candidate IPs',
         );
-        await Future<void>.delayed(const Duration(seconds: 2));
+      } on PlatformException catch (e) {
+        await ConnectionLogger.instance.log(
+          'Connection | Tier 3 hotspot failed',
+          details: '${e.code} ${e.message}',
+        );
+      } catch (e) {
+        await ConnectionLogger.instance.log(
+          'Connection | Tier 3 hotspot failed',
+          details: e.toString(),
+        );
       }
     }
-    throw Exception('Endpoint read failed: $lastError');
+
+    // Tier 1 — same LAN (primary, no P2P/hotspot radio use).
+    if (payload.hasLan) {
+      if (await ConnectionTier.guestOnSameLanAs(
+        payload.lanIp,
+        skipWifiProbe: skipWifiProbe,
+      )) {
+        if (!mounted) throw StateError('unmounted');
+        _setPhase(_GuestDiscoveryPhase.connecting, 'Tier 1: Connecting over home Wi‑Fi…');
+        await ConnectionLogger.instance.log(
+          'Connection | Tier 1 LAN',
+          details: '${payload.lanIp}:$port',
+        );
+        final lanEndpoint = await _tryTcpConnect(payload.lanIp, port);
+        if (lanEndpoint != null) return lanEndpoint;
+        await ConnectionLogger.instance.log(
+          'Connection | Tier 1 failed',
+          details: 'TCP to ${payload.lanIp}:$port',
+        );
+      } else {
+        await ConnectionLogger.instance.log(
+          'Connection | Tier 1 skipped',
+          details: 'guest not on same subnet as ${payload.lanIp}',
+        );
+      }
+    }
+
+    // Tier 2 — Wi‑Fi Direct.
+    if (Platform.isAndroid && payload.hasP2p) {
+      if (!mounted) throw StateError('unmounted');
+      await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
+      if (!mounted) throw StateError('unmounted');
+      _setPhase(_GuestDiscoveryPhase.connecting, 'Tier 2: Joining Wi‑Fi Direct group…');
+      await ConnectionLogger.instance.log(
+        'Connection | Tier 2 P2P',
+        details: 'mac=${payload.p2pMac}',
+      );
+      try {
+        final ownerIp = await HandshakeTrace.run<String>(
+          'WLAN connect (guest → hub P2P group)',
+          () => WlanLinkManager.instance.connectToWifiDirectPeer(payload.p2pMac),
+          extra: 'peerMac=${payload.p2pMac}',
+          hardTimeout: const Duration(seconds: 35),
+        );
+        final targetIp = payload.p2pIp.isNotEmpty ? payload.p2pIp : ownerIp;
+        final p2pEndpoint = await _tryTcpConnect(targetIp, port);
+        if (p2pEndpoint != null) return p2pEndpoint;
+      } on PlatformException catch (e) {
+        final reason = e.details?.toString() ?? '';
+        await ConnectionLogger.instance.log(
+          'Connection | Tier 2 P2P failed',
+          details: '${e.code} $reason',
+        );
+        final busy = reason.contains('reason=2') || e.message?.contains('reason=2') == true;
+        if (!busy && e.code != 'p2p_timeout') {
+          // Non-busy hard failure may still try hotspot if credentials exist.
+        }
+      } catch (e) {
+        await ConnectionLogger.instance.log(
+          'Connection | Tier 2 P2P failed',
+          details: e.toString(),
+        );
+      }
+    }
+
+    throw Exception('All connection tiers failed (Hotspot → LAN → P2P)');
   }
 
   @override
@@ -160,6 +310,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
 
   @override
   void dispose() {
+    GuestConnectionGuard.reset();
     _stopDiscovery();
     _pulseTimer?.cancel();
     super.dispose();
@@ -213,8 +364,17 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   }
 
   Future<void> _startDiscovery() async {
+    if (GuestConnectionGuard.isActive || _connectionUiLocked) {
+      debugPrint(
+        '[Discovery] Ignoring _startDiscovery — connection in progress '
+        '(guard=${GuestConnectionGuard.isActive} locked=$_connectionUiLocked)',
+      );
+      return;
+    }
     try {
-      await _ensureAndroidLocationForBle();
+      if (!Platform.isWindows) {
+        await _ensureAndroidLocationForBle();
+      }
       if (!mounted) return;
 
       await _logNetworkInterfaces();
@@ -222,27 +382,40 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       await BleTransport.instance.startScanning();
       _scanSubscription?.cancel();
       _seenPeers.clear();
-      _scanSubscription = BleTransport.instance.scanPeers().listen((peers) {
-        for (final peer in peers) {
-          if (_seenPeers.add(peer.id)) {
-            ConnectionLogger.instance.log(
-              'BLE Scan Peer Found',
-              details: '${peer.friendlyName} (${peer.id})',
-            );
+      _scanSubscription = BleTransport.instance.scanPeers().listen(
+        (peers) {
+          if (GuestConnectionGuard.isActive || _connectionUiLocked) return;
+          for (final peer in peers) {
+            if (_seenPeers.add(peer.id)) {
+              ConnectionLogger.instance.log(
+                'BLE Scan Peer Found',
+                details: '${peer.friendlyName} (${peer.id})',
+              );
+            }
           }
-        }
-        if (!mounted) return;
-        setState(() {
-          _peers
-            ..clear()
-            ..addAll(peers);
-          _isScanning = true;
-          _status = 'Peer Discovery via BLE';
-        });
-      });
-      setState(() {
-        _isScanning = true;
-      });
+          if (!mounted || GuestConnectionGuard.isActive || _connectionUiLocked) {
+            return;
+          }
+          setState(() {
+            _peers
+              ..clear()
+              ..addAll(peers);
+            if (_phase == _GuestDiscoveryPhase.scanning) {
+              _status = 'Peer Discovery via BLE';
+            }
+          });
+        },
+        onError: (Object e) {
+          if (GuestConnectionGuard.isActive || _connectionUiLocked) {
+            debugPrint(
+              '[Discovery] Ignoring BLE scan stream error during connection: $e',
+            );
+            return;
+          }
+          debugPrint('[Discovery] BLE scan stream error: $e');
+        },
+      );
+      _setPhase(_GuestDiscoveryPhase.scanning, 'Peer Discovery via BLE');
     } catch (e) {
       if (!mounted) return;
       debugPrint('[Discovery] start failed: $e');
@@ -257,19 +430,29 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     await _scanSubscription?.cancel();
     _scanSubscription = null;
 
-    if (mounted) {
-      setState(() {
-        _isScanning = false;
-      });
+    if (mounted &&
+        !GuestConnectionGuard.isActive &&
+        !_connectionUiLocked &&
+        _phase == _GuestDiscoveryPhase.scanning) {
+      _setPhase(_GuestDiscoveryPhase.scanning, _status);
     }
   }
 
-  Future<void> _selectPeer(BlePeer peer) async {
+  Future<void> _lockUiForConnection() async {
+    _pauseDiscoverySideEffects();
+    _setPhase(_GuestDiscoveryPhase.connecting, _kHotspotConnectingOverlayMessage);
+    await _scanSubscription?.cancel();
+    _scanSubscription = null;
     try {
-      setState(() {
-        _isHandshaking = true;
-        _status = 'Waiting for peer to approve...';
-      });
+      await BleTransport.instance.stopScanning();
+    } catch (_) {}
+  }
+
+  Future<void> _selectPeer(BlePeer peer) async {
+    GuestConnectionGuard.enter();
+    _pauseDiscoverySideEffects();
+    try {
+      _setPhase(_GuestDiscoveryPhase.handshaking, _kHotspotConnectingOverlayMessage);
 
       await ConnectionLogger.instance.log(
         'BLE | Handshake sequence start',
@@ -282,138 +465,18 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         details: handshakePayload.describeForLog(),
       );
 
-      // On Android with a Wi-Fi Direct host: use WifiP2pManager.connect() (proper P2P API)
-      // so the guest's socket is routed over the p2p interface, bypassing hotspot iptables.
-      // The returned groupOwnerIp overrides the BLE-advertised endpoint IP.
-      String? p2pGroupOwnerIp;
-      if (Platform.isAndroid && handshakePayload.p2pMac.isNotEmpty) {
-        if (!mounted) return;
-        setState(() => _status = 'Connecting to hub Wi-Fi Direct…');
-        try {
-          p2pGroupOwnerIp = await HandshakeTrace.run<String>(
-            'WLAN connect (guest → hub P2P group)',
-            () => WlanLinkManager.instance.connectToWifiDirectPeer(handshakePayload.p2pMac),
-            extra: 'peerMac=${handshakePayload.p2pMac}',
-            hardTimeout: const Duration(seconds: 35),
-          );
-          await ConnectionLogger.instance.log(
-            'WLAN connect | P2P connected',
-            details: 'groupOwnerIp=$p2pGroupOwnerIp',
-          );
-        } catch (e) {
-          await ConnectionLogger.instance.log(
-            'WLAN connect | P2P failed — proceeding with BLE-advertised IP',
-            details: e.toString(),
-          );
-          p2pGroupOwnerIp = null;
-        }
-      }
+      if (!mounted) return;
+      await _lockUiForConnection();
+      if (!mounted) return;
+      final effectiveEndpoint = await _connectViaTierStrategy(handshakePayload);
 
       if (!mounted) return;
-      setState(() {
-        _status = 'Reading endpoint from peer…';
-      });
-      final endpoint = await _readEndpointWithRetries(peer);
+      _setPhase(_GuestDiscoveryPhase.connecting, 'Opening file console…');
       await ConnectionLogger.instance.log(
-        'HS | Auth endpoint vs ServerHello',
-        details:
-            'endpoint=${endpoint.ip}:${endpoint.port} vs hello_hub=${handshakePayload.hubIp}:${handshakePayload.hubPort}',
+        'Connection | Tier strategy succeeded',
+        details: '${effectiveEndpoint.ip}:${effectiveEndpoint.port}',
       );
-      await ConnectionLogger.instance.log(
-        'BLE | Extracted IP',
-        details: '${endpoint.ip}:${endpoint.port}',
-      );
-      debugPrint(
-        'Network | Guest BLE endpoint (Auth): ${endpoint.ip}:${endpoint.port}',
-      );
-      // If the P2P connection succeeded, replace the BLE-advertised IP with
-      // the confirmed group-owner IP (avoids stale/mismatched BLE values).
-      final resolvedEndpoint = (p2pGroupOwnerIp != null && p2pGroupOwnerIp.isNotEmpty)
-          ? PeerEndpoint(ip: p2pGroupOwnerIp, port: endpoint.port)
-          : endpoint;
-      if (resolvedEndpoint.ip != endpoint.ip) {
-        await ConnectionLogger.instance.log(
-          'Network | Endpoint overridden by P2P group owner',
-          details: '${endpoint.ip} → ${resolvedEndpoint.ip}:${resolvedEndpoint.port}',
-        );
-      }
-
-      if (!mounted) return;
-      setState(() {
-        _status = 'Triggering auto-connect…';
-      });
-      await ConnectionLogger.instance.log(
-        'Connection | Triggering auto-connect',
-        details: '${endpoint.ip}:${endpoint.port}',
-      );
-      var effectiveEndpoint = resolvedEndpoint;
-      try {
-        await HandshakeTrace.run<void>(
-          'TCP verify (guest → hub HTTP port)',
-          () async {
-            final socket = await Socket.connect(
-              resolvedEndpoint.ip,
-              resolvedEndpoint.port,
-              timeout: const Duration(seconds: 10),
-            );
-            await socket.close();
-          },
-          extra: '${resolvedEndpoint.ip}:${resolvedEndpoint.port}',
-          hardTimeout: const Duration(seconds: 14),
-        );
-        await ConnectionLogger.instance.log(
-          'Socket Connection Success',
-          details: '${resolvedEndpoint.ip}:${resolvedEndpoint.port}',
-        );
-      } on TimeoutException catch (e) {
-        await ConnectionLogger.instance.log(
-          'Connection | Timeout trying to reach ${resolvedEndpoint.ip} - Check if devices are on the same Wi-Fi and if Client Isolation is active.',
-          details: '$e',
-        );
-        await _logTcpVerifyApIsolationHint(resolvedEndpoint);
-        if (resolvedEndpoint.ip.startsWith('10.') || resolvedEndpoint.ip.startsWith('172.')) {
-          await ConnectionLogger.instance.log(
-            'Network Hint',
-            details: 'Potential Client Isolation detected on this network.',
-          );
-        }
-        final gatewayEndpoint = await _tryGatewayFallback(resolvedEndpoint);
-        if (gatewayEndpoint != null) {
-          effectiveEndpoint = gatewayEndpoint;
-        } else {
-          rethrow;
-        }
-      } on SocketException catch (e) {
-        final looksLikeTimeout = _looksLikeTcpTimeout(e);
-        if (looksLikeTimeout) {
-          await ConnectionLogger.instance.log(
-            'Connection | Timeout trying to reach ${resolvedEndpoint.ip} - Check if devices are on the same Wi-Fi and if Client Isolation is active.',
-            details: e.toString(),
-          );
-          await _logTcpVerifyApIsolationHint(resolvedEndpoint);
-        } else {
-          await ConnectionLogger.instance.log(
-            'Socket Connection Failed',
-            details: e.toString(),
-          );
-        }
-        if (resolvedEndpoint.ip.startsWith('10.') || resolvedEndpoint.ip.startsWith('172.')) {
-          await ConnectionLogger.instance.log(
-            'Network Hint',
-            details: 'Potential Client Isolation detected on this network.',
-          );
-        }
-        if (looksLikeTimeout) {
-          final gatewayEndpoint = await _tryGatewayFallback(resolvedEndpoint);
-          if (gatewayEndpoint != null) {
-            effectiveEndpoint = gatewayEndpoint;
-          } else {
-            rethrow;
-          }
-        } else {
-          rethrow;
-        }
-      }
+      GuestConnectionGuard.exit();
       await widget.onEndpointReady(effectiveEndpoint);
     } catch (e, st) {
       await ConnectionLogger.instance.log(
@@ -422,22 +485,67 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       );
       debugPrint('[Discovery] Handshake Failure stack:\n$st');
       if (!mounted) return;
-      setState(() {
-        _status = 'Peer Discovery via BLE';
-      });
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Secure handshake failed: $e')));
+      final wasHandshaking = _phase == _GuestDiscoveryPhase.handshaking;
+      if (wasHandshaking) {
+        GuestConnectionGuard.exit();
+        _setPhase(_GuestDiscoveryPhase.scanning, 'Peer Discovery via BLE');
+        await _startDiscovery();
+      } else {
+        GuestConnectionGuard.exit();
+        _setPhase(
+          _GuestDiscoveryPhase.connecting,
+          'Connection failed — tap ← back to search again',
+        );
+      }
+      final message = e is PlatformException
+          ? '${e.code}: ${e.message ?? e.details ?? "unknown"}'
+          : e.toString();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            wasHandshaking
+                ? 'Secure handshake failed: $message'
+                : 'Connection failed: $message',
+          ),
+          duration: const Duration(seconds: 8),
+        ),
+      );
     } finally {
       if (!mounted) return;
-      setState(() {
-        _isHandshaking = false;
-      });
+      if (_phase == _GuestDiscoveryPhase.handshaking) {
+        GuestConnectionGuard.exit();
+        _setPhase(_GuestDiscoveryPhase.scanning, 'Peer Discovery via BLE');
+        await _startDiscovery();
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_connectionUiLocked) {
+      return const Scaffold(
+        body: SafeArea(
+          child: Center(
+            child: Padding(
+              padding: EdgeInsets.symmetric(horizontal: 28),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 28),
+                  Text(
+                    _kHotspotConnectingOverlayMessage,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(fontSize: 16),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(title: const Text('Peer Discovery via BLE')),
       body: Padding(
@@ -452,21 +560,6 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
               style: Theme.of(context).textTheme.bodySmall,
             ),
             const SizedBox(height: 8),
-            if (_isHandshaking)
-              Row(
-                children: const [
-                  SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                  SizedBox(width: 8),
-                  Expanded(
-                    child: Text('Waiting for sender to approve the connection...'),
-                  ),
-                ],
-              ),
-            if (_isHandshaking) const SizedBox(height: 8),
             Expanded(
               child: _peers.isEmpty
                   ? Center(
@@ -480,16 +573,10 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                           ),
                           const SizedBox(height: 8),
                           Text(
-                            _isHandshaking
-                                ? 'Waiting for sender to approve the connection...'
-                                : _isScanning
+                            _isScanning
                                 ? 'Peer Discovery via BLE in progress…'
                                 : 'No senders discovered',
                           ),
-                          if (_isHandshaking) ...[
-                            const SizedBox(height: 8),
-                            const CircularProgressIndicator(strokeWidth: 2),
-                          ],
                         ],
                       ),
                     )
@@ -507,7 +594,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                                 ? 'Transfer hub • $kAirShareBleServiceUuid'
                                 : 'UUID ${peer.serviceUuid}',
                           ),
-                          onTap: _isHandshaking ? null : () => _selectPeer(peer),
+                          onTap: _connectionUiLocked ? null : () => _selectPeer(peer),
                         );
                       },
                     ),
@@ -515,13 +602,15 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: () async {
-          await _stopDiscovery();
-          await _startDiscovery();
-        },
-        child: const Icon(Icons.refresh),
-      ),
+      floatingActionButton: _connectionUiLocked
+          ? null
+          : FloatingActionButton(
+              onPressed: () async {
+                await _stopDiscovery();
+                await _startDiscovery();
+              },
+              child: const Icon(Icons.refresh),
+            ),
     );
   }
 }

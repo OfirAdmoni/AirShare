@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:air_share/air_share_constants.dart';
 import 'package:air_share/handshake_trace.dart';
@@ -24,41 +25,69 @@ class BlePeer {
   }
 }
 
+/// 3-tier handshake payload broadcast by the host over BLE GATT.
 class HandshakePayload {
   const HandshakePayload({
-    required this.ssid,
-    required this.password,
-    required this.hubIp,
-    this.hubPort = 8080,
+    this.lanIp = '',
+    this.p2pIp = '',
     this.p2pMac = '',
+    this.hotspotSsid = '',
+    this.hotspotPass = '',
+    this.hotspotHubIp = '',
+    this.hubPort = 8080,
   });
 
-  final String ssid;
-  final String password;
-  final String hubIp;
-  final int hubPort;
-  /// Wi-Fi Direct device address of the hub (e.g. "AA:BB:CC:DD:EE:FF").
-  /// Empty string when the hub did not create a P2P group.
+  final String lanIp;
+  final String p2pIp;
   final String p2pMac;
+  final String hotspotSsid;
+  final String hotspotPass;
+  /// Hub IPv4 on the hotspot interface (tier 3).
+  final String hotspotHubIp;
+  final int hubPort;
 
+  /// Legacy primary hub IP (LAN preferred, then P2P, then hotspot hub).
+  String get hubIp {
+    if (lanIp.isNotEmpty) return lanIp;
+    if (p2pIp.isNotEmpty) return p2pIp;
+    if (hotspotHubIp.isNotEmpty) return hotspotHubIp;
+    return '';
+  }
+
+  String get ssid => hotspotSsid;
+  String get password => hotspotPass;
+
+  bool get hasLan => lanIp.isNotEmpty;
+  bool get hasP2p => p2pMac.isNotEmpty;
+  bool get hasHotspot => hotspotSsid.isNotEmpty && hotspotPass.isNotEmpty;
+
+  /// [lan_ip] must be explicit in JSON — never alias [hubIp] (often ap0) into Tier 1 LAN.
   factory HandshakePayload.fromMap(Map<dynamic, dynamic> map) {
-    final portRaw = map['hubPort'];
+    final portRaw = map['hub_port'] ?? map['hubPort'];
     final port = portRaw is int
         ? portRaw
         : int.tryParse(portRaw?.toString() ?? '') ?? 8080;
+    final lan = (map['lan_ip'] ?? '').toString();
+    final hotspotSsid = (map['hotspot_ssid'] ?? map['ssid'] ?? '').toString();
+    final hotspotHubRaw = (map['hotspot_hub_ip'] ?? '').toString();
+    final legacyHub = (map['hubIp'] ?? '').toString();
+    final hotspotHubIp = hotspotHubRaw.isNotEmpty
+        ? hotspotHubRaw
+        : (hotspotSsid.isNotEmpty ? legacyHub : '');
     return HandshakePayload(
-      ssid: (map['ssid'] ?? '').toString(),
-      password: (map['password'] ?? '').toString(),
-      hubIp: (map['hubIp'] ?? '').toString(),
+      lanIp: lan,
+      p2pIp: (map['p2p_ip'] ?? '').toString(),
+      p2pMac: (map['p2p_mac'] ?? map['p2pMac'] ?? '').toString(),
+      hotspotSsid: hotspotSsid,
+      hotspotPass: (map['hotspot_pass'] ?? map['password'] ?? '').toString(),
+      hotspotHubIp: hotspotHubIp,
       hubPort: port,
-      p2pMac: (map['p2pMac'] ?? '').toString(),
     );
   }
 
-  /// Log-safe summary (no password or SSID contents).
   String describeForLog() =>
-      'hubIp=$hubIp hubPort=$hubPort ssid_len=${ssid.length} '
-      'pwd_present=${password.isNotEmpty} p2pMac_present=${p2pMac.isNotEmpty}';
+      'lan_ip=$lanIp p2p_ip=$p2pIp p2p_mac_present=${p2pMac.isNotEmpty} '
+      'hotspot_present=${hotspotSsid.isNotEmpty} hub_port=$hubPort';
 }
 
 class PeerEndpoint {
@@ -106,6 +135,22 @@ class BleTransport {
     });
   }
 
+  /// Android: whether the adapter is powered on (requires BT permissions on API 31+).
+  Future<bool> isBluetoothEnabled() async {
+    if (!Platform.isAndroid) return true;
+    final enabled = await _methodChannel.invokeMethod<bool>('isBluetoothEnabled');
+    return enabled ?? false;
+  }
+
+  /// Android: launches [BluetoothAdapter.ACTION_REQUEST_ENABLE] when BT is off.
+  Future<bool> requestEnableBluetooth() async {
+    if (!Platform.isAndroid) return true;
+    final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
+      'requestEnableBluetooth',
+    );
+    return raw?['enabled'] == true;
+  }
+
   Future<void> startScanning() async {
     await _methodChannel.invokeMethod('startScanning', {
       'serviceUuid': airShareServiceUuid,
@@ -137,9 +182,38 @@ class BleTransport {
     _uiChannel.setMethodCallHandler(handler);
   }
 
+  /// Pushes all tier endpoints to native before guest approval.
+  Future<void> updateConnectionEndpoints({
+    required String lanIp,
+    required String p2pIp,
+    required String p2pMac,
+    required String hotspotSsid,
+    required String hotspotPass,
+    required String hotspotHubIp,
+    required int hubPort,
+  }) async {
+    if (Platform.isWindows) {
+      final primary = lanIp.isNotEmpty
+          ? lanIp
+          : (p2pIp.isNotEmpty ? p2pIp : hotspotHubIp);
+      await updateHubEndpoint(ip: primary, port: hubPort);
+      return;
+    }
+    await _methodChannel.invokeMethod('updateConnectionEndpoints', {
+      'lanIp': lanIp,
+      'p2pIp': p2pIp,
+      'p2pMac': p2pMac,
+      'hotspotSsid': hotspotSsid,
+      'hotspotPass': hotspotPass,
+      'hotspotHubIp': hotspotHubIp,
+      'hubPort': hubPort,
+    });
+  }
+
+  /// Waits for host approval via GATT notification (no read polling).
   Future<HandshakePayload> establishSecureHandshake(BlePeer peer) async {
     final payload = await HandshakeTrace.run(
-      'ClientHello→ServerHello (BLE read handshake JSON)',
+      'ClientHello→ServerHello (BLE notify handshake JSON)',
       () async {
         final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
           'establishSecureHandshake',
@@ -192,5 +266,20 @@ class BleTransport {
         'port': port,
       },
     );
+  }
+
+  /// Local BLE peer id (Android BT address when available, else stable persisted id).
+  Future<String> getLocalPeerId() async {
+    if (!Platform.isAndroid && !Platform.isWindows) {
+      throw UnsupportedError('getLocalPeerId is only supported on Android and Windows');
+    }
+    final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
+      'getLocalPeerId',
+    );
+    final id = raw?['peerId']?.toString().trim();
+    if (id == null || id.isEmpty) {
+      throw Exception('getLocalPeerId returned empty id');
+    }
+    return id;
   }
 }
