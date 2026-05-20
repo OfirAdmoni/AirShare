@@ -17,7 +17,7 @@ class WlanLinkManager {
     await _channel.invokeMethod<void>('ensureLocationForWifiTier');
   }
 
-  /// Removes an active Wi‑Fi Direct group and waits for the radio to settle (Tier 2 → 3).
+  /// Removes an active Wi‑Fi Direct group and waits for the radio to settle (Tier 3 fallback cleanup).
   Future<void> teardownP2pBeforeHotspot() async {
     if (!_isAndroidMobile) return;
     await _channel.invokeMethod<void>('teardownP2pBeforeHotspot');

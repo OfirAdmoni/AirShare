@@ -5,7 +5,7 @@ import 'package:geolocator/geolocator.dart';
 
 import 'package:air_share/wlan_link_manager.dart';
 
-/// Location + native checks required for offline Tier 2 (P2P) / Tier 3 (hotspot).
+/// Location + native checks required for offline Tier 2 (hotspot) / Tier 3 (P2P).
 class WifiTierPrerequisites {
   WifiTierPrerequisites._();
 

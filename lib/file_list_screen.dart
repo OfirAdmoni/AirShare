@@ -8,6 +8,7 @@ import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'package:air_share/connection_logger.dart';
 import 'package:air_share/file_zone_session.dart';
 import 'package:air_share/hub_status.dart';
 import 'package:air_share/local_hub_runtime.dart';
@@ -63,6 +64,13 @@ class _FileListScreenState extends State<FileListScreen> {
   bool _guestConnectionTimedOut = false;
   Timer? _guestConnectionTimer;
   Timer? _refreshTimer;
+
+  // Transfer-cancellation state (Case A).
+  bool _teardownConfirmed = false;
+  http.Client? _activeDownloadClient;
+  String? _activeDownloadPath;
+
+  bool get _isTransferActive => isDownloading || isUploading;
 
   String get baseUrl => 'http://${widget.hubHost}:${widget.hubPort}';
   HubStatus get _hubStatus => HubStatusScope.of(context);
@@ -187,6 +195,11 @@ class _FileListScreenState extends State<FileListScreen> {
     });
 
     final client = http.Client();
+    _activeDownloadClient = client;
+    // Track the IOSink so the finally block can close it before deleting the
+    // partial file — required on Windows which cannot delete open file handles.
+    IOSink? sink;
+
     try {
       final uri = Uri.parse(
         '$baseUrl/download?name=${Uri.encodeComponent(fileName)}',
@@ -204,7 +217,8 @@ class _FileListScreenState extends State<FileListScreen> {
       }
 
       final outputFile = File(p.join(targetDir.path, fileName));
-      final sink = outputFile.openWrite();
+      _activeDownloadPath = outputFile.path;
+      sink = outputFile.openWrite();
 
       final totalBytes = response.contentLength;
       var receivedBytes = 0;
@@ -222,9 +236,12 @@ class _FileListScreenState extends State<FileListScreen> {
 
       await sink.flush();
       await sink.close();
+      sink = null; // mark as cleanly closed
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(
         SnackBar(content: Text('Saved to: ${outputFile.path}')),
       );
     } catch (e) {
@@ -233,7 +250,34 @@ class _FileListScreenState extends State<FileListScreen> {
         context,
       ).showSnackBar(SnackBar(content: Text('Data egress error: $e')));
     } finally {
+      // Close the sink before any file operations (avoids Windows file lock).
+      if (sink != null) {
+        try {
+          await sink.close();
+        } catch (_) {}
+      }
+      _activeDownloadClient = null;
       client.close();
+
+      // Delete partial file if the user explicitly confirmed cancellation.
+      if (_teardownConfirmed) {
+        final pathToDelete = _activeDownloadPath;
+        _activeDownloadPath = null;
+        if (pathToDelete != null) {
+          try {
+            final partial = File(pathToDelete);
+            if (await partial.exists()) {
+              await partial.delete();
+              await ConnectionLogger.instance.log(
+                'Teardown | Partial file deleted: $fileName',
+              );
+            }
+          } catch (_) {}
+        }
+      } else {
+        _activeDownloadPath = null;
+      }
+
       if (!mounted) return;
       setState(() {
         isDownloading = false;
@@ -441,6 +485,45 @@ class _FileListScreenState extends State<FileListScreen> {
     super.dispose();
   }
 
+  // Shows the Case A confirmation dialog when the user tries to leave during
+  // an active transfer. Returns after the dialog is dismissed — navigation
+  // (if confirmed) is handled internally.
+  Future<void> _showCancelDialog() async {
+    if (!mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Cancel transfer?'),
+        content: const Text(
+          'A file transfer is in progress. Leaving now will leave it incomplete.',
+        ),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Continue'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Cancel transfer'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    _teardownConfirmed = true;
+    // Interrupt any in-flight download stream so its finally block can run.
+    _activeDownloadClient?.close();
+    _activeDownloadClient = null;
+
+    // Show SnackBar via the root ScaffoldMessenger so it persists after pop.
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Transfer canceled')),
+    );
+    if (mounted) Navigator.of(context).pop();
+  }
+
   @override
   Widget build(BuildContext context) {
     final content = files.isEmpty
@@ -515,134 +598,140 @@ class _FileListScreenState extends State<FileListScreen> {
             },
           );
 
-    return Scaffold(
-      appBar: AppBar(
-        title: Text('${widget.modeTitle} • ${widget.hubHost}:${widget.hubPort}'),
-      ),
-      body: Column(
-        children: [
-          if (_selectedFiles.isNotEmpty)
-            Material(
-              color: Theme.of(context).colorScheme.surfaceContainerLow,
-              child: SizedBox(
-                height: 120,
-                child: ListView.separated(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  itemCount: _selectedFiles.length,
-                  separatorBuilder: (_, __) => const Divider(height: 1),
-                  itemBuilder: (context, index) {
-                    final file = _selectedFiles[index];
-                    return ListTile(
-                      dense: true,
-                      leading: const Icon(Icons.upload_file, size: 20),
-                      title: Text(
-                        file.name,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      trailing: Text(_formatFileSize(file.sizeBytes)),
-                    );
-                  },
-                ),
-              ),
-            ),
-          if (isUploading)
-            Material(
-              color: Theme.of(context).colorScheme.surfaceContainerHighest,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Data Ingress: ${uploadingFileName ?? "file"}',
-                      style: Theme.of(context).textTheme.bodyMedium,
-                    ),
-                    const SizedBox(height: 8),
-                    LinearProgressIndicator(value: uploadProgress),
-                  ],
-                ),
-              ),
-            ),
-          if (isDownloading)
-            Material(
-              color: Theme.of(context).colorScheme.surfaceContainerHighest,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Data Egress: ${downloadingFileName ?? "file"}',
-                      style: Theme.of(context).textTheme.bodyMedium,
-                    ),
-                    const SizedBox(height: 8),
-                    LinearProgressIndicator(value: downloadProgress),
-                  ],
-                ),
-              ),
-            ),
-          if (widget.isHubMode && !_guestConnected)
-            Material(
-              color: _guestConnectionTimedOut
-                  ? Theme.of(context).colorScheme.errorContainer
-                  : Theme.of(context).colorScheme.secondaryContainer,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                child: Row(
-                  children: [
-                    if (!_guestConnectionTimedOut)
-                      const SizedBox(
-                        width: 14,
-                        height: 14,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    else
-                      Icon(
-                        Icons.warning_amber_rounded,
-                        size: 16,
-                        color: Theme.of(context).colorScheme.onErrorContainer,
-                      ),
-                    const SizedBox(width: 12),
-                    Text(
-                      _guestConnectionTimedOut
-                          ? 'No receiver connected after 2 min — still waiting'
-                          : 'Waiting for receiver to connect…',
-                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                            color: _guestConnectionTimedOut
-                                ? Theme.of(context).colorScheme.onErrorContainer
-                                : Theme.of(context).colorScheme.onSecondaryContainer,
-                          ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          Expanded(child: content),
-          if (widget.isHubMode)
-            AnimatedBuilder(
-              animation: _hubStatus,
-              builder: (context, _) {
-                final isError = _hubStatus.lifecycle == HubLifecycle.error;
-                return Container(
-                  width: double.infinity,
-                  color: isError
-                      ? Theme.of(context).colorScheme.errorContainer
-                      : Theme.of(context).colorScheme.surfaceContainerHighest,
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                  child: Text(
-                    isError && _hubStatus.lastError != null
-                        ? '${_hubStatus.message}: ${_hubStatus.lastError}'
-                        : _hubStatus.message,
+    return PopScope(
+      canPop: !_isTransferActive,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _showCancelDialog();
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text('${widget.modeTitle} • ${widget.hubHost}:${widget.hubPort}'),
+        ),
+        body: Column(
+          children: [
+            if (_selectedFiles.isNotEmpty)
+              Material(
+                color: Theme.of(context).colorScheme.surfaceContainerLow,
+                child: SizedBox(
+                  height: 120,
+                  child: ListView.separated(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    itemCount: _selectedFiles.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final file = _selectedFiles[index];
+                      return ListTile(
+                        dense: true,
+                        leading: const Icon(Icons.upload_file, size: 20),
+                        title: Text(
+                          file.name,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        trailing: Text(_formatFileSize(file.sizeBytes)),
+                      );
+                    },
                   ),
-                );
-              },
-            ),
-        ],
-      ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: pickAndUploadFile,
-        child: const Icon(Icons.add),
+                ),
+              ),
+            if (isUploading)
+              Material(
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Data Ingress: ${uploadingFileName ?? "file"}',
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      ),
+                      const SizedBox(height: 8),
+                      LinearProgressIndicator(value: uploadProgress),
+                    ],
+                  ),
+                ),
+              ),
+            if (isDownloading)
+              Material(
+                color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Data Egress: ${downloadingFileName ?? "file"}',
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      ),
+                      const SizedBox(height: 8),
+                      LinearProgressIndicator(value: downloadProgress),
+                    ],
+                  ),
+                ),
+              ),
+            if (widget.isHubMode && !_guestConnected)
+              Material(
+                color: _guestConnectionTimedOut
+                    ? Theme.of(context).colorScheme.errorContainer
+                    : Theme.of(context).colorScheme.secondaryContainer,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  child: Row(
+                    children: [
+                      if (!_guestConnectionTimedOut)
+                        const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      else
+                        Icon(
+                          Icons.warning_amber_rounded,
+                          size: 16,
+                          color: Theme.of(context).colorScheme.onErrorContainer,
+                        ),
+                      const SizedBox(width: 12),
+                      Text(
+                        _guestConnectionTimedOut
+                            ? 'No receiver connected after 2 min — still waiting'
+                            : 'Waiting for receiver to connect…',
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                              color: _guestConnectionTimedOut
+                                  ? Theme.of(context).colorScheme.onErrorContainer
+                                  : Theme.of(context).colorScheme.onSecondaryContainer,
+                            ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            Expanded(child: content),
+            if (widget.isHubMode)
+              AnimatedBuilder(
+                animation: _hubStatus,
+                builder: (context, _) {
+                  final isError = _hubStatus.lifecycle == HubLifecycle.error;
+                  return Container(
+                    width: double.infinity,
+                    color: isError
+                        ? Theme.of(context).colorScheme.errorContainer
+                        : Theme.of(context).colorScheme.surfaceContainerHighest,
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                    child: Text(
+                      isError && _hubStatus.lastError != null
+                          ? '${_hubStatus.message}: ${_hubStatus.lastError}'
+                          : _hubStatus.message,
+                    ),
+                  );
+                },
+              ),
+          ],
+        ),
+        floatingActionButton: FloatingActionButton(
+          onPressed: pickAndUploadFile,
+          child: const Icon(Icons.add),
+        ),
       ),
     );
   }

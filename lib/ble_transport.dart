@@ -46,11 +46,11 @@ class HandshakePayload {
   final String hotspotHubIp;
   final int hubPort;
 
-  /// Legacy primary hub IP (LAN preferred, then P2P, then hotspot hub).
+  /// Legacy primary hub IP (LAN preferred, then hotspot, then P2P).
   String get hubIp {
     if (lanIp.isNotEmpty) return lanIp;
-    if (p2pIp.isNotEmpty) return p2pIp;
     if (hotspotHubIp.isNotEmpty) return hotspotHubIp;
+    if (p2pIp.isNotEmpty) return p2pIp;
     return '';
   }
 
@@ -135,9 +135,9 @@ class BleTransport {
     });
   }
 
-  /// Android: whether the adapter is powered on (requires BT permissions on API 31+).
+  /// Android and Windows: whether the Bluetooth adapter is powered on.
   Future<bool> isBluetoothEnabled() async {
-    if (!Platform.isAndroid) return true;
+    if (!Platform.isAndroid && !Platform.isWindows) return true;
     final enabled = await _methodChannel.invokeMethod<bool>('isBluetoothEnabled');
     return enabled ?? false;
   }
@@ -149,6 +149,17 @@ class BleTransport {
       'requestEnableBluetooth',
     );
     return raw?['enabled'] == true;
+  }
+
+  /// Opens the system Bluetooth settings panel.
+  /// Android: navigates to Settings.ACTION_BLUETOOTH_SETTINGS.
+  /// Windows: opens ms-settings:bluetooth.
+  Future<void> openBluetoothSettings() async {
+    if (Platform.isAndroid) {
+      await _methodChannel.invokeMethod<void>('openBluetoothSettings');
+    } else if (Platform.isWindows) {
+      await Process.run('cmd', ['/c', 'start', 'ms-settings:bluetooth']);
+    }
   }
 
   Future<void> startScanning() async {

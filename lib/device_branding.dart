@@ -1,3 +1,4 @@
+import 'package:air_share/connection_logger.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -7,6 +8,7 @@ class DeviceBranding {
   DeviceBranding._();
 
   static const String _prefKey = 'ble_friendly_display_name';
+  static const int _maxNameLength = 32;
 
   /// OS-reported model or hostname (no hard-coded product string).
   static Future<String> hardwareDefaultName() async {
@@ -61,11 +63,18 @@ class DeviceBranding {
 
   static Future<void> saveDisplayName(String value) async {
     final prefs = await SharedPreferences.getInstance();
-    final t = value.trim();
-    if (t.isEmpty) {
+    final trimmed = value.trim();
+    final clamped = trimmed.length > _maxNameLength
+        ? trimmed.substring(0, _maxNameLength)
+        : trimmed;
+    if (clamped.isEmpty) {
       await prefs.remove(_prefKey);
+      await ConnectionLogger.instance.log(
+        'DeviceName | User saved new name: (empty — reverted to hardware default)',
+      );
     } else {
-      await prefs.setString(_prefKey, t);
+      await prefs.setString(_prefKey, clamped);
+      await ConnectionLogger.instance.log('DeviceName | User saved new name: $clamped');
     }
   }
 

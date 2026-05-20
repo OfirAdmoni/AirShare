@@ -476,6 +476,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             "isBluetoothEnabled" -> ensurePermissionsThenExecute(result) { isBluetoothEnabled(result) }
             "requestEnableBluetooth" -> ensurePermissionsThenExecute(result) { requestEnableBluetooth(result) }
             "openWirelessSettings" -> openWirelessSettings(result)
+            "openBluetoothSettings" -> openBluetoothSettings(result)
             "shareLogs" -> shareLogs(call, result)
             "getLocalPeerId" -> ensurePermissionsThenExecute(result) { getLocalPeerId(result) }
             else -> result.notImplemented()
@@ -522,6 +523,15 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private fun openWirelessSettings(result: MethodChannel.Result) {
         try {
             startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS))
+            result.success(null)
+        } catch (e: Exception) {
+            result.error("settings_intent_failed", e.message, null)
+        }
+    }
+
+    private fun openBluetoothSettings(result: MethodChannel.Result) {
+        try {
+            startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
             result.success(null)
         } catch (e: Exception) {
             result.error("settings_intent_failed", e.message, null)

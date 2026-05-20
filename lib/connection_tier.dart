@@ -2,7 +2,7 @@ import 'dart:io';
 
 import 'package:network_info_plus/network_info_plus.dart';
 
-/// Helpers for LAN → Wi‑Fi Direct → hotspot tier selection.
+/// Helpers for LAN → hotspot → Wi‑Fi Direct tier selection.
 class ConnectionTier {
   ConnectionTier._();
 

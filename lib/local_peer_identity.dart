@@ -13,6 +13,10 @@ class LocalPeerIdentity {
 
   static LocalPeerIdentity? _cached;
 
+  /// Clears the cached identity so the next [resolve] re-reads the current
+  /// device name from storage. Call after saving a new name.
+  static void invalidate() => _cached = null;
+
   final String peerId;
   final String displayName;
 

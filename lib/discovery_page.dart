@@ -160,7 +160,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     _pulseTimer = null;
   }
 
-  /// Tier 3 only: permissions + WifiNetworkSpecifier (no TCP / Wi‑Fi probes before dialog).
+  /// Tier 2 only: permissions + WifiNetworkSpecifier (no TCP / Wi‑Fi probes before dialog).
   Future<void> _joinHostHotspotAp(HandshakePayload payload) async {
     if (!Platform.isAndroid || !payload.hasHotspot) return;
 
@@ -178,7 +178,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     if (!mounted) throw StateError('unmounted');
 
     await ConnectionLogger.instance.log(
-      'Connection | Tier 3 hotspot',
+      'Connection | Tier 2 hotspot',
       details: 'ssid_len=${payload.hotspotSsid.length}',
     );
     await HandshakeTrace.run<void>(
@@ -218,17 +218,17 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         final hotspotEndpoint = await _probeHubAfterHotspot(payload, port);
         if (hotspotEndpoint != null) return hotspotEndpoint;
         await ConnectionLogger.instance.log(
-          'Connection | Tier 3 TCP failed after hotspot join',
+          'Connection | Tier 2 TCP failed after hotspot join',
           details: 'no hub reachable on candidate IPs',
         );
       } on PlatformException catch (e) {
         await ConnectionLogger.instance.log(
-          'Connection | Tier 3 hotspot failed',
+          'Connection | Tier 2 hotspot failed',
           details: '${e.code} ${e.message}',
         );
       } catch (e) {
         await ConnectionLogger.instance.log(
-          'Connection | Tier 3 hotspot failed',
+          'Connection | Tier 2 hotspot failed',
           details: e.toString(),
         );
       }
@@ -260,14 +260,14 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       }
     }
 
-    // Tier 2 — Wi‑Fi Direct.
+    // Tier 3 — Wi‑Fi Direct (last-resort fallback).
     if (Platform.isAndroid && payload.hasP2p) {
       if (!mounted) throw StateError('unmounted');
       await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
       if (!mounted) throw StateError('unmounted');
-      _setPhase(_GuestDiscoveryPhase.connecting, 'Tier 2: Joining Wi‑Fi Direct group…');
+      _setPhase(_GuestDiscoveryPhase.connecting, 'Tier 3: Joining Wi‑Fi Direct group…');
       await ConnectionLogger.instance.log(
-        'Connection | Tier 2 P2P',
+        'Connection | Tier 3 P2P',
         details: 'mac=${payload.p2pMac}',
       );
       try {
@@ -283,16 +283,16 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       } on PlatformException catch (e) {
         final reason = e.details?.toString() ?? '';
         await ConnectionLogger.instance.log(
-          'Connection | Tier 2 P2P failed',
+          'Connection | Tier 3 P2P failed',
           details: '${e.code} $reason',
         );
         final busy = reason.contains('reason=2') || e.message?.contains('reason=2') == true;
         if (!busy && e.code != 'p2p_timeout') {
-          // Non-busy hard failure may still try hotspot if credentials exist.
+          // Non-busy hard failure — P2P is the last resort; no further tier to try.
         }
       } catch (e) {
         await ConnectionLogger.instance.log(
-          'Connection | Tier 2 P2P failed',
+          'Connection | Tier 3 P2P failed',
           details: e.toString(),
         );
       }
@@ -478,6 +478,12 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       );
       GuestConnectionGuard.exit();
       await widget.onEndpointReady(effectiveEndpoint);
+      // Gap 5 fix: reset to scanning so the user is not stuck on the
+      // connecting overlay after backing out of FileListScreen.
+      if (mounted) {
+        _setPhase(_GuestDiscoveryPhase.scanning, 'Peer Discovery via BLE');
+        await _startDiscovery();
+      }
     } catch (e, st) {
       await ConnectionLogger.instance.log(
         'Handshake Failure',
@@ -523,8 +529,11 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   @override
   Widget build(BuildContext context) {
     if (_connectionUiLocked) {
-      return const Scaffold(
-        body: SafeArea(
+      return Scaffold(
+        appBar: AppBar(
+          leading: const BackButton(),
+        ),
+        body: const SafeArea(
           child: Center(
             child: Padding(
               padding: EdgeInsets.symmetric(horizontal: 28),

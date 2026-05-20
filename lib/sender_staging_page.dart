@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 
 import 'package:air_share/ble_transport.dart';
+import 'package:air_share/session_teardown.dart';
 import 'package:air_share/connection_logger.dart';
 import 'package:air_share/device_branding.dart';
 import 'package:air_share/file_list_screen.dart';
@@ -33,6 +34,8 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
   bool _isPreparing = false;
   bool _prepareStarted = false;
   bool _hotspotDialogShown = false;
+  bool _teardownRan = false;
+  bool _hotspotStarting = false;
 
   HubStatus get _hubStatus => HubStatusScope.of(context);
 
@@ -52,6 +55,14 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
     try {
       await WlanLinkManager.instance.stopWifiDirectGroup();
     } catch (_) {}
+  }
+
+  Future<void> _runFullTeardown() async {
+    if (_teardownRan) return;
+    _teardownRan = true;
+    await SessionTeardown.runSenderTeardown(
+      hotspotStartInFlight: _hotspotStarting,
+    );
   }
 
   /// LocalOnlyHotspot: only system-generated SSID/password are valid for BLE/guest join.
@@ -320,12 +331,12 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
 
   @override
   void dispose() {
-    unawaited(_releaseHostRadio());
+    unawaited(_runFullTeardown());
     super.dispose();
   }
 
   Future<void> _prepareSender() async {
-    if (!mounted || _isPreparing) return;
+    if (!mounted || _isPreparing || _teardownRan) return;
     setState(() {
       _isPreparing = true;
       _status = 'Preparing network endpoints…';
@@ -416,67 +427,67 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
       } else if (Platform.isAndroid) {
         await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
         if (!mounted) return;
-        if (mounted) setState(() => _status = 'Tier 2: Starting Wi‑Fi Direct group…');
+        if (mounted) setState(() => _status = 'Tier 2: Starting temporary hotspot…');
+        var hotspotStarted = false;
+        _hotspotStarting = true;
         try {
-          final p2pInfo = await WlanLinkManager.instance.startWifiDirectGroup();
-          p2pIp = (p2pInfo?['hubIp'] ?? '').toString().trim();
-          p2pMac = (p2pInfo?['p2pMac'] ?? '').toString().trim();
+          final hotspotReady = await _tryStartSystemHotspot(
+            hubPort: port,
+            apply: (ssid, pass, hubIp) {
+              hotspotSsid = ssid;
+              hotspotPass = pass;
+              hotspotHubIp = hubIp;
+            },
+          );
+          if (hotspotReady) {
+            hotspotStarted = true;
+            await ConnectionLogger.instance.log(
+              'Connection | Tier 2 hotspot ready',
+              details: 'ssid=$hotspotSsid hub=$hotspotHubIp',
+            );
+          } else {
+            await ConnectionLogger.instance.log(
+              'Connection | Tier 2 hotspot not active',
+              details: 'onStarted was not confirmed or system SSID missing',
+            );
+          }
+        } on PlatformException catch (e) {
           await ConnectionLogger.instance.log(
-            'Connection | Tier 2 P2P ready',
-            details: 'ip=$p2pIp mac=$p2pMac',
+            'Connection | Tier 2 hotspot failed',
+            details: '${e.code}: ${e.message}',
           );
         } catch (e) {
           await ConnectionLogger.instance.log(
-            'Connection | Tier 2 P2P failed',
+            'Connection | Tier 2 hotspot failed',
             details: '$e',
           );
-          await WlanLinkManager.instance.teardownP2pBeforeHotspot();
+        } finally {
+          _hotspotStarting = false;
+        }
+        if (!hotspotStarted) {
+          await WlanLinkManager.instance.stopNativeHotspot();
           if (!mounted) return;
-          if (mounted) {
-            setState(() => _status = 'Tier 3: Starting temporary hotspot (after P2P teardown)…');
-          }
+          if (mounted) setState(() => _status = 'Tier 3: Starting Wi‑Fi Direct group…');
           try {
-            final hotspotReady = await _tryStartSystemHotspot(
-              hubPort: port,
-              apply: (ssid, pass, hubIp) {
-                hotspotSsid = ssid;
-                hotspotPass = pass;
-                hotspotHubIp = hubIp;
-              },
-            );
-            if (hotspotReady) {
-              await ConnectionLogger.instance.log(
-                'Connection | Tier 3 hotspot ready',
-                details: 'ssid=$hotspotSsid hub=$hotspotHubIp',
-              );
-            } else {
-              await ConnectionLogger.instance.log(
-                'Connection | Tier 3 hotspot not active',
-                details: 'onStarted was not confirmed or system SSID missing',
-              );
-              manualHotspot = true;
-              await _notifyManualHotspotRequired();
-            }
-          } on PlatformException catch (e2) {
+            final p2pInfo = await WlanLinkManager.instance.startWifiDirectGroup();
+            p2pIp = (p2pInfo?['hubIp'] ?? '').toString().trim();
+            p2pMac = (p2pInfo?['p2pMac'] ?? '').toString().trim();
             await ConnectionLogger.instance.log(
-              'Connection | Tier 3 hotspot failed',
-              details: '${e2.code}: ${e2.message}',
+              'Connection | Tier 3 P2P ready',
+              details: 'ip=$p2pIp mac=$p2pMac',
+            );
+          } catch (e) {
+            await ConnectionLogger.instance.log(
+              'Connection | Tier 3 P2P failed',
+              details: '$e',
             );
             manualHotspot = true;
-            if (e2.code == 'hotspot_failed' || e2.code == 'hotspot_permission') {
-              await _notifyManualHotspotRequired();
-            }
-          } catch (e2) {
-            manualHotspot = true;
-            await ConnectionLogger.instance.log(
-              'Connection | Tier 3 hotspot failed',
-              details: '$e2',
-            );
             await _notifyManualHotspotRequired();
           }
         }
       } else if (!Platform.isWindows) {
-        if (mounted) setState(() => _status = 'Tier 3: Starting temporary hotspot…');
+        if (mounted) setState(() => _status = 'Tier 2: Starting temporary hotspot…');
+        _hotspotStarting = true;
         try {
           final hotspotReady = await _tryStartSystemHotspot(
             hubPort: port,
@@ -493,7 +504,7 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
         } on PlatformException catch (e) {
           manualHotspot = true;
           await ConnectionLogger.instance.log(
-            'Connection | Tier 3 hotspot failed',
+            'Connection | Tier 2 hotspot failed',
             details: '${e.code}: ${e.message}',
           );
           if (e.code == 'hotspot_failed' || e.code == 'hotspot_permission') {
@@ -501,8 +512,10 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
           }
         } catch (e) {
           manualHotspot = true;
-          await ConnectionLogger.instance.log('Connection | Tier 3 hotspot failed', details: '$e');
+          await ConnectionLogger.instance.log('Connection | Tier 2 hotspot failed', details: '$e');
           await _notifyManualHotspotRequired();
+        } finally {
+          _hotspotStarting = false;
         }
       }
 
@@ -531,7 +544,7 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
         hubPort: port,
       );
 
-      final advertisedIp = lanIp ?? (p2pIp.isNotEmpty ? p2pIp : hotspotHubIp);
+      final advertisedIp = lanIp ?? (hotspotHubIp.isNotEmpty ? hotspotHubIp : p2pIp);
       if (advertisedIp.isNotEmpty) {
         HubEndpointState.instance.setPending(ip: advertisedIp, port: port);
         await _primeBleGattEndpoint(ip: advertisedIp, port: port);
@@ -569,6 +582,9 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
         'BLE Advertise Start',
         details: 'endpoints ready; advertising as $advertiseAs',
       );
+      await ConnectionLogger.instance.log(
+        'DeviceName | BLE advertising restarted with new name: $advertiseAs',
+      );
       await BleTransport.instance.startHubAdvertising(
         friendlyName: advertiseAs,
       );
@@ -600,17 +616,14 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
       );
 
       sessionNotifier.value = null;
-      HubEndpointState.instance.clear();
       _currentAdvertisedIp = null;
       _networkWarning = null;
-      await _releaseHostRadio();
-      await BleTransport.instance.stopHubAdvertising();
+      await _runFullTeardown();
       if (mounted) Navigator.of(context).pop();
     } catch (e, st) {
       debugPrint('[SenderStaging] $e\n$st');
       await ConnectionLogger.instance.log('BLE Advertise Result', details: 'failed: $e');
-      await _releaseHostRadio();
-      HubEndpointState.instance.clear();
+      await _runFullTeardown();
       _currentAdvertisedIp = null;
       _networkWarning = null;
       if (!mounted) return;
@@ -631,7 +644,7 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
     return PopScope(
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) {
-          unawaited(_releaseHostRadio());
+          unawaited(_runFullTeardown());
         }
       },
       child: Scaffold(
@@ -687,12 +700,10 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
               ],
               const SizedBox(height: 24),
               OutlinedButton(
-                onPressed: _isPreparing
-                    ? null
-                    : () async {
-                        await _releaseHostRadio();
-                        if (context.mounted) Navigator.of(context).pop();
-                      },
+                onPressed: () async {
+                  await _runFullTeardown();
+                  if (context.mounted) Navigator.of(context).pop();
+                },
                 child: const Text('Cancel'),
               ),
             ],

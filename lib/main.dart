@@ -4,7 +4,7 @@ import 'dart:io';
 
 import 'package:air_share/ble_transport.dart';
 import 'package:air_share/connection_logger.dart';
-import 'package:air_share/device_branding.dart';
+import 'package:air_share/settings_page.dart';
 import 'package:air_share/discovery_page.dart';
 import 'package:air_share/file_list_screen.dart';
 import 'package:air_share/file_zone_session.dart';
@@ -133,50 +133,33 @@ class ModeSelectionPage extends StatefulWidget {
 }
 
 class _ModeSelectionPageState extends State<ModeSelectionPage> {
-  final TextEditingController _nameController = TextEditingController();
-  final FocusNode _nameFocus = FocusNode();
-  String _modelHint = '';
-  bool _loaded = false;
-
   @override
   void initState() {
     super.initState();
-    _loadBranding();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       UxPrompts.promptBluetoothOnLaunch(context);
     });
   }
 
-  Future<void> _loadBranding() async {
-    final saved = await DeviceBranding.savedDisplayNameRaw();
-    final model = await DeviceBranding.hardwareDefaultName();
-    if (!mounted) return;
-    setState(() {
-      _nameController.text = saved ?? '';
-      _modelHint = model;
-      _loaded = true;
-    });
-  }
-
-  Future<void> _persistName() async {
-    await DeviceBranding.saveDisplayName(_nameController.text);
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Device name saved')),
-    );
-  }
-
-  @override
-  void dispose() {
-    _nameController.dispose();
-    _nameFocus.dispose();
-    super.dispose();
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('AirShare Transfer Console')),
+      appBar: AppBar(
+        title: const Text('AirShare Transfer Console'),
+        actions: [
+          IconButton(
+            tooltip: 'Settings',
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: () {
+              Navigator.of(context).push<void>(
+                MaterialPageRoute<void>(
+                  builder: (_) => const SettingsPage(),
+                ),
+              );
+            },
+          ),
+        ],
+      ),
       body: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 360),
@@ -186,44 +169,13 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                if (!_loaded)
-                  const Padding(
-                    padding: EdgeInsets.only(bottom: 16),
-                    child: LinearProgressIndicator(),
-                  )
-                else ...[
-                  Text(
-                    'Send as (BLE name)',
-                    style: Theme.of(context).textTheme.titleSmall,
-                  ),
-                  const SizedBox(height: 6),
-                  TextField(
-                    controller: _nameController,
-                    focusNode: _nameFocus,
-                    textCapitalization: TextCapitalization.words,
-                    decoration: InputDecoration(
-                      border: const OutlineInputBorder(),
-                      hintText: _modelHint.isEmpty
-                          ? 'Device model if empty'
-                          : 'Empty = use "$_modelHint"',
-                      suffixIcon: IconButton(
-                        tooltip: 'Save',
-                        icon: const Icon(Icons.save_outlined),
-                        onPressed: _persistName,
-                      ),
-                    ),
-                    onEditingComplete: _persistName,
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Leave blank to advertise as this device\'s model name ($_modelHint).',
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                  const SizedBox(height: 20),
-                ],
                 ElevatedButton.icon(
-                  onPressed: () {
+                  onPressed: () async {
+                    final btReady = await UxPrompts
+                        .promptBluetoothRequiredForTransfer(context);
+                    if (!btReady) return;
                     ConnectionLogger.instance.log('Receiver Flow Opened');
+                    if (!context.mounted) return;
                     Navigator.of(context).push<void>(
                       MaterialPageRoute<void>(
                         builder: (discoveryContext) => DiscoveryPage(
@@ -258,8 +210,12 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
                 ),
                 const SizedBox(height: 12),
                 OutlinedButton.icon(
-                  onPressed: () {
+                  onPressed: () async {
+                    final btReady = await UxPrompts
+                        .promptBluetoothRequiredForTransfer(context);
+                    if (!btReady) return;
                     ConnectionLogger.instance.log('Sender Flow Opened');
+                    if (!context.mounted) return;
                     Navigator.of(context).push<void>(
                       MaterialPageRoute<void>(
                         builder: (_) => const SenderStagingPage(),
@@ -430,7 +386,15 @@ class _ConnectionLogPageState extends State<ConnectionLogPage> {
     }
     setState(() => _sharing = true);
     try {
-      await ConnectionLogger.instance.shareDisplayedLogs();
+      if (Platform.isWindows) {
+        await Clipboard.setData(ClipboardData(text: lines.join('\n')));
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Log copied to clipboard')),
+        );
+      } else {
+        await ConnectionLogger.instance.shareDisplayedLogs();
+      }
     } on PlatformException catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
