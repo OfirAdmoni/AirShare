@@ -424,6 +424,24 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
         if (mounted) {
           setState(() => _status = 'LAN ready — skipping Wi‑Fi Direct (radio save)');
         }
+      } else if (Platform.isIOS) {
+        await ConnectionLogger.instance.log(
+          'Connection | iOS sender — LAN only (no hotspot host)',
+          details: lanIp ?? 'no LAN IP',
+        );
+        if (mounted) {
+          setState(
+            () => _status = lanIp != null && lanIp.isNotEmpty
+                ? 'iOS LAN ready — starting BLE advertisement…'
+                : 'iOS cannot host an offline hotspot — connect to Wi‑Fi or use an Android/Windows sender',
+          );
+          if (lanIp == null || lanIp.isEmpty) {
+            _networkWarning =
+                'iOS cannot host an offline hotspot. Receivers on iPhone/iPad can join an Android host\'s hotspot. '
+                'iOS-to-iOS offline transfer is planned (Multipeer Connectivity). '
+                'For now, use the same Wi‑Fi network or send from Android/Windows.';
+          }
+        }
       } else if (Platform.isAndroid) {
         await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
         if (!mounted) return;

@@ -34,6 +34,17 @@ enum _GuestDiscoveryPhase {
 const String _kHotspotConnectingOverlayMessage =
     'Connecting to Hub Hotspot...\nPlease approve the system prompt.';
 
+/// Offline transfer capabilities by platform (guest + host expectations).
+const String _kOfflineTransferPlatformNote =
+    'Android can host an offline hotspot for receivers.\n'
+    'iPhone/iPad can join an Android host\'s hotspot (approve the Join Wi‑Fi prompt).\n'
+    'iOS cannot host an offline hotspot — use Send on Android or connect over the same Wi‑Fi.\n'
+  // TODO(offline-ios): iOS-to-iOS offline transfer via Multipeer Connectivity.
+    'iOS-to-iOS offline transfer: future Multipeer Connectivity support.';
+
+bool _supportsHotspotGuestJoin() =>
+    Platform.isAndroid || Platform.isIOS;
+
 class _DiscoveryPageState extends State<DiscoveryPage> {
   StreamSubscription<List<BlePeer>>? _scanSubscription;
   final List<BlePeer> _peers = [];
@@ -160,29 +171,36 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     _pulseTimer = null;
   }
 
-  /// Tier 2 only: permissions + WifiNetworkSpecifier (no TCP / Wi‑Fi probes before dialog).
+  /// Tier 2: join host hotspot (Android WifiNetworkSpecifier / iOS NEHotspotConfiguration).
   Future<void> _joinHostHotspotAp(HandshakePayload payload) async {
-    if (!Platform.isAndroid || !payload.hasHotspot) return;
+    if (!_supportsHotspotGuestJoin() || !payload.hasHotspot) return;
 
-    await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
-    if (!mounted) throw StateError('unmounted');
+    if (Platform.isAndroid) {
+      await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
+      if (!mounted) throw StateError('unmounted');
 
-    final locationGranted = await WifiTierPrerequisites.ensureFineLocationPermission(
-      context: context,
-    );
-    if (!locationGranted) {
-      throw StateError(
-        'Location permission is required to join the host Wi‑Fi network',
+      final locationGranted =
+          await WifiTierPrerequisites.ensureFineLocationPermission(
+        context: context,
       );
+      if (!locationGranted) {
+        throw StateError(
+          'Location permission is required to join the host Wi‑Fi network',
+        );
+      }
+      if (!mounted) throw StateError('unmounted');
     }
-    if (!mounted) throw StateError('unmounted');
 
     await ConnectionLogger.instance.log(
       'Connection | Tier 2 hotspot',
-      details: 'ssid_len=${payload.hotspotSsid.length}',
+      details:
+          'platform=${Platform.operatingSystem} ssid_len=${payload.hotspotSsid.length}',
     );
+    final wlanTraceLabel = Platform.isIOS
+        ? 'WLAN connect (guest → hub hotspot via NEHotspotConfiguration)'
+        : 'WLAN connect (guest → hub hotspot via WifiNetworkSpecifier)';
     await HandshakeTrace.run<void>(
-      'WLAN connect (guest → hub hotspot via WifiNetworkSpecifier)',
+      wlanTraceLabel,
       () => WlanLinkManager.instance.connectToHubWlan(
         ssid: payload.hotspotSsid,
         password: payload.hotspotPass,
@@ -210,8 +228,8 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     final port = payload.hubPort;
     final skipWifiProbe = GuestConnectionGuard.isActive;
 
-    // Android offline: join hotspot FIRST — no Wi‑Fi scans before system dialog.
-    if (Platform.isAndroid && payload.hasHotspot) {
+    // Android / iOS offline: join hotspot FIRST — no Wi‑Fi scans before system dialog.
+    if (_supportsHotspotGuestJoin() && payload.hasHotspot) {
       if (!mounted) throw StateError('unmounted');
       try {
         await _joinHostHotspotAp(payload);
@@ -567,6 +585,13 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
             Text(
               'Service UUID: $kAirShareBleServiceUuid',
               style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _kOfflineTransferPlatformNote,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
             ),
             const SizedBox(height: 8),
             Expanded(

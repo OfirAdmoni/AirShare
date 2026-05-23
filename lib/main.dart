@@ -226,6 +226,16 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
                   label: const Text('Send Files'),
                 ),
                 const SizedBox(height: 12),
+                Text(
+                  'Android can host an offline hotspot. iPhone/iPad can join an Android '
+                  'host\'s hotspot. iOS cannot host a hotspot. '
+                  'iOS-to-iOS offline: TODO (Multipeer Connectivity).',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                ),
+                const SizedBox(height: 12),
                 OutlinedButton.icon(
                   onPressed: () {
                     Navigator.of(context).push<void>(
