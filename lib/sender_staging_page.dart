@@ -102,6 +102,26 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
     }
   }
 
+  static const String _kIosLanOnlyMessage =
+      'iOS currently supports same-Wi-Fi LAN sharing only.';
+
+  Future<void> _showIosLanOnlyBlocked() async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Same Wi‑Fi required'),
+        content: const Text(_kIosLanOnlyMessage),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _notifyManualHotspotRequired() async {
     if (_hotspotDialogShown || !mounted) return;
     _hotspotDialogShown = true;
@@ -133,7 +153,7 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
   /// it is known (Android/Windows). Reduces Android↔Android races where the
   /// guest reads `:8080` or an empty endpoint before the approve dialog runs.
   Future<void> _primeBleGattEndpoint({required String ip, required int port}) async {
-    if (!Platform.isAndroid && !Platform.isWindows) return;
+    if (!Platform.isAndroid && !Platform.isWindows && !Platform.isIOS) return;
     try {
       await BleTransport.instance.updateHubEndpoint(ip: ip, port: port);
       await ConnectionLogger.instance.log(
@@ -426,21 +446,27 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
         }
       } else if (Platform.isIOS) {
         await ConnectionLogger.instance.log(
-          'Connection | iOS sender — LAN only (no hotspot host)',
+          'Connection | iOS sender — LAN only (no offline hotspot host)',
           details: lanIp ?? 'no LAN IP',
         );
         if (mounted) {
-          setState(
-            () => _status = lanIp != null && lanIp.isNotEmpty
-                ? 'iOS LAN ready — starting BLE advertisement…'
-                : 'iOS cannot host an offline hotspot — connect to Wi‑Fi or use an Android/Windows sender',
-          );
-          if (lanIp == null || lanIp.isEmpty) {
-            _networkWarning =
-                'iOS cannot host an offline hotspot. Receivers on iPhone/iPad can join an Android host\'s hotspot. '
-                'iOS-to-iOS offline transfer is planned (Multipeer Connectivity). '
-                'For now, use the same Wi‑Fi network or send from Android/Windows.';
+          setState(() {
+            _status = _kIosLanOnlyMessage;
+            _networkWarning = _kIosLanOnlyMessage;
+          });
+        }
+        if (lanIp == null || lanIp.isEmpty) {
+          await _showIosLanOnlyBlocked();
+          if (mounted) {
+            setState(() {
+              _isPreparing = false;
+              _status = _kIosLanOnlyMessage;
+            });
           }
+          return;
+        }
+        if (mounted) {
+          setState(() => _status = 'iOS LAN ready — starting BLE advertisement…');
         }
       } else if (Platform.isAndroid) {
         await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
@@ -594,6 +620,10 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
       }
 
       if (!mounted) return;
+      if (Platform.isIOS && (lanIp == null || lanIp.isEmpty)) {
+        await _showIosLanOnlyBlocked();
+        return;
+      }
       final advertiseAs = await DeviceBranding.effectiveAdvertisingName();
       setState(() => _status = 'Starting BLE advertisement…');
       await ConnectionLogger.instance.log(
@@ -603,10 +633,22 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
       await ConnectionLogger.instance.log(
         'DeviceName | BLE advertising restarted with new name: $advertiseAs',
       );
-      await BleTransport.instance.startHubAdvertising(
-        friendlyName: advertiseAs,
-      );
-      await ConnectionLogger.instance.log('BLE Advertise Result', details: 'success');
+      try {
+        await BleTransport.instance.startHubAdvertising(
+          friendlyName: advertiseAs,
+        );
+        await ConnectionLogger.instance.log('BLE Advertise Result', details: 'success');
+      } on PlatformException catch (e) {
+        await ConnectionLogger.instance.log(
+          'BLE Advertise Result',
+          details: 'failed: ${e.code} ${e.message}',
+        );
+        if (Platform.isIOS && mounted) {
+          await _showIosLanOnlyBlocked();
+          return;
+        }
+        rethrow;
+      }
 
       if (!mounted) return;
       setState(
