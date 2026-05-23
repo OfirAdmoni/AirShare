@@ -521,6 +521,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
           'Connection failed — tap ← back to search again',
         );
       }
+      if (!mounted) return;
       final message = e is PlatformException
           ? '${e.code}: ${e.message ?? e.details ?? "unknown"}'
           : e.toString();
@@ -535,8 +536,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         ),
       );
     } finally {
-      if (!mounted) return;
-      if (_phase == _GuestDiscoveryPhase.handshaking) {
+      if (mounted && _phase == _GuestDiscoveryPhase.handshaking) {
         GuestConnectionGuard.exit();
         _setPhase(_GuestDiscoveryPhase.scanning, 'Peer Discovery via BLE');
         await _startDiscovery();
