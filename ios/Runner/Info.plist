@@ -28,6 +28,10 @@
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>AirShare uses Bluetooth to discover nearby devices and exchange connection details securely.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>AirShare uses Bluetooth to discover nearby devices and exchange connection details securely.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_airshare._tcp</string>
