@@ -34,7 +34,18 @@ class ConnectionTier {
         type: InternetAddressType.IPv4,
       )) {
         final name = iface.name.toLowerCase();
-        if (!name.contains('wlan') && !name.contains('wifi')) continue;
+        if (name.contains('pdp') ||
+            name.contains('rmnet') ||
+            name.contains('wwan') ||
+            name.contains('cellular')) {
+          continue;
+        }
+        // iOS uses en0/en1 etc.; Android often uses wlan0.
+        if (!Platform.isIOS &&
+            !name.contains('wlan') &&
+            !name.contains('wifi')) {
+          continue;
+        }
         for (final addr in iface.addresses) {
           if (sameIpv4Subnet(addr.address, hostLanIp)) return true;
         }

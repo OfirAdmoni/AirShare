@@ -34,6 +34,15 @@ enum _GuestDiscoveryPhase {
 const String _kHotspotConnectingOverlayMessage =
     'Connecting to Hub Hotspot...\nPlease approve the system prompt.';
 
+/// Guest discovery hint (same-Wi-Fi focus on iOS).
+const String _kOfflineTransferPlatformNote =
+    'Same Wi‑Fi: connect to the same network, then receive from an Android or Windows sender.\n'
+    'iPhone/iPad uses LAN (lan_ip) from the BLE handshake — no hotspot join on iOS.\n'
+    'iOS Send works on the same Wi‑Fi only (offline hotspot host is not supported).';
+
+/// Offline hotspot join (Tier 2) — Android only; same-Wi-Fi iOS uses Tier 1 LAN.
+bool _supportsHotspotGuestJoin() => Platform.isAndroid;
+
 class _DiscoveryPageState extends State<DiscoveryPage> {
   StreamSubscription<List<BlePeer>>? _scanSubscription;
   final List<BlePeer> _peers = [];
@@ -160,29 +169,36 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     _pulseTimer = null;
   }
 
-  /// Tier 2 only: permissions + WifiNetworkSpecifier (no TCP / Wi‑Fi probes before dialog).
+  /// Tier 2: join host hotspot (Android WifiNetworkSpecifier / iOS NEHotspotConfiguration).
   Future<void> _joinHostHotspotAp(HandshakePayload payload) async {
-    if (!Platform.isAndroid || !payload.hasHotspot) return;
+    if (!_supportsHotspotGuestJoin() || !payload.hasHotspot) return;
 
-    await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
-    if (!mounted) throw StateError('unmounted');
+    if (Platform.isAndroid) {
+      await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
+      if (!mounted) throw StateError('unmounted');
 
-    final locationGranted = await WifiTierPrerequisites.ensureFineLocationPermission(
-      context: context,
-    );
-    if (!locationGranted) {
-      throw StateError(
-        'Location permission is required to join the host Wi‑Fi network',
+      final locationGranted =
+          await WifiTierPrerequisites.ensureFineLocationPermission(
+        context: context,
       );
+      if (!locationGranted) {
+        throw StateError(
+          'Location permission is required to join the host Wi‑Fi network',
+        );
+      }
+      if (!mounted) throw StateError('unmounted');
     }
-    if (!mounted) throw StateError('unmounted');
 
     await ConnectionLogger.instance.log(
       'Connection | Tier 2 hotspot',
-      details: 'ssid_len=${payload.hotspotSsid.length}',
+      details:
+          'platform=${Platform.operatingSystem} ssid_len=${payload.hotspotSsid.length}',
     );
+    final wlanTraceLabel = Platform.isIOS
+        ? 'WLAN connect (guest → hub hotspot via NEHotspotConfiguration)'
+        : 'WLAN connect (guest → hub hotspot via WifiNetworkSpecifier)';
     await HandshakeTrace.run<void>(
-      'WLAN connect (guest → hub hotspot via WifiNetworkSpecifier)',
+      wlanTraceLabel,
       () => WlanLinkManager.instance.connectToHubWlan(
         ssid: payload.hotspotSsid,
         password: payload.hotspotPass,
@@ -206,12 +222,78 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     return null;
   }
 
+  Future<PeerEndpoint?> _tryTier1Lan({
+    required HandshakePayload payload,
+    required int port,
+    required bool skipWifiProbe,
+  }) async {
+    if (!payload.hasLan) {
+      if (Platform.isIOS) {
+        await ConnectionLogger.instance.log(
+          'Connection | Tier 1 LAN missing',
+          details:
+              'handshake has no lan_ip — same-Wi-Fi path unavailable on iOS receiver',
+        );
+      }
+      return null;
+    }
+
+    final onSameLan = await ConnectionTier.guestOnSameLanAs(
+      payload.lanIp,
+      skipWifiProbe: skipWifiProbe,
+    );
+    if (!onSameLan) {
+      await ConnectionLogger.instance.log(
+        'Connection | Tier 1 subnet check',
+        details: Platform.isIOS
+            ? 'subnet check inconclusive for ${payload.lanIp}; probing TCP anyway'
+            : 'guest not on same subnet as ${payload.lanIp}',
+      );
+      if (!Platform.isIOS) return null;
+    }
+
+    if (!mounted) throw StateError('unmounted');
+    _setPhase(
+      _GuestDiscoveryPhase.connecting,
+      'Tier 1: Connecting over same Wi‑Fi…',
+    );
+    await ConnectionLogger.instance.log(
+      'Connection | Tier 1 LAN',
+      details: 'tier=LAN lan_ip=${payload.lanIp} hub_port=$port',
+    );
+    try {
+      final lanEndpoint = await _tryTcpConnect(payload.lanIp, port);
+      if (lanEndpoint != null) return lanEndpoint;
+      await ConnectionLogger.instance.log(
+        'Connection | Tier 1 failed',
+        details:
+            'tier=LAN lan_ip=${payload.lanIp} hub_port=$port reason=TCP probe failed (no reachable hub)',
+      );
+    } catch (e, st) {
+      await ConnectionLogger.instance.log(
+        'Connection | Tier 1 failed',
+        details:
+            'tier=LAN lan_ip=${payload.lanIp} hub_port=$port reason=${e.runtimeType}: $e',
+      );
+      debugPrint('[Discovery] Tier 1 LAN exception:\n$st');
+    }
+    return null;
+  }
+
   Future<PeerEndpoint> _connectViaTierStrategy(HandshakePayload payload) async {
     final port = payload.hubPort;
     final skipWifiProbe = GuestConnectionGuard.isActive;
 
-    // Android offline: join hotspot FIRST — no Wi‑Fi scans before system dialog.
-    if (Platform.isAndroid && payload.hasHotspot) {
+    // Tier 1 — same LAN first (Android sender → iOS/Android guest on home Wi‑Fi).
+    final lanEndpoint = await _tryTier1Lan(
+      payload: payload,
+      port: port,
+      skipWifiProbe: skipWifiProbe,
+    );
+    if (lanEndpoint != null) return lanEndpoint;
+
+    // Tier 2 — offline hotspot join (Android guest only; iOS skips NEHotspot).
+    if (_supportsHotspotGuestJoin() && payload.hasHotspot) {
       if (!mounted) throw StateError('unmounted');
       try {
         await _joinHostHotspotAp(payload);
@@ -219,45 +301,28 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         if (hotspotEndpoint != null) return hotspotEndpoint;
         await ConnectionLogger.instance.log(
           'Connection | Tier 2 TCP failed after hotspot join',
-          details: 'no hub reachable on candidate IPs',
+          details:
+              'tier=hotspot lan_ip=${payload.lanIp} hub_port=$port reason=no hub on candidate IPs',
         );
       } on PlatformException catch (e) {
         await ConnectionLogger.instance.log(
           'Connection | Tier 2 hotspot failed',
-          details: '${e.code} ${e.message}',
+          details:
+              'tier=hotspot lan_ip=${payload.lanIp} hub_port=$port reason=${e.code}: ${e.message}',
         );
       } catch (e) {
         await ConnectionLogger.instance.log(
           'Connection | Tier 2 hotspot failed',
-          details: e.toString(),
+          details:
+              'tier=hotspot lan_ip=${payload.lanIp} hub_port=$port reason=$e',
         );
       }
-    }
-
-    // Tier 1 — same LAN (primary, no P2P/hotspot radio use).
-    if (payload.hasLan) {
-      if (await ConnectionTier.guestOnSameLanAs(
-        payload.lanIp,
-        skipWifiProbe: skipWifiProbe,
-      )) {
-        if (!mounted) throw StateError('unmounted');
-        _setPhase(_GuestDiscoveryPhase.connecting, 'Tier 1: Connecting over home Wi‑Fi…');
-        await ConnectionLogger.instance.log(
-          'Connection | Tier 1 LAN',
-          details: '${payload.lanIp}:$port',
-        );
-        final lanEndpoint = await _tryTcpConnect(payload.lanIp, port);
-        if (lanEndpoint != null) return lanEndpoint;
-        await ConnectionLogger.instance.log(
-          'Connection | Tier 1 failed',
-          details: 'TCP to ${payload.lanIp}:$port',
-        );
-      } else {
-        await ConnectionLogger.instance.log(
-          'Connection | Tier 1 skipped',
-          details: 'guest not on same subnet as ${payload.lanIp}',
-        );
-      }
+    } else if (Platform.isIOS && payload.hasHotspot) {
+      await ConnectionLogger.instance.log(
+        'Connection | Tier 2 hotspot skipped',
+        details:
+            'tier=hotspot lan_ip=${payload.lanIp} hub_port=$port reason=iOS same-Wi-Fi mode (no NEHotspot join)',
+      );
     }
 
     // Tier 3 — Wi‑Fi Direct (last-resort fallback).
@@ -298,7 +363,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       }
     }
 
-    throw Exception('All connection tiers failed (Hotspot → LAN → P2P)');
+    throw Exception('All connection tiers failed (LAN → Hotspot → P2P)');
   }
 
   @override
@@ -503,6 +568,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
           'Connection failed — tap ← back to search again',
         );
       }
+      if (!mounted) return;
       final message = e is PlatformException
           ? '${e.code}: ${e.message ?? e.details ?? "unknown"}'
           : e.toString();
@@ -517,8 +583,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         ),
       );
     } finally {
-      if (!mounted) return;
-      if (_phase == _GuestDiscoveryPhase.handshaking) {
+      if (mounted && _phase == _GuestDiscoveryPhase.handshaking) {
         GuestConnectionGuard.exit();
         _setPhase(_GuestDiscoveryPhase.scanning, 'Peer Discovery via BLE');
         await _startDiscovery();
@@ -567,6 +632,13 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
             Text(
               'Service UUID: $kAirShareBleServiceUuid',
               style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _kOfflineTransferPlatformNote,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
             ),
             const SizedBox(height: 8),
             Expanded(

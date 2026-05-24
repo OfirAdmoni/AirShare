@@ -30,7 +30,7 @@ class WlanLinkManager {
     String? password,
   }) async {
     final args = <String, dynamic>{
-      if (hubPort != null) 'hubPort': hubPort,
+      'hubPort': ?hubPort,
     };
     if (Platform.isWindows) {
       args['ssid'] = ssid ?? 'AirShareLink';
@@ -46,8 +46,8 @@ class WlanLinkManager {
     required String ssid,
     required String password,
   }) async {
-    if (!_isAndroidMobile) {
-      throw UnsupportedError('connectToHubWlan is only supported on Android');
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      throw UnsupportedError('connectToHubWlan is only supported on Android and iOS');
     }
     await _channel.invokeMethod('connectToHubWlan', {
       'ssid': ssid,
