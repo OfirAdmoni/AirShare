@@ -24,11 +24,7 @@ class DiscoveryPage extends StatefulWidget {
   State<DiscoveryPage> createState() => _DiscoveryPageState();
 }
 
-enum _GuestDiscoveryPhase {
-  scanning,
-  handshaking,
-  connecting,
-}
+enum _GuestDiscoveryPhase { scanning, handshaking, connecting }
 
 /// Static label only — no phase-driven UI churn during hotspot join.
 const String _kHotspotConnectingOverlayMessage =
@@ -37,10 +33,10 @@ const String _kHotspotConnectingOverlayMessage =
 /// Guest discovery hint (same-Wi-Fi focus on iOS).
 const String _kOfflineTransferPlatformNote =
     'Same Wi‑Fi: connect to the same network, then receive from an Android or Windows sender.\n'
-    'iPhone/iPad uses LAN (lan_ip) from the BLE handshake — no hotspot join on iOS.\n'
+    'iPhone/iPad uses LAN first, then manual hotspot join if the sender advertises hotspot credentials.\n'
     'iOS Send works on the same Wi‑Fi only (offline hotspot host is not supported).';
 
-/// Offline hotspot join (Tier 2) — Android only; same-Wi-Fi iOS uses Tier 1 LAN.
+/// Offline hotspot join (Tier 2) — Android only; iOS shows manual join UI instead.
 bool _supportsHotspotGuestJoin() => Platform.isAndroid;
 
 class _DiscoveryPageState extends State<DiscoveryPage> {
@@ -74,6 +70,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       _status = status;
     });
   }
+
   Future<void> _logNetworkInterfaces() async {
     final interfaces = await NetworkInterface.list(
       includeLoopback: true,
@@ -95,7 +92,9 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       final msg = e.message.toLowerCase();
       final osMsg = e.osError?.message.toLowerCase() ?? '';
       if (msg.contains('timed out') || osMsg.contains('timed out')) return true;
-      if (e.osError?.errorCode == 110) return true; // ETIMEDOUT on Android/Linux
+      if (e.osError?.errorCode == 110) {
+        return true; // ETIMEDOUT on Android/Linux
+      }
     }
     return false;
   }
@@ -169,7 +168,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     _pulseTimer = null;
   }
 
-  /// Tier 2: join host hotspot (Android WifiNetworkSpecifier / iOS NEHotspotConfiguration).
+  /// Tier 2: join host hotspot (Android WifiNetworkSpecifier only).
   Future<void> _joinHostHotspotAp(HandshakePayload payload) async {
     if (!_supportsHotspotGuestJoin() || !payload.hasHotspot) return;
 
@@ -179,8 +178,8 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
 
       final locationGranted =
           await WifiTierPrerequisites.ensureFineLocationPermission(
-        context: context,
-      );
+            context: context,
+          );
       if (!locationGranted) {
         throw StateError(
           'Location permission is required to join the host Wi‑Fi network',
@@ -194,11 +193,8 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       details:
           'platform=${Platform.operatingSystem} ssid_len=${payload.hotspotSsid.length}',
     );
-    final wlanTraceLabel = Platform.isIOS
-        ? 'WLAN connect (guest → hub hotspot via NEHotspotConfiguration)'
-        : 'WLAN connect (guest → hub hotspot via WifiNetworkSpecifier)';
     await HandshakeTrace.run<void>(
-      wlanTraceLabel,
+      'WLAN connect (guest → hub hotspot via WifiNetworkSpecifier)',
       () => WlanLinkManager.instance.connectToHubWlan(
         ssid: payload.hotspotSsid,
         password: payload.hotspotPass,
@@ -208,7 +204,10 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     );
   }
 
-  Future<PeerEndpoint?> _probeHubAfterHotspot(HandshakePayload payload, int port) async {
+  Future<PeerEndpoint?> _probeHubAfterHotspot(
+    HandshakePayload payload,
+    int port,
+  ) async {
     final candidates = <String>[
       if (payload.hotspotHubIp.isNotEmpty) payload.hotspotHubIp,
       if (payload.p2pIp.isNotEmpty) payload.p2pIp,
@@ -220,6 +219,217 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       if (endpoint != null) return endpoint;
     }
     return null;
+  }
+
+  bool _looksLikeAndroidHotspotIp(String ip) {
+    return ip.trim().startsWith('192.168.43.');
+  }
+
+  List<({String ip, String source})> _manualHotspotCandidateIps(
+    HandshakePayload payload,
+  ) {
+    final seen = <String>{};
+    final candidates = <({String ip, String source})>[];
+
+    void add(String ip, String source) {
+      final trimmed = ip.trim();
+      if (trimmed.isEmpty || !seen.add(trimmed)) return;
+      candidates.add((ip: trimmed, source: source));
+    }
+
+    final rawHotspotHubIp = payload.rawHotspotHubIp.trim();
+    if (rawHotspotHubIp.isNotEmpty) {
+      add(rawHotspotHubIp, 'handshake.hotspot_hub_ip');
+    }
+
+    if (_looksLikeAndroidHotspotIp(payload.lanIp)) {
+      add(payload.lanIp, 'handshake.lan_ip');
+    }
+
+    if (rawHotspotHubIp.isEmpty && payload.hotspotHubIp.isNotEmpty) {
+      add(payload.hotspotHubIp, 'handshake.hubIp');
+    }
+
+    if (payload.p2pIp.isNotEmpty) {
+      add(payload.p2pIp, 'handshake.p2p_ip');
+    }
+
+    add('192.168.43.1', 'fallback.android_hotspot_gateway');
+    add('192.168.49.1', 'fallback.android_p2p_gateway');
+    add('192.168.137.1', 'fallback.windows_hotspot_gateway');
+
+    return candidates;
+  }
+
+  Future<PeerEndpoint?> _probeManualHotspotJoin(
+    HandshakePayload payload,
+    int port,
+  ) async {
+    final candidates = _manualHotspotCandidateIps(payload);
+    await ConnectionLogger.instance.log(
+      'Connection | Manual hotspot retry probe',
+      details:
+          'raw_lan_ip=${payload.lanIp} raw_hotspot_hub_ip=${payload.rawHotspotHubIp} '
+          'resolved_hotspot_hub_ip=${payload.hotspotHubIp} '
+          'candidates=${candidates.map((c) => "${c.source}:${c.ip}").join(",")} '
+          'hub_port=$port',
+    );
+    for (final candidate in candidates) {
+      await ConnectionLogger.instance.log(
+        'Connection | Manual hotspot candidate probe',
+        details: '${candidate.source} ${candidate.ip}:$port',
+      );
+      final endpoint = await _tryTcpConnect(candidate.ip, port);
+      if (endpoint != null) {
+        await ConnectionLogger.instance.log(
+          'Connection | Manual hotspot retry success',
+          details: '${candidate.source} ${endpoint.ip}:${endpoint.port}',
+        );
+        return endpoint;
+      }
+      await ConnectionLogger.instance.log(
+        'Connection | Manual hotspot candidate failed',
+        details: '${candidate.source} ${candidate.ip}:$port',
+      );
+    }
+    await ConnectionLogger.instance.log(
+      'Connection | Manual hotspot retry failed',
+      details:
+          'no hub on candidates=${candidates.map((c) => "${c.source}:${c.ip}").join(",")} '
+          'hub_port=$port',
+    );
+    return null;
+  }
+
+  Future<PeerEndpoint> _showIosManualHotspotJoinDialog(
+    HandshakePayload payload,
+    int port,
+  ) async {
+    final candidates = _manualHotspotCandidateIps(payload);
+    await ConnectionLogger.instance.log(
+      'Connection | Manual hotspot join shown',
+      details:
+          'ssid=${payload.hotspotSsid} raw_lan_ip=${payload.lanIp} '
+          'raw_hotspot_hub_ip=${payload.rawHotspotHubIp} '
+          'resolved_hotspot_hub_ip=${payload.hotspotHubIp} '
+          'candidates=${candidates.map((c) => "${c.source}:${c.ip}").join(",")} '
+          'hub_port=$port',
+    );
+    if (!mounted) throw StateError('unmounted');
+
+    final endpoint = await showDialog<PeerEndpoint>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) {
+        var retrying = false;
+        String? errorText;
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            Future<void> retry() async {
+              setDialogState(() {
+                retrying = true;
+                errorText = null;
+              });
+              final endpoint = await _probeManualHotspotJoin(payload, port);
+              if (!context.mounted) return;
+              if (endpoint != null) {
+                Navigator.of(context).pop(endpoint);
+                return;
+              }
+              setDialogState(() {
+                retrying = false;
+                errorText =
+                    'Could not reach the sender yet. Make sure this iPad is joined to '
+                    '"${payload.hotspotSsid}", then try again.';
+              });
+            }
+
+            return PopScope(
+              canPop: false,
+              child: AlertDialog(
+                title: const Text('Join sender hotspot'),
+                content: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'This sender is not reachable on your current Wi‑Fi. '
+                        'Join its hotspot manually, return to AirShare, then retry.',
+                      ),
+                      const SizedBox(height: 16),
+                      SelectableText('SSID: ${payload.hotspotSsid}'),
+                      const SizedBox(height: 8),
+                      SelectableText('Password: ${payload.hotspotPass}'),
+                      const SizedBox(height: 8),
+                      Text(
+                        'AirShare will try ${candidates.first.ip}:$port first, then gateway fallbacks.',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                      if (errorText != null) ...[
+                        const SizedBox(height: 12),
+                        Text(
+                          errorText!,
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.error,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: retrying
+                        ? null
+                        : () async {
+                            await Clipboard.setData(
+                              ClipboardData(text: payload.hotspotPass),
+                            );
+                            if (!context.mounted) return;
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Hotspot password copied'),
+                              ),
+                            );
+                          },
+                    child: const Text('Copy Password'),
+                  ),
+                  TextButton(
+                    onPressed: retrying
+                        ? null
+                        : () async {
+                            await ConnectionLogger.instance.log(
+                              'Connection | Manual hotspot open Wi-Fi settings',
+                              details: 'ssid=${payload.hotspotSsid}',
+                            );
+                            await WlanLinkManager.instance
+                                .openWirelessSettings();
+                          },
+                    child: const Text('Open Wi‑Fi Settings'),
+                  ),
+                  FilledButton(
+                    onPressed: retrying ? null : retry,
+                    child: retrying
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Text('I joined, retry'),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    if (endpoint == null) {
+      throw Exception('Manual hotspot join was cancelled');
+    }
+    return endpoint;
   }
 
   Future<PeerEndpoint?> _tryTier1Lan({
@@ -292,7 +502,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     );
     if (lanEndpoint != null) return lanEndpoint;
 
-    // Tier 2 — offline hotspot join (Android guest only; iOS skips NEHotspot).
+    // Tier 2 — offline hotspot join (Android automatic; iOS manual settings flow).
     if (_supportsHotspotGuestJoin() && payload.hasHotspot) {
       if (!mounted) throw StateError('unmounted');
       try {
@@ -318,11 +528,11 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         );
       }
     } else if (Platform.isIOS && payload.hasHotspot) {
-      await ConnectionLogger.instance.log(
-        'Connection | Tier 2 hotspot skipped',
-        details:
-            'tier=hotspot lan_ip=${payload.lanIp} hub_port=$port reason=iOS same-Wi-Fi mode (no NEHotspot join)',
+      _setPhase(
+        _GuestDiscoveryPhase.connecting,
+        'Join sender hotspot manually…',
       );
+      return _showIosManualHotspotJoinDialog(payload, port);
     }
 
     // Tier 3 — Wi‑Fi Direct (last-resort fallback).
@@ -330,7 +540,10 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       if (!mounted) throw StateError('unmounted');
       await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
       if (!mounted) throw StateError('unmounted');
-      _setPhase(_GuestDiscoveryPhase.connecting, 'Tier 3: Joining Wi‑Fi Direct group…');
+      _setPhase(
+        _GuestDiscoveryPhase.connecting,
+        'Tier 3: Joining Wi‑Fi Direct group…',
+      );
       await ConnectionLogger.instance.log(
         'Connection | Tier 3 P2P',
         details: 'mac=${payload.p2pMac}',
@@ -338,7 +551,8 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       try {
         final ownerIp = await HandshakeTrace.run<String>(
           'WLAN connect (guest → hub P2P group)',
-          () => WlanLinkManager.instance.connectToWifiDirectPeer(payload.p2pMac),
+          () =>
+              WlanLinkManager.instance.connectToWifiDirectPeer(payload.p2pMac),
           extra: 'peerMac=${payload.p2pMac}',
           hardTimeout: const Duration(seconds: 35),
         );
@@ -351,7 +565,9 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
           'Connection | Tier 3 P2P failed',
           details: '${e.code} $reason',
         );
-        final busy = reason.contains('reason=2') || e.message?.contains('reason=2') == true;
+        final busy =
+            reason.contains('reason=2') ||
+            e.message?.contains('reason=2') == true;
         if (!busy && e.code != 'p2p_timeout') {
           // Non-busy hard failure — P2P is the last resort; no further tier to try.
         }
@@ -458,7 +674,9 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
               );
             }
           }
-          if (!mounted || GuestConnectionGuard.isActive || _connectionUiLocked) {
+          if (!mounted ||
+              GuestConnectionGuard.isActive ||
+              _connectionUiLocked) {
             return;
           }
           setState(() {
@@ -505,7 +723,10 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
 
   Future<void> _lockUiForConnection() async {
     _pauseDiscoverySideEffects();
-    _setPhase(_GuestDiscoveryPhase.connecting, _kHotspotConnectingOverlayMessage);
+    _setPhase(
+      _GuestDiscoveryPhase.connecting,
+      _kHotspotConnectingOverlayMessage,
+    );
     await _scanSubscription?.cancel();
     _scanSubscription = null;
     try {
@@ -517,14 +738,17 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     GuestConnectionGuard.enter();
     _pauseDiscoverySideEffects();
     try {
-      _setPhase(_GuestDiscoveryPhase.handshaking, _kHotspotConnectingOverlayMessage);
+      _setPhase(
+        _GuestDiscoveryPhase.handshaking,
+        _kHotspotConnectingOverlayMessage,
+      );
 
       await ConnectionLogger.instance.log(
         'BLE | Handshake sequence start',
         details: 'peer=${peer.friendlyName} (${peer.id})',
       );
-      final handshakePayload =
-          await BleTransport.instance.establishSecureHandshake(peer);
+      final handshakePayload = await BleTransport.instance
+          .establishSecureHandshake(peer);
       await ConnectionLogger.instance.log(
         'HS | ServerHello payload (BLE JSON, log-safe)',
         details: handshakePayload.describeForLog(),
@@ -595,9 +819,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   Widget build(BuildContext context) {
     if (_connectionUiLocked) {
       return Scaffold(
-        appBar: AppBar(
-          leading: const BackButton(),
-        ),
+        appBar: AppBar(leading: const BackButton()),
         body: const SafeArea(
           child: Center(
             child: Padding(
@@ -637,8 +859,8 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
             Text(
               _kOfflineTransferPlatformNote,
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 8),
             Expanded(
@@ -650,7 +872,10 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                           AnimatedScale(
                             scale: _pulseScale,
                             duration: const Duration(milliseconds: 500),
-                            child: const Icon(Icons.bluetooth_searching, size: 42),
+                            child: const Icon(
+                              Icons.bluetooth_searching,
+                              size: 42,
+                            ),
                           ),
                           const SizedBox(height: 8),
                           Text(
@@ -675,7 +900,9 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                                 ? 'Transfer hub • $kAirShareBleServiceUuid'
                                 : 'UUID ${peer.serviceUuid}',
                           ),
-                          onTap: _connectionUiLocked ? null : () => _selectPeer(peer),
+                          onTap: _connectionUiLocked
+                              ? null
+                              : () => _selectPeer(peer),
                         );
                       },
                     ),
