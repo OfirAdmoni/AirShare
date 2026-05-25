@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:io';
@@ -40,13 +41,15 @@ class _AirShareAppState extends State<AirShareApp> {
         return null;
       }
       final args = call.arguments as Map<dynamic, dynamic>? ?? {};
-      final friendlyName = (args['friendlyName'] ?? 'Unknown Device').toString();
+      final friendlyName = (args['friendlyName'] ?? 'Unknown Device')
+          .toString();
       await ConnectionLogger.instance.log(
         'Connection Request Prompted',
         details: 'peer=$friendlyName',
       );
+      if (!mounted) return null;
       final ctx = _navigatorKey.currentContext;
-      if (ctx == null) return null;
+      if (ctx == null || !ctx.mounted) return null;
       final approved = await showDialog<bool>(
         context: ctx,
         barrierDismissible: false,
@@ -152,9 +155,7 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
             icon: const Icon(Icons.settings_outlined),
             onPressed: () {
               Navigator.of(context).push<void>(
-                MaterialPageRoute<void>(
-                  builder: (_) => const SettingsPage(),
-                ),
+                MaterialPageRoute<void>(builder: (_) => const SettingsPage()),
               );
             },
           ),
@@ -171,8 +172,10 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
               children: [
                 ElevatedButton.icon(
                   onPressed: () async {
-                    final btReady = await UxPrompts
-                        .promptBluetoothRequiredForTransfer(context);
+                    final btReady =
+                        await UxPrompts.promptBluetoothRequiredForTransfer(
+                          context,
+                        );
                     if (!btReady) return;
                     ConnectionLogger.instance.log('Receiver Flow Opened');
                     if (!context.mounted) return;
@@ -180,16 +183,19 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
                       MaterialPageRoute<void>(
                         builder: (discoveryContext) => DiscoveryPage(
                           onEndpointReady: (endpoint) async {
+                            if (!discoveryContext.mounted) return;
+                            final n = FileZoneSessionScope.of(discoveryContext);
+                            final navigator = Navigator.of(discoveryContext);
                             await ConnectionLogger.instance.log(
                               'Connection | Triggering auto-connect',
                               details: 'hub=${endpoint.ip}:${endpoint.port}',
                             );
-                            final n = FileZoneSessionScope.of(discoveryContext);
+                            if (!navigator.mounted) return;
                             n.value = FileZoneSession(
                               hubHost: endpoint.ip,
                               hubPort: endpoint.port,
                             );
-                            await Navigator.of(discoveryContext).push<void>(
+                            await navigator.push<void>(
                               MaterialPageRoute<void>(
                                 builder: (_) => FileListScreen(
                                   hubHost: endpoint.ip,
@@ -211,8 +217,10 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
                 const SizedBox(height: 12),
                 OutlinedButton.icon(
                   onPressed: () async {
-                    final btReady = await UxPrompts
-                        .promptBluetoothRequiredForTransfer(context);
+                    final btReady =
+                        await UxPrompts.promptBluetoothRequiredForTransfer(
+                          context,
+                        );
                     if (!btReady) return;
                     ConnectionLogger.instance.log('Sender Flow Opened');
                     if (!context.mounted) return;
@@ -232,8 +240,8 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
                   'iOS-to-iOS offline: TODO (Multipeer Connectivity).',
                   textAlign: TextAlign.center,
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: Theme.of(context).colorScheme.onSurfaceVariant,
-                      ),
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
                 ),
                 const SizedBox(height: 12),
                 OutlinedButton.icon(
@@ -277,7 +285,9 @@ class ManualConnectionPage extends StatefulWidget {
 
 class _ManualConnectionPageState extends State<ManualConnectionPage> {
   final TextEditingController _ipController = TextEditingController();
-  final TextEditingController _portController = TextEditingController(text: '8080');
+  final TextEditingController _portController = TextEditingController(
+    text: '8080',
+  );
   bool _connecting = false;
 
   @override
@@ -308,22 +318,36 @@ class _ManualConnectionPageState extends State<ManualConnectionPage> {
         timeout: const Duration(seconds: 3),
       );
       await socket.close();
-      await ConnectionLogger.instance.log('Socket Connection Success', details: '$ip:$port');
-    } catch (e) {
-      await ConnectionLogger.instance.log('Socket Connection Failed', details: e.toString());
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Connection check failed: $e')),
+      await ConnectionLogger.instance.log(
+        'Socket Connection Success',
+        details: '$ip:$port',
       );
+    } catch (e) {
+      await ConnectionLogger.instance.log(
+        'Socket Connection Failed',
+        details: e.toString(),
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Connection check failed: $e')));
       setState(() => _connecting = false);
       return;
     }
 
     if (!mounted) return;
     final notifier = FileZoneSessionScope.of(context);
+    final navigator = Navigator.of(context);
     notifier.value = FileZoneSession(hubHost: ip, hubPort: port);
-    await ConnectionLogger.instance.log('Manual Session Initialized', details: '$ip:$port');
-    await Navigator.of(context).push<void>(
+    await ConnectionLogger.instance.log(
+      'Manual Session Initialized',
+      details: '$ip:$port',
+    );
+    if (!navigator.mounted) {
+      notifier.value = null;
+      return;
+    }
+    await navigator.push<void>(
       MaterialPageRoute<void>(
         builder: (_) => FileListScreen(
           hubHost: ip,
@@ -385,15 +409,35 @@ class ConnectionLogPage extends StatefulWidget {
 class _ConnectionLogPageState extends State<ConnectionLogPage> {
   bool _clearing = false;
   bool _sharing = false;
+  bool _returningToMainMenu = false;
+
+  @override
+  void dispose() {
+    unawaited(ConnectionLogger.instance.log('Logs | Screen disposed'));
+    super.dispose();
+  }
+
+  Future<void> _returnToMainMenu() async {
+    if (_returningToMainMenu) return;
+    _returningToMainMenu = true;
+    await ConnectionLogger.instance.log('Logs | Return to main menu requested');
+    if (!mounted) return;
+    Navigator.of(context).popUntil((route) => route.isFirst);
+    await ConnectionLogger.instance.log(
+      'Navigation | Return to main menu completed',
+      details: 'from=logs',
+    );
+  }
 
   Future<void> _shareLogs() async {
     final lines = ConnectionLogger.instance.entries.value;
     if (lines.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No logs to share')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('No logs to share')));
       return;
     }
+    if (!mounted) return;
     setState(() => _sharing = true);
     try {
       if (Platform.isWindows) {
@@ -416,13 +460,14 @@ class _ConnectionLogPageState extends State<ConnectionLogPage> {
   }
 
   Future<void> _clearLogs() async {
+    if (!mounted) return;
     setState(() => _clearing = true);
     try {
       await ConnectionLogger.instance.clear();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Logs cleared')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Logs cleared')));
     } finally {
       if (mounted) setState(() => _clearing = false);
     }
@@ -430,43 +475,59 @@ class _ConnectionLogPageState extends State<ConnectionLogPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Connection Audit Log'),
-        actions: [
-          IconButton(
-            tooltip: 'Share Logs',
-            onPressed: _sharing || _clearing ? null : _shareLogs,
-            icon: _sharing
-                ? const SizedBox(
-                    width: 24,
-                    height: 24,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.share_outlined),
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        unawaited(_returnToMainMenu());
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          leading: IconButton(
+            tooltip: 'Back to Main Menu',
+            icon: const Icon(Icons.arrow_back),
+            onPressed: _returningToMainMenu ? null : _returnToMainMenu,
           ),
-          IconButton(
-            tooltip: 'Clear Logs',
-            onPressed: _clearing || _sharing ? null : _clearLogs,
-            icon: const Icon(Icons.delete_outline),
-          ),
-        ],
-      ),
-      body: ValueListenableBuilder<List<String>>(
-        valueListenable: ConnectionLogger.instance.entries,
-        builder: (context, lines, _) {
-          if (lines.isEmpty) {
-            return const Center(child: Text('No logs yet'));
-          }
-          return ListView.builder(
-            padding: const EdgeInsets.all(12),
-            itemCount: lines.length,
-            itemBuilder: (context, index) => Padding(
-              padding: const EdgeInsets.symmetric(vertical: 3),
-              child: Text(lines[index], style: const TextStyle(fontSize: 12)),
+          title: const Text('Connection Audit Log'),
+          actions: [
+            IconButton(
+              tooltip: 'Share Logs',
+              onPressed: _sharing || _clearing || _returningToMainMenu
+                  ? null
+                  : _shareLogs,
+              icon: _sharing
+                  ? const SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.share_outlined),
             ),
-          );
-        },
+            IconButton(
+              tooltip: 'Clear Logs',
+              onPressed: _clearing || _sharing || _returningToMainMenu
+                  ? null
+                  : _clearLogs,
+              icon: const Icon(Icons.delete_outline),
+            ),
+          ],
+        ),
+        body: ValueListenableBuilder<List<String>>(
+          valueListenable: ConnectionLogger.instance.entries,
+          builder: (context, lines, _) {
+            if (lines.isEmpty) {
+              return const Center(child: Text('No logs yet'));
+            }
+            return ListView.builder(
+              padding: const EdgeInsets.all(12),
+              itemCount: lines.length,
+              itemBuilder: (context, index) => Padding(
+                padding: const EdgeInsets.symmetric(vertical: 3),
+                child: Text(lines[index], style: const TextStyle(fontSize: 12)),
+              ),
+            );
+          },
+        ),
       ),
     );
   }

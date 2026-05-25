@@ -26,6 +26,10 @@ class DiscoveryPage extends StatefulWidget {
 
 enum _GuestDiscoveryPhase { scanning, handshaking, connecting }
 
+class _ManualHotspotFlowCancelled implements Exception {
+  const _ManualHotspotFlowCancelled();
+}
+
 /// Static label only — no phase-driven UI churn during hotspot join.
 const String _kHotspotConnectingOverlayMessage =
     'Connecting to Hub Hotspot...\nPlease approve the system prompt.';
@@ -47,6 +51,8 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   String _status = 'Peer Discovery via BLE';
   double _pulseScale = 1.0;
   Timer? _pulseTimer;
+  bool _leavingForMainMenu = false;
+  int _manualProbeGeneration = 0;
 
   bool get _connectionUiLocked =>
       _phase == _GuestDiscoveryPhase.handshaking ||
@@ -100,6 +106,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   }
 
   Future<PeerEndpoint?> _tryTcpConnect(String ip, int port) async {
+    if (_leavingForMainMenu) return null;
     try {
       await HandshakeTrace.run<void>(
         'TCP verify (guest → hub HTTP port)',
@@ -114,6 +121,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         extra: '$ip:$port',
         hardTimeout: const Duration(seconds: 14),
       );
+      if (_leavingForMainMenu) return null;
       await ConnectionLogger.instance.log(
         'Socket Connection Success',
         details: '$ip:$port',
@@ -153,6 +161,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         extra: '$gateway:$port',
         hardTimeout: const Duration(seconds: 14),
       );
+      if (_leavingForMainMenu) return null;
       await ConnectionLogger.instance.log(
         'Socket Connection Success',
         details: 'gateway $gateway:$port',
@@ -265,6 +274,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     HandshakePayload payload,
     int port,
   ) async {
+    final probeGeneration = _manualProbeGeneration;
     final candidates = _manualHotspotCandidateIps(payload);
     await ConnectionLogger.instance.log(
       'Connection | Manual hotspot retry probe',
@@ -275,11 +285,25 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
           'hub_port=$port',
     );
     for (final candidate in candidates) {
+      if (_leavingForMainMenu || probeGeneration != _manualProbeGeneration) {
+        await ConnectionLogger.instance.log(
+          'Connection | Manual hotspot retry abandoned',
+          details: 'navigation changed before ${candidate.ip}:$port',
+        );
+        return null;
+      }
       await ConnectionLogger.instance.log(
         'Connection | Manual hotspot candidate probe',
         details: '${candidate.source} ${candidate.ip}:$port',
       );
       final endpoint = await _tryTcpConnect(candidate.ip, port);
+      if (_leavingForMainMenu || probeGeneration != _manualProbeGeneration) {
+        await ConnectionLogger.instance.log(
+          'Connection | Manual hotspot retry abandoned',
+          details: 'navigation changed after ${candidate.ip}:$port',
+        );
+        return null;
+      }
       if (endpoint != null) {
         await ConnectionLogger.instance.log(
           'Connection | Manual hotspot retry success',
@@ -299,6 +323,38 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
           'hub_port=$port',
     );
     return null;
+  }
+
+  Future<void> _returnToMainMenuFromManualHotspot(
+    BuildContext dialogContext,
+  ) async {
+    if (_leavingForMainMenu) return;
+    _leavingForMainMenu = true;
+    _manualProbeGeneration++;
+    await ConnectionLogger.instance.log(
+      'Connection | Manual hotspot flow cancelled',
+      details: 'user requested return to main menu',
+    );
+    _seenPeers.clear();
+    _peers.clear();
+    if (mounted) {
+      setState(() {
+        _phase = _GuestDiscoveryPhase.scanning;
+        _status = 'Peer Discovery via BLE';
+      });
+    }
+    await _stopDiscovery(userNavigation: true);
+    GuestConnectionGuard.reset();
+
+    if (dialogContext.mounted) {
+      Navigator.of(dialogContext, rootNavigator: true).pop(null);
+    }
+    if (!mounted) return;
+    Navigator.of(context).popUntil((route) => route.isFirst);
+    await ConnectionLogger.instance.log(
+      'Navigation | Return to main menu completed',
+      details: 'from=manual_hotspot_join',
+    );
   }
 
   Future<PeerEndpoint> _showIosManualHotspotJoinDialog(
@@ -380,6 +436,11 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                 ),
                 actions: [
                   TextButton(
+                    onPressed: () =>
+                        _returnToMainMenuFromManualHotspot(context),
+                    child: const Text('Cancel and Try Again'),
+                  ),
+                  TextButton(
                     onPressed: retrying
                         ? null
                         : () async {
@@ -427,7 +488,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     );
 
     if (endpoint == null) {
-      throw Exception('Manual hotspot join was cancelled');
+      throw const _ManualHotspotFlowCancelled();
     }
     return endpoint;
   }
@@ -586,13 +647,19 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   void initState() {
     super.initState();
     _startPulseAnimation();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _startDiscovery());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && !_leavingForMainMenu) {
+        _startDiscovery();
+      }
+    });
   }
 
   @override
   void dispose() {
+    _leavingForMainMenu = true;
+    _manualProbeGeneration++;
     GuestConnectionGuard.reset();
-    _stopDiscovery();
+    unawaited(_stopDiscovery(userNavigation: true));
     _pulseTimer?.cancel();
     super.dispose();
   }
@@ -645,6 +712,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   }
 
   Future<void> _startDiscovery() async {
+    if (_leavingForMainMenu) return;
     if (GuestConnectionGuard.isActive || _connectionUiLocked) {
       debugPrint(
         '[Discovery] Ignoring _startDiscovery — connection in progress '
@@ -656,11 +724,12 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       if (!Platform.isWindows) {
         await _ensureAndroidLocationForBle();
       }
-      if (!mounted) return;
+      if (!mounted || _leavingForMainMenu) return;
 
       await _logNetworkInterfaces();
       await ConnectionLogger.instance.log('BLE Scan Start');
       await BleTransport.instance.startScanning();
+      if (!mounted || _leavingForMainMenu) return;
       _scanSubscription?.cancel();
       _seenPeers.clear();
       _scanSubscription = BleTransport.instance.scanPeers().listen(
@@ -708,12 +777,29 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     }
   }
 
-  Future<void> _stopDiscovery() async {
-    await BleTransport.instance.stopScanning();
+  Future<void> _stopDiscovery({bool userNavigation = false}) async {
+    if (userNavigation) {
+      _pulseTimer?.cancel();
+      _pulseTimer = null;
+    }
     await _scanSubscription?.cancel();
     _scanSubscription = null;
+    try {
+      await BleTransport.instance.stopScanning();
+      if (userNavigation) {
+        await ConnectionLogger.instance.log(
+          'Discovery | Stopped by user navigation',
+        );
+      }
+    } catch (e) {
+      await ConnectionLogger.instance.log(
+        'Discovery | Stop scanning failed',
+        details: '$e',
+      );
+    }
 
     if (mounted &&
+        !userNavigation &&
         !GuestConnectionGuard.isActive &&
         !_connectionUiLocked &&
         _phase == _GuestDiscoveryPhase.scanning) {
@@ -731,7 +817,12 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     _scanSubscription = null;
     try {
       await BleTransport.instance.stopScanning();
-    } catch (_) {}
+    } catch (e) {
+      await ConnectionLogger.instance.log(
+        'Discovery | Stop scanning failed',
+        details: '$e',
+      );
+    }
   }
 
   Future<void> _selectPeer(BlePeer peer) async {
@@ -774,6 +865,13 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         await _startDiscovery();
       }
     } catch (e, st) {
+      if (e is _ManualHotspotFlowCancelled || _leavingForMainMenu) {
+        await ConnectionLogger.instance.log(
+          'Connection | Manual hotspot flow ended',
+          details: 'returned to main menu',
+        );
+        return;
+      }
       await ConnectionLogger.instance.log(
         'Handshake Failure',
         details: '${e.runtimeType}: $e',
@@ -807,7 +905,9 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         ),
       );
     } finally {
-      if (mounted && _phase == _GuestDiscoveryPhase.handshaking) {
+      if (!_leavingForMainMenu &&
+          mounted &&
+          _phase == _GuestDiscoveryPhase.handshaking) {
         GuestConnectionGuard.exit();
         _setPhase(_GuestDiscoveryPhase.scanning, 'Peer Discovery via BLE');
         await _startDiscovery();
