@@ -34,6 +34,8 @@ class HandshakePayload {
     this.hotspotSsid = '',
     this.hotspotPass = '',
     this.hotspotHubIp = '',
+    this.rawHotspotHubIp = '',
+    this.legacyHubIp = '',
     this.hubPort = 8080,
   });
 
@@ -42,8 +44,11 @@ class HandshakePayload {
   final String p2pMac;
   final String hotspotSsid;
   final String hotspotPass;
+
   /// Hub IPv4 on the hotspot interface (tier 3).
   final String hotspotHubIp;
+  final String rawHotspotHubIp;
+  final String legacyHubIp;
   final int hubPort;
 
   /// Legacy primary hub IP (LAN preferred, then hotspot, then P2P).
@@ -81,6 +86,8 @@ class HandshakePayload {
       hotspotSsid: hotspotSsid,
       hotspotPass: (map['hotspot_pass'] ?? map['password'] ?? '').toString(),
       hotspotHubIp: hotspotHubIp,
+      rawHotspotHubIp: hotspotHubRaw,
+      legacyHubIp: legacyHub,
       hubPort: port,
     );
   }
@@ -91,21 +98,17 @@ class HandshakePayload {
 }
 
 class PeerEndpoint {
-  const PeerEndpoint({
-    required this.ip,
-    required this.port,
-  });
+  const PeerEndpoint({required this.ip, required this.port});
 
   final String ip;
   final int port;
 
   factory PeerEndpoint.fromMap(Map<dynamic, dynamic> map) {
     final portRaw = map['port'];
-    final port = portRaw is int ? portRaw : int.tryParse('${portRaw ?? ''}') ?? 8080;
-    return PeerEndpoint(
-      ip: (map['ip'] ?? '').toString(),
-      port: port,
-    );
+    final port = portRaw is int
+        ? portRaw
+        : int.tryParse('${portRaw ?? ''}') ?? 8080;
+    return PeerEndpoint(ip: (map['ip'] ?? '').toString(), port: port);
   }
 }
 
@@ -137,8 +140,12 @@ class BleTransport {
 
   /// Android and Windows: whether the Bluetooth adapter is powered on.
   Future<bool> isBluetoothEnabled() async {
-    if (!Platform.isAndroid && !Platform.isWindows) return true;
-    final enabled = await _methodChannel.invokeMethod<bool>('isBluetoothEnabled');
+    if (!Platform.isAndroid && !Platform.isWindows && !Platform.isIOS) {
+      return true;
+    }
+    final enabled = await _methodChannel.invokeMethod<bool>(
+      'isBluetoothEnabled',
+    );
     return enabled ?? false;
   }
 
@@ -155,7 +162,7 @@ class BleTransport {
   /// Android: navigates to Settings.ACTION_BLUETOOTH_SETTINGS.
   /// Windows: opens ms-settings:bluetooth.
   Future<void> openBluetoothSettings() async {
-    if (Platform.isAndroid) {
+    if (Platform.isAndroid || Platform.isIOS) {
       await _methodChannel.invokeMethod<void>('openBluetoothSettings');
     } else if (Platform.isWindows) {
       await Process.run('cmd', ['/c', 'start', 'ms-settings:bluetooth']);
@@ -228,10 +235,7 @@ class BleTransport {
       () async {
         final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
           'establishSecureHandshake',
-          {
-            'peerId': peer.id,
-            'serviceUuid': peer.serviceUuid,
-          },
+          {'peerId': peer.id, 'serviceUuid': peer.serviceUuid},
         );
         if (raw == null) {
           throw Exception('Secure handshake returned empty payload');
@@ -250,10 +254,7 @@ class BleTransport {
       () async {
         final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
           'readPeerEndpoint',
-          {
-            'peerId': peer.id,
-            'serviceUuid': peer.serviceUuid,
-          },
+          {'peerId': peer.id, 'serviceUuid': peer.serviceUuid},
         );
         if (raw == null) {
           throw Exception('Peer endpoint read returned empty payload');
@@ -270,19 +271,18 @@ class BleTransport {
     required String ip,
     required int port,
   }) async {
-    await _methodChannel.invokeMethod(
-      'updateHubEndpoint',
-      {
-        'ip': ip,
-        'port': port,
-      },
-    );
+    await _methodChannel.invokeMethod('updateHubEndpoint', {
+      'ip': ip,
+      'port': port,
+    });
   }
 
   /// Local BLE peer id (Android BT address when available, else stable persisted id).
   Future<String> getLocalPeerId() async {
-    if (!Platform.isAndroid && !Platform.isWindows) {
-      throw UnsupportedError('getLocalPeerId is only supported on Android and Windows');
+    if (!Platform.isAndroid && !Platform.isWindows && !Platform.isIOS) {
+      throw UnsupportedError(
+        'getLocalPeerId is only supported on Android, iOS, and Windows',
+      );
     }
     final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
       'getLocalPeerId',
