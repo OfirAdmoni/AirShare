@@ -384,22 +384,46 @@ void FlutterWindow::StartBleScanning(
                                                      auto&&,
                                                      const BluetoothLEAdvertisementReceivedEventArgs&
                                                          args) {
+      const auto bt_addr = args.BluetoothAddress();
+
+      // Collect service UUIDs (present in primary advertisements, absent in
+      // scan responses — Android puts the device name in the scan response).
       std::vector<winrt::guid> uuids;
       for (const auto& uuid : args.Advertisement().ServiceUuids()) {
         uuids.push_back(uuid);
       }
-      if (!IsAirShareService(uuids)) {
-        return;
-      }
-      const auto bt_addr = args.BluetoothAddress();
-      std::stringstream id_stream;
-      id_stream << bt_addr;
-      const std::string peer_id = id_stream.str();
+
+      const bool is_known_peer =
+          (discovered_peers_.find(bt_addr) != discovered_peers_.end());
+
+      // Unknown device with no AirShare service UUID → not our peer, skip.
+      if (!IsAirShareService(uuids) && !is_known_peer) return;
+
       const std::string friendly_name =
           WinrtStringToUtf8(args.Advertisement().LocalName());
-      discovered_peers_[bt_addr] = {
-          peer_id, friendly_name.empty() ? "Nearby peer" : friendly_name};
-      PublishDiscoveredPeers();
+
+      if (is_known_peer) {
+        // Scan-response (or repeat advertisement): update the stored name only
+        // when we actually received one — never overwrite a good name with "".
+        if (!friendly_name.empty() &&
+            discovered_peers_[bt_addr].second != friendly_name) {
+          OutputDebugStringW(
+              (L"[AirShareNative] Peer name resolved from scan response: " +
+               std::wstring(friendly_name.begin(), friendly_name.end()) + L"\n")
+                  .c_str());
+          discovered_peers_[bt_addr].second = friendly_name;
+          PublishDiscoveredPeers();
+        }
+      } else {
+        // First sighting via primary advertisement.
+        std::stringstream id_stream;
+        id_stream << bt_addr;
+        const std::string peer_id = id_stream.str();
+        discovered_peers_[bt_addr] = {
+            peer_id,
+            friendly_name.empty() ? "AirShare Device" : friendly_name};
+        PublishDiscoveredPeers();
+      }
     });
 
     watcher_stopped_token_ = g_watcher.Stopped(
@@ -930,11 +954,16 @@ void FlutterWindow::StartHubAdvertising(
       if (friendly_u8.empty()) {
         friendly_u8 = "Windows";
       }
+      // Store the FULL resolved name for injection into the GATT handshake
+      // payload — this is how the receiver learns the correct custom name,
+      // because WinRT GattServiceProviderAdvertisingParameters has no API for
+      // setting the BLE local name (the OS always uses the computer name).
+      pending_friendly_name_ = friendly_u8;
+
+      // PDU size check: WinRT uses the OS BT device name for the scan
+      // response, not our friendly_u8, so this is informational only.
       winrt::hstring h_label = winrt::to_hstring(friendly_u8);
       std::wstring wname(h_label.c_str());
-      if (wname.size() > 10) {
-        wname.resize(10);
-      }
       while (wname.size() > 1) {
         const std::string u8 =
             WinrtStringToUtf8(winrt::hstring(wname.c_str()));
@@ -949,23 +978,17 @@ void FlutterWindow::StartHubAdvertising(
                         : WinrtStringToUtf8(winrt::hstring(wname.c_str()));
       const int scan_ad_estimate =
           u8_final.empty() ? 0 : static_cast<int>(2 + u8_final.size());
-      if (scan_ad_estimate > kBleAdvPduMax) {
-        OutputDebugStringW(
-            L"[AirShareNative] BLE scan-response name still too large; refusing StartAdvertising.\n");
-        StopHubAdvertisingInternal();
-        result->Error("ble_adv_oversize",
-                      "BLE scan response would exceed 31 bytes; shorten the device name.");
-        return;
-      }
       const std::wstring wlog =
-          L"[AirShareNative] BLE adv verify: primary~" +
-          std::to_wstring(kPrimaryFlagsAnd128UuidEstimate) + L"B (flags+service UUID), scan~" +
-          std::to_wstring(scan_ad_estimate) + L"B (Flutter/local name, truncated for PDU), max PDU=" +
-          std::to_wstring(kBleAdvPduMax) + L"\n";
+          L"[AirShareNative] BLE adv: friendly_name=\"" +
+          std::wstring(h_label.c_str()) +
+          L"\", scan_response_name=<OS BT device name>, scan_est~" +
+          std::to_wstring(scan_ad_estimate) + L"B, primary~" +
+          std::to_wstring(kPrimaryFlagsAnd128UuidEstimate) +
+          L"B (flags+service UUID)\n";
       OutputDebugStringW(wlog.c_str());
     } catch (...) {
       OutputDebugStringW(
-          L"[AirShareNative] BLE adv verify: name check failed; continuing with StartAdvertising.\n");
+          L"[AirShareNative] BLE adv verify: name check skipped.\n");
     }
 
     GattServiceProviderAdvertisingParameters adv_params;
@@ -1160,8 +1183,11 @@ void FlutterWindow::ClearPendingReadState() {
 winrt::Windows::Storage::Streams::IBuffer FlutterWindow::BuildHandshakeBuffer() const {
   std::ostringstream oss;
   oss << "{\"ssid\":\"" << pending_ssid_ << "\",\"password\":\"" << pending_password_
-      << "\",\"hubIp\":\"" << pending_hub_ip_ << "\",\"hubPort\":" << pending_hub_port_
-      << "}";
+      << "\",\"hubIp\":\"" << pending_hub_ip_ << "\",\"hubPort\":" << pending_hub_port_;
+  if (!pending_friendly_name_.empty()) {
+    oss << ",\"friendly_name\":\"" << pending_friendly_name_ << "\"";
+  }
+  oss << "}";
   const std::string json = oss.str();
   winrt::Windows::Storage::Streams::DataWriter writer;
   writer.WriteString(winrt::to_hstring(json));

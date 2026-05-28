@@ -108,6 +108,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private var pendingLanIp: String = ""
     private var pendingP2pIp: String = ""
     private var pendingHotspotHubIp: String = ""
+    private var pendingFriendlyName: String = ""
     /// True only after LocalOnlyHotspotCallback.onStarted — gates BLE hotspot fields.
     private var hotspotActive = false
 
@@ -723,6 +724,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             "hotspot_pass" to json.optString("hotspot_pass", json.optString("password", "")),
             "hotspot_hub_ip" to json.optString("hotspot_hub_ip", ""),
             "hub_port" to json.optInt("hub_port", json.optInt("hubPort", 8080)),
+            "friendly_name" to json.optString("friendly_name", ""),
         )
     }
 
@@ -807,6 +809,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 put("password", password)
             }
             if (p2pMac.isNotBlank()) put("p2pMac", p2pMac)
+            if (pendingFriendlyName.isNotBlank()) put("friendly_name", pendingFriendlyName)
         }.toString()
         Log.i(
             "AirShareNative",
@@ -1040,12 +1043,13 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             Build.PRODUCT.trim().ifBlank { "Android" }
         }
         val baseName = if (fromFlutter.isNotEmpty()) fromFlutter else modelFallback
+        pendingFriendlyName = baseName
         if (pendingHubIp != null && pendingHubIp!!.isNotBlank()) {
             advertisedEndpoint = "${pendingHubIp}:${pendingHubPort}"
         }
-        var broadcastLabel = baseName.take(10).trim()
+        var broadcastLabel = baseName.trim()
         if (broadcastLabel.isEmpty()) {
-            broadcastLabel = modelFallback.take(10).trim().ifEmpty { "?" }
+            broadcastLabel = modelFallback.trim().ifEmpty { "?" }
         }
         while (broadcastLabel.toByteArray(StandardCharsets.UTF_8).size > 29) {
             broadcastLabel = broadcastLabel.dropLast(1)

@@ -37,6 +37,7 @@ class HandshakePayload {
     this.rawHotspotHubIp = '',
     this.legacyHubIp = '',
     this.hubPort = 8080,
+    this.friendlyName = '',
   });
 
   final String lanIp;
@@ -50,6 +51,9 @@ class HandshakePayload {
   final String rawHotspotHubIp;
   final String legacyHubIp;
   final int hubPort;
+
+  /// Sender's display name from Settings, embedded in the GATT handshake.
+  final String friendlyName;
 
   /// Legacy primary hub IP (LAN preferred, then hotspot, then P2P).
   String get hubIp {
@@ -89,12 +93,14 @@ class HandshakePayload {
       rawHotspotHubIp: hotspotHubRaw,
       legacyHubIp: legacyHub,
       hubPort: port,
+      friendlyName: (map['friendly_name'] ?? '').toString(),
     );
   }
 
   String describeForLog() =>
       'lan_ip=$lanIp p2p_ip=$p2pIp p2p_mac_present=${p2pMac.isNotEmpty} '
-      'hotspot_present=${hotspotSsid.isNotEmpty} hub_port=$hubPort';
+      'hotspot_present=${hotspotSsid.isNotEmpty} hub_port=$hubPort'
+      '${friendlyName.isNotEmpty ? " friendly_name=$friendlyName" : ""}';
 }
 
 class PeerEndpoint {

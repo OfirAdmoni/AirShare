@@ -54,6 +54,20 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   bool _leavingForMainMenu = false;
   int _manualProbeGeneration = 0;
 
+  /// Name shown in the connecting overlay; set when the user taps a peer and
+  /// updated once the GATT handshake resolves the full custom name.
+  String _connectingPeerName = '';
+
+  /// Strips raw BLE fallbacks ("Nearby peer", "Unknown Peer") so the user
+  /// always sees a friendly label instead of an internal default.
+  static String _cleanDisplayName(String rawName) {
+    final name = rawName.trim();
+    if (name.isEmpty || name == 'Nearby peer' || name == 'Unknown Peer') {
+      return 'AirShare Device';
+    }
+    return name;
+  }
+
   bool get _connectionUiLocked =>
       _phase == _GuestDiscoveryPhase.handshaking ||
       _phase == _GuestDiscoveryPhase.connecting;
@@ -829,14 +843,19 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     GuestConnectionGuard.enter();
     _pauseDiscoverySideEffects();
     try {
-      _setPhase(
-        _GuestDiscoveryPhase.handshaking,
-        _kHotspotConnectingOverlayMessage,
-      );
+      // Set the connecting peer name and handshaking phase in one setState so
+      // the overlay renders with a name the moment it appears.
+      if (mounted) {
+        setState(() {
+          _connectingPeerName = _cleanDisplayName(peer.friendlyName);
+          _phase = _GuestDiscoveryPhase.handshaking;
+          _status = 'Connecting…';
+        });
+      }
 
       await ConnectionLogger.instance.log(
         'BLE | Handshake sequence start',
-        details: 'peer=${peer.friendlyName} (${peer.id})',
+        details: 'peer=$_connectingPeerName (${peer.id})',
       );
       final handshakePayload = await BleTransport.instance
           .establishSecureHandshake(peer);
@@ -844,6 +863,29 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         'HS | ServerHello payload (BLE JSON, log-safe)',
         details: handshakePayload.describeForLog(),
       );
+      // If the GATT payload carries a better name (full custom name from
+      // Settings), update both the overlay label and the peer list entry.
+      if (handshakePayload.friendlyName.isNotEmpty && mounted) {
+        final resolvedName = handshakePayload.friendlyName;
+        if (resolvedName != peer.friendlyName) {
+          await ConnectionLogger.instance.log(
+            'HS | Resolved sender name from payload',
+            details:
+                'ble="${peer.friendlyName}" payload="$resolvedName"',
+          );
+        }
+        setState(() {
+          _connectingPeerName = resolvedName;
+          final idx = _peers.indexWhere((p) => p.id == peer.id);
+          if (idx != -1) {
+            _peers[idx] = BlePeer(
+              id: peer.id,
+              friendlyName: resolvedName,
+              serviceUuid: peer.serviceUuid,
+            );
+          }
+        });
+      }
 
       if (!mounted) return;
       await _lockUiForConnection();
@@ -918,21 +960,35 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   @override
   Widget build(BuildContext context) {
     if (_connectionUiLocked) {
+      final tt = Theme.of(context).textTheme;
+      final cs = Theme.of(context).colorScheme;
       return Scaffold(
         appBar: AppBar(leading: const BackButton()),
-        body: const SafeArea(
+        body: SafeArea(
           child: Center(
             child: Padding(
-              padding: EdgeInsets.symmetric(horizontal: 28),
+              padding: const EdgeInsets.symmetric(horizontal: 28),
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  CircularProgressIndicator(),
-                  SizedBox(height: 28),
+                  const CircularProgressIndicator(),
+                  const SizedBox(height: 32),
+                  if (_connectingPeerName.isNotEmpty) ...[
+                    Text(
+                      _connectingPeerName,
+                      textAlign: TextAlign.center,
+                      style: tt.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                  ],
                   Text(
-                    _kHotspotConnectingOverlayMessage,
+                    _status,
                     textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 16),
+                    style: tt.bodyMedium?.copyWith(
+                      color: cs.onSurfaceVariant,
+                    ),
                   ),
                 ],
               ),
@@ -993,12 +1049,12 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
 
                         return ListTile(
                           leading: const Icon(Icons.hub),
-                          title: Text(peer.friendlyName),
+                          title: Text(_cleanDisplayName(peer.friendlyName)),
                           subtitle: Text(
                             peer.serviceUuid.toLowerCase() ==
                                     kAirShareBleServiceUuid.toLowerCase()
-                                ? 'Transfer hub • $kAirShareBleServiceUuid'
-                                : 'UUID ${peer.serviceUuid}',
+                                ? 'AirShare Hub  ·  tap to connect'
+                                : peer.serviceUuid,
                           ),
                           onTap: _connectionUiLocked
                               ? null
