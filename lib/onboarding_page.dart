@@ -15,36 +15,40 @@ class _OnboardingPageState extends State<OnboardingPage> {
   final PageController _controller = PageController();
   int _currentPage = 0;
 
+  // ── Slide definitions ──────────────────────────────────────────────────────
+
   static const _slides = [
     _Slide(
       icon: Icons.wifi_tethering_rounded,
-      iconColor: Color(0xFF2563EB),
-      title: 'Welcome to AirShare',
-      body: 'Transfer files instantly between nearby devices —\n'
-          'no internet, no accounts, no cloud required.',
+      title: 'Air it, Share it',
+      body: 'The fastest way to drop files to anyone nearby — '
+          'no internet, no accounts, no cloud. '
+          'Just open the app and go.',
     ),
     _Slide(
-      icon: Icons.swap_horiz_rounded,
-      iconColor: Color(0xFF059669),
-      title: 'How it works',
-      body: 'Sender taps Send and picks files.\n'
-          'Receiver taps Receive and waits.\n\n'
-          'Once connected, the receiver approves the transfer and files arrive instantly over your local network.',
+      icon: Icons.wifi_tethering,
+      title: 'Open a Room & Broadcast',
+      body: 'Host a room and start sharing in seconds.\n\n'
+          'Every room is completely temporary — '
+          'all files are permanently wiped the moment '
+          'the room closes or the app shuts down.',
     ),
     _Slide(
-      icon: Icons.admin_panel_settings_outlined,
-      iconColor: Color(0xFF7C3AED),
-      title: 'A quick heads-up',
-      body: 'AirShare uses Bluetooth to discover nearby devices and your local Wi-Fi to move files.\n\n'
-          'We\'ll ask for Bluetooth and Location permissions on the next screen.',
+      icon: Icons.sensors,
+      title: 'Connect to a Friend',
+      body: 'Joining a nearby room is effortless. '
+          'Browse shared files in a beautiful grid '
+          'and download exactly what you need in a snap.',
     ),
   ];
+
+  // ── Navigation ─────────────────────────────────────────────────────────────
 
   void _next() {
     if (_currentPage < _slides.length - 1) {
       _controller.nextPage(
-        duration: const Duration(milliseconds: 220),
-        curve: Curves.easeOut,
+        duration: const Duration(milliseconds: 280),
+        curve: Curves.easeOutCubic,
       );
     } else {
       widget.onComplete();
@@ -57,18 +61,20 @@ class _OnboardingPageState extends State<OnboardingPage> {
     super.dispose();
   }
 
+  // ── Build ──────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
     final isLast = _currentPage == _slides.length - 1;
 
     return Scaffold(
+      backgroundColor: const Color(0xFFDBEAFE),
       body: SafeArea(
         child: Column(
           children: [
-            // Top bar — Skip (hidden on last slide)
+            // ── Top bar — Skip ───────────────────────────────────────────────
             SizedBox(
-              height: 48,
+              height: 52,
               child: Align(
                 alignment: Alignment.centerRight,
                 child: Padding(
@@ -77,15 +83,21 @@ class _OnboardingPageState extends State<OnboardingPage> {
                     opacity: isLast ? 0 : 1,
                     duration: const Duration(milliseconds: 200),
                     child: TextButton(
+                      style: TextButton.styleFrom(
+                        foregroundColor: const Color(0xFF0A2463),
+                      ),
                       onPressed: isLast ? null : widget.onComplete,
-                      child: const Text('Skip'),
+                      child: const Text(
+                        'Skip',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
                     ),
                   ),
                 ),
               ),
             ),
 
-            // Slides
+            // ── Slides ───────────────────────────────────────────────────────
             Expanded(
               child: PageView.builder(
                 controller: _controller,
@@ -95,9 +107,9 @@ class _OnboardingPageState extends State<OnboardingPage> {
               ),
             ),
 
-            // Bottom bar — dots + button
+            // ── Bottom bar — dots + button ───────────────────────────────────
             Padding(
-              padding: const EdgeInsets.fromLTRB(24, 16, 24, 36),
+              padding: const EdgeInsets.fromLTRB(24, 16, 24, 40),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
@@ -106,21 +118,38 @@ class _OnboardingPageState extends State<OnboardingPage> {
                     children: List.generate(_slides.length, (i) {
                       final active = i == _currentPage;
                       return AnimatedContainer(
-                        duration: const Duration(milliseconds: 220),
-                        curve: Curves.easeOut,
+                        duration: const Duration(milliseconds: 250),
+                        curve: Curves.easeOutCubic,
                         margin: const EdgeInsets.only(right: 6),
-                        width: active ? 22 : 8,
+                        width: active ? 24 : 8,
                         height: 8,
                         decoration: BoxDecoration(
-                          color: active ? cs.primary : cs.outlineVariant,
+                          color: active
+                              ? const Color(0xFF0A2463)
+                              : const Color(0xFF0A2463).withValues(alpha: 0.25),
                           borderRadius: BorderRadius.circular(4),
                         ),
                       );
                     }),
                   ),
+
+                  // Next / Get Started button
                   FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF2563EB),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 28, vertical: 14),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      textStyle: const TextStyle(
+                        fontWeight: FontWeight.w600,
+                        fontSize: 15,
+                      ),
+                    ),
                     onPressed: _next,
-                    child: Text(isLast ? 'Get started' : 'Next'),
+                    child: Text(isLast ? 'Get Started' : 'Next'),
                   ),
                 ],
               ),
@@ -132,23 +161,21 @@ class _OnboardingPageState extends State<OnboardingPage> {
   }
 }
 
-// ── Data ─────────────────────────────────────────────────────────────────────
+// ── Data model ────────────────────────────────────────────────────────────────
 
 class _Slide {
   const _Slide({
     required this.icon,
-    required this.iconColor,
     required this.title,
     required this.body,
   });
 
   final IconData icon;
-  final Color iconColor;
   final String title;
   final String body;
 }
 
-// ── Slide widget ──────────────────────────────────────────────────────────────
+// ── Slide renderer ────────────────────────────────────────────────────────────
 
 class _SlideView extends StatelessWidget {
   const _SlideView({required this.slide});
@@ -158,34 +185,54 @@ class _SlideView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final tt = Theme.of(context).textTheme;
-    final cs = Theme.of(context).colorScheme;
+
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 36),
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
+          // Icon circle
           Container(
-            width: 108,
-            height: 108,
+            width: 120,
+            height: 120,
             decoration: BoxDecoration(
-              color: slide.iconColor.withValues(alpha: 0.10),
+              color: const Color(0xFF0A2463).withValues(alpha: 0.08),
               shape: BoxShape.circle,
+              border: Border.all(
+                color: const Color(0xFF0A2463).withValues(alpha: 0.15),
+                width: 1.5,
+              ),
             ),
-            child: Icon(slide.icon, size: 54, color: slide.iconColor),
+            child: Icon(
+              slide.icon,
+              size: 58,
+              color: const Color(0xFF0A2463),
+            ),
           ),
-          const SizedBox(height: 36),
+
+          const SizedBox(height: 40),
+
+          // Title
           Text(
             slide.title,
             textAlign: TextAlign.center,
-            style: tt.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
+            style: tt.headlineMedium?.copyWith(
+              color: const Color(0xFF0A2463),
+              fontWeight: FontWeight.w800,
+              letterSpacing: -0.3,
+              height: 1.2,
+            ),
           ),
-          const SizedBox(height: 16),
+
+          const SizedBox(height: 20),
+
+          // Body
           Text(
             slide.body,
             textAlign: TextAlign.center,
             style: tt.bodyLarge?.copyWith(
-              color: cs.onSurfaceVariant,
-              height: 1.55,
+              color: const Color(0xFF1E3A8A),
+              height: 1.65,
             ),
           ),
         ],
