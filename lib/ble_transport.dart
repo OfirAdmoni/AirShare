@@ -196,9 +196,13 @@ class BleTransport {
     await _methodChannel.invokeMethod('stopHubAdvertising');
   }
 
-  Future<void> approveConnection({required bool approved}) async {
+  Future<void> approveConnection({
+    required bool approved,
+    String lanIp = '',
+  }) async {
     await _methodChannel.invokeMethod('approveConnection', {
       'approved': approved,
+      if (lanIp.isNotEmpty) 'lanIp': lanIp,
     });
   }
 

@@ -115,35 +115,48 @@ class _AirShareAppState extends State<AirShareApp> {
           );
         },
       );
+      var lanForBle = '';
       if (approved == true) {
-        final pendingIp = HubEndpointState.instance.pendingIp;
-        final pendingPort = HubEndpointState.instance.pendingPort;
+        final hubState = HubEndpointState.instance;
+        final pendingIp = hubState.pendingIp;
+        final pendingPort = hubState.pendingPort;
+        lanForBle = hubState.rememberedLanIp.isNotEmpty
+            ? hubState.rememberedLanIp
+            : (pendingIp ?? '');
         await ConnectionLogger.instance.log(
           'HS | Host | Approve tapped',
           details:
-              'pendingIp=${pendingIp ?? "(null)"} pendingPort=$pendingPort',
+              'pendingIp=${pendingIp ?? "(null)"} lan_ip=$lanForBle pendingPort=$pendingPort',
         );
-        if (pendingIp != null && pendingIp.isNotEmpty) {
+        if (lanForBle.isNotEmpty) {
           await BleTransport.instance.updateHubEndpoint(
-            ip: pendingIp,
+            ip: lanForBle,
             port: pendingPort,
           );
-          await ConnectionLogger.instance.log(
-            'HS | Host | updateHubEndpoint(native GATT)',
-            details: '$pendingIp:$pendingPort',
+          await BleTransport.instance.updateConnectionEndpoints(
+            lanIp: lanForBle,
+            p2pIp: hubState.rememberedP2pIp,
+            p2pMac: hubState.rememberedP2pMac,
+            hotspotSsid: hubState.rememberedHotspotSsid,
+            hotspotPass: hubState.rememberedHotspotPass,
+            hotspotHubIp: hubState.rememberedHotspotHubIp,
+            hubPort: pendingPort,
           );
           await ConnectionLogger.instance.log(
-            'Connection | Advertising real IP',
-            details: '$pendingIp:$pendingPort',
+            'HS | Host | BLE handshake refreshed for Approve',
+            details: 'lan_ip=$lanForBle hub_port=$pendingPort',
           );
         } else {
           await ConnectionLogger.instance.log(
-            'HS | Host | updateHubEndpoint SKIPPED',
-            details: 'pendingIp empty — handshake JSON may lack hubIp',
+            'HS | Host | Approve BLE refresh SKIPPED',
+            details: 'no LAN IP — handshake JSON may lack lan_ip',
           );
         }
       }
-      await BleTransport.instance.approveConnection(approved: approved == true);
+      await BleTransport.instance.approveConnection(
+        approved: approved == true,
+        lanIp: lanForBle,
+      );
       await ConnectionLogger.instance.log(
         'Connection Request Decision',
         details: approved == true ? 'approved' : 'declined',

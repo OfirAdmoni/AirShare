@@ -292,8 +292,10 @@ final class BleTransportPlugin: NSObject {
     }
     let port = args["port"] as? Int ?? 8080
     pendingHubIp = ip
+    pendingLanIp = ip
     pendingHubPort = port
     advertisedEndpoint = "\(ip):\(port)"
+    logBle("updateHubEndpoint: pendingLanIp=\(pendingLanIp) endpoint=\(advertisedEndpoint)")
     result(nil)
   }
 
@@ -302,8 +304,14 @@ final class BleTransportPlugin: NSObject {
       result(nil)
       return
     }
-    pendingLanIp = (args["lanIp"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    pendingP2pIp = (args["p2pIp"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let lanFromDart = (args["lanIp"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !lanFromDart.isEmpty {
+      pendingLanIp = lanFromDart
+    }
+    let p2pFromDart = (args["p2pIp"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !p2pFromDart.isEmpty {
+      pendingP2pIp = p2pFromDart
+    }
     pendingP2pMac = (args["p2pMac"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     pendingHotspotSsid = (args["hotspotSsid"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     pendingHotspotPass = (args["hotspotPass"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -461,12 +469,16 @@ final class BleTransportPlugin: NSObject {
   }
 
   private func buildHandshakePayloadData() -> Data? {
-    let lan = pendingLanIp
+    var lan = pendingLanIp
     let p2p = pendingP2pIp
     let ssid = hotspotActive ? pendingHotspotSsid : ""
     let password = hotspotActive ? pendingHotspotPass : ""
     let p2pMac = pendingP2pMac
     let hotspotHub = hotspotActive ? pendingHotspotHubIp : ""
+    if lan.isEmpty, let hubFallback = pendingHubIp?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !hubFallback.isEmpty, ssid.isEmpty {
+      lan = hubFallback
+    }
     if lan.isEmpty && p2p.isEmpty && ssid.isEmpty {
       return nil
     }

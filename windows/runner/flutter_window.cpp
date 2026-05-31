@@ -31,6 +31,75 @@ void TrimAsciiWhitespace(std::string& s) {
   }
 }
 
+std::string ExtractJsonStringField(const std::string& key, const std::string& json) {
+  const std::string needle = "\"" + key + "\":\"";
+  auto start = json.find(needle);
+  if (start == std::string::npos) {
+    return {};
+  }
+  start += needle.size();
+  auto end = json.find('"', start);
+  if (end == std::string::npos) {
+    return {};
+  }
+  return json.substr(start, end - start);
+}
+
+int ExtractJsonIntField(const std::string& key, const std::string& json, int default_v) {
+  const std::string needle = "\"" + key + "\":";
+  auto start = json.find(needle);
+  if (start == std::string::npos) {
+    return default_v;
+  }
+  start += needle.size();
+  while (start < json.size() &&
+         std::isspace(static_cast<unsigned char>(json[start]))) {
+    start++;
+  }
+  int val = 0;
+  bool any = false;
+  while (start < json.size() &&
+         std::isdigit(static_cast<unsigned char>(json[start]))) {
+    any = true;
+    val = val * 10 + (json[start] - '0');
+    start++;
+  }
+  return any ? val : default_v;
+}
+
+flutter::EncodableMap HandshakeJsonToEncodableMap(const std::string& json) {
+  const int hub_port = ExtractJsonIntField("hub_port", json,
+                                           ExtractJsonIntField("hubPort", json, 8080));
+  return {
+      {flutter::EncodableValue("lan_ip"),
+       flutter::EncodableValue(ExtractJsonStringField("lan_ip", json))},
+      {flutter::EncodableValue("p2p_ip"),
+       flutter::EncodableValue(ExtractJsonStringField("p2p_ip", json))},
+      {flutter::EncodableValue("p2p_mac"),
+       flutter::EncodableValue(ExtractJsonStringField("p2p_mac", json))},
+      {flutter::EncodableValue("p2pMac"),
+       flutter::EncodableValue(ExtractJsonStringField("p2pMac", json))},
+      {flutter::EncodableValue("hotspot_ssid"),
+       flutter::EncodableValue(ExtractJsonStringField("hotspot_ssid", json))},
+      {flutter::EncodableValue("ssid"),
+       flutter::EncodableValue(ExtractJsonStringField("ssid", json))},
+      {flutter::EncodableValue("hotspot_pass"),
+       flutter::EncodableValue(ExtractJsonStringField("hotspot_pass", json))},
+      {flutter::EncodableValue("password"),
+       flutter::EncodableValue(ExtractJsonStringField("password", json))},
+      {flutter::EncodableValue("hotspot_hub_ip"),
+       flutter::EncodableValue(ExtractJsonStringField("hotspot_hub_ip", json))},
+      {flutter::EncodableValue("hubIp"),
+       flutter::EncodableValue(ExtractJsonStringField("hubIp", json))},
+      {flutter::EncodableValue("hub_port"), flutter::EncodableValue(hub_port)},
+      {flutter::EncodableValue("hubPort"), flutter::EncodableValue(hub_port)},
+      {flutter::EncodableValue("tls_cert_sha256"),
+       flutter::EncodableValue(ExtractJsonStringField("tls_cert_sha256", json))},
+      {flutter::EncodableValue("friendly_name"),
+       flutter::EncodableValue(ExtractJsonStringField("friendly_name", json))},
+  };
+}
+
 std::string GetHostComputerNameUtf8() {
   wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1] = {};
   DWORD n = static_cast<DWORD>(MAX_COMPUTERNAME_LENGTH + 1);
@@ -646,46 +715,17 @@ void FlutterWindow::EstablishSecureHandshake(
       return;
     }
     const std::string json(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    // Minimal JSON parse: expect {"ssid":"..","password":"..","hubIp":".."}
-    auto extract = [](const std::string& key, const std::string& src) {
-      const std::string needle = "\"" + key + "\":\"";
-      auto start = src.find(needle);
-      if (start == std::string::npos) return std::string();
-      start += needle.size();
-      auto end = src.find('"', start);
-      if (end == std::string::npos) return std::string();
-      return src.substr(start, end - start);
-    };
-    auto extract_int = [](const std::string& key, const std::string& src,
-                          int default_v) {
-      const std::string needle = "\"" + key + "\":";
-      auto start = src.find(needle);
-      if (start == std::string::npos) return default_v;
-      start += needle.size();
-      while (start < src.size() &&
-             std::isspace(static_cast<unsigned char>(src[start]))) {
-        start++;
+    flutter::EncodableMap payload = HandshakeJsonToEncodableMap(json);
+    {
+      std::wstring preview(json.begin(), json.end());
+      if (preview.size() > 200) {
+        preview = preview.substr(0, 200) + L"...";
       }
-      int val = 0;
-      bool any = false;
-      while (start < src.size() &&
-             std::isdigit(static_cast<unsigned char>(src[start]))) {
-        any = true;
-        val = val * 10 + (src[start] - '0');
-        start++;
-      }
-      return any ? val : default_v;
-    };
-    flutter::EncodableMap payload = {
-        {flutter::EncodableValue("ssid"),
-         flutter::EncodableValue(extract("ssid", json))},
-        {flutter::EncodableValue("password"),
-         flutter::EncodableValue(extract("password", json))},
-        {flutter::EncodableValue("hubIp"),
-         flutter::EncodableValue(extract("hubIp", json))},
-        {flutter::EncodableValue("hubPort"),
-         flutter::EncodableValue(extract_int("hubPort", json, 8080))},
-    };
+      OutputDebugStringW(
+          (L"[AirShareNative] Native | Handshake JSON parsed (full wire fields)\n" +
+           preview + L"\n")
+              .c_str());
+    }
     OutputDebugStringW(
         L"[AirShareNative] Peer Handshake Released (client read); closing BLE peripheral before socket.\n");
     try {

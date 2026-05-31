@@ -530,11 +530,9 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     if (!onSameLan) {
       await ConnectionLogger.instance.log(
         'Connection | Tier 1 subnet check',
-        details: Platform.isIOS
-            ? 'subnet check inconclusive for ${payload.lanIp}; probing TCP anyway'
-            : 'guest not on same subnet as ${payload.lanIp}',
+        details:
+            'guest subnet mismatch for ${payload.lanIp}; BLE-delivered lan_ip trusted, probing TCP anyway',
       );
-      if (!Platform.isIOS) return null;
     }
 
     if (!mounted) throw StateError('unmounted');
