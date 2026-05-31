@@ -55,6 +55,7 @@ import org.json.JSONObject
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentHashMap
 import java.util.Collections
 import java.util.Locale
 import java.util.UUID
@@ -95,7 +96,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private var pendingReadDevice: BluetoothDevice? = null
     private var pendingReadRequestId: Int? = null
     private var pendingReadOffset: Int = 0
-    private var handshakePayload: ByteArray = ByteArray(0)
+    /** Infrastructure-only JSON (no [host_public_key]) — shared across all peers. */
+    private var handshakeInfrastructurePayload: ByteArray = ByteArray(0)
+    /** Live GATT centrals that enabled handshake notifications (CCCD) — device instances, not address strings. */
+    private val activeSubscribers = ConcurrentHashMap.newKeySet<BluetoothDevice>()
 
     private val approvalTimeoutHandler = Handler(Looper.getMainLooper())
     private var approvalTimeoutRunnable: Runnable? = null
@@ -106,6 +110,16 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private var pendingHubPort: Int = 8080
     private var advertisedEndpoint: String = ""
     private var pendingLanIp: String = ""
+    /** Host X25519 public key material released per-peer on Approve (not global GATT). */
+    private var hostSessionPublicKey: String = ""
+    /** guest_public_key (base64url) → host_public_key after Approve. */
+    private val approvedPeerHostKeys = mutableMapOf<String, String>()
+    /** BLE transport id (MAC) → guest_public_key. */
+    private val guestPublicKeyByTransport = mutableMapOf<String, String>()
+    /** guest_public_key → BLE transport id for GATT notify. */
+    private val transportByGuestPublicKey = mutableMapOf<String, String>()
+    private val pendingApprovalSessionKeys = mutableSetOf<String>()
+    private var pendingTlsCertSha256: String = ""
     private var pendingP2pIp: String = ""
     private var pendingHotspotHubIp: String = ""
     /// True only after LocalOnlyHotspotCallback.onStarted — gates BLE hotspot fields.
@@ -123,6 +137,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private var localHotspotReservation: WifiManager.LocalOnlyHotspotReservation? = null
     private var connectivityCallback: ConnectivityManager.NetworkCallback? = null
     private var connectivityCallbackRegistered = false
+    /** Guest Tier 2: process-bound hub hotspot [Network] after [WifiNetworkSpecifier] success. */
+    private var guestHubBoundNetwork: Network? = null
 
     private var wifiP2pManager: WifiP2pManager? = null
     private var wifiP2pChannel: WifiP2pManager.Channel? = null
@@ -181,6 +197,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 Log.i("AirShareNative", "Peer connected for secure handshake: ${device.address}")
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                activeSubscribers.remove(device)
+                Log.i(
+                    "AirShareNative",
+                    "Peer disconnected; removed from activeSubscribers (${device.address})",
+                )
             }
         }
 
@@ -213,21 +235,25 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 return
             }
             if (characteristic.uuid != handshakeCharacteristicUuid) return
-            if (handshakePayload.isNotEmpty()) {
+            val peerPayload = buildHandshakePayloadForTransport(device.address)
+            if (peerPayload != null && peerPayload.isNotEmpty()) {
                 val sent = gattServer?.sendResponse(
                     device,
                     requestId,
                     BluetoothGatt.GATT_SUCCESS,
                     offset,
-                    handshakePayload,
+                    peerPayload,
                 ) == true
-                val payloadText = String(handshakePayload, StandardCharsets.UTF_8)
+                val payloadText = String(peerPayload, StandardCharsets.UTF_8)
                 Log.i(
                     "AirShareNative",
-                    "Android | GATT | Sending Response: $payloadText (Length: ${handshakePayload.size})",
+                    "Android | GATT | Per-peer handshake read ${device.address}: $payloadText (Length: ${peerPayload.size})",
                 )
                 if (!sent) {
-                    Log.w("AirShareNative", "Android | GATT | sendResponse failed for approved payload")
+                    Log.w("AirShareNative", "Android | GATT | sendResponse failed for handshake payload")
+                }
+                if (!handshakeSessionIsReleased(peerPayload)) {
+                    promptHandshakeApprovalIfNeeded(device)
                 }
                 return
             }
@@ -296,12 +322,25 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             value: ByteArray,
         ) {
             if (characteristic.uuid == handshakeCharacteristicUuid) {
-                Log.w("AirShareNative", "Handshake characteristic write rejected from ${device.address}")
+                val guestPk = parseGuestPublicKeyFromWrite(value)
+                if (guestPk != null) {
+                    registerGuestSession(device.address, guestPk)
+                    Log.i(
+                        "AirShareNative",
+                        "Guest session key registered transport=${device.address} guest_pk=${guestPk.take(16)}…",
+                    )
+                    promptHandshakeApprovalIfNeeded(device)
+                } else {
+                    Log.w(
+                        "AirShareNative",
+                        "Handshake write from ${device.address} missing guest_public_key",
+                    )
+                }
                 if (responseNeeded) {
                     gattServer?.sendResponse(
                         device,
                         requestId,
-                        BluetoothGatt.GATT_WRITE_NOT_PERMITTED,
+                        BluetoothGatt.GATT_SUCCESS,
                         offset,
                         null,
                     )
@@ -346,6 +385,29 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     "AirShareNative",
                     "CCCD write from ${device.address}: notify=$enableNotify indicate=$enableIndicate responseNeeded=$responseNeeded",
                 )
+                val parentChar = descriptor.characteristic
+                if (parentChar?.uuid == handshakeCharacteristicUuid &&
+                    (enableNotify || enableIndicate)
+                ) {
+                    activeSubscribers.add(device)
+                    Log.i(
+                        "AirShareNative",
+                        "CCCD notify enabled: ${device.address} activeSubscribers=${activeSubscribers.size}",
+                    )
+                    val peerPayload = buildHandshakePayloadForTransport(device.address)
+                    if (peerPayload != null &&
+                        peerPayload.isNotEmpty() &&
+                        !handshakeSessionIsReleased(peerPayload)
+                    ) {
+                        promptHandshakeApprovalIfNeeded(device)
+                    }
+                } else if (!enableNotify && !enableIndicate) {
+                    activeSubscribers.remove(device)
+                    Log.i(
+                        "AirShareNative",
+                        "CCCD notify disabled: ${device.address} activeSubscribers=${activeSubscribers.size}",
+                    )
+                }
                 val sent = gattServer?.sendResponse(
                     device,
                     requestId,
@@ -458,6 +520,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             "updateHubEndpoint" -> updateHubEndpoint(call, result)
             "updateConnectionEndpoints" -> updateConnectionEndpoints(call, result)
             "approveConnection" -> approveConnection(call, result)
+            "resetHostHandshakeState" -> resetHostHandshakeState(result)
+            "resetGuestHandshakeState" -> resetGuestHandshakeState(result)
             "ensureLocationForWifiTier" -> ensurePermissionsThenExecute(result) { ensureLocationForWifiTier(result) }
             "startTemporaryHotspot" -> ensurePermissionsThenExecute(result) {
                 ensureLocationReadyForWifiTier(result) { startTemporaryHotspot(call, result) }
@@ -473,6 +537,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 ensureLocationReadyForWifiTier(result) { connectToWifiDirectPeerInternal(call, result) }
             }
             "stopInternalLink" -> stopInternalLink(result)
+            "releaseGuestWlanBinding" -> releaseGuestWlanBinding(result)
             "isBluetoothEnabled" -> ensurePermissionsThenExecute(result) { isBluetoothEnabled(result) }
             "requestEnableBluetooth" -> ensurePermissionsThenExecute(result) { requestEnableBluetooth(result) }
             "openWirelessSettings" -> openWirelessSettings(result)
@@ -582,7 +647,23 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
     private fun approveConnection(call: MethodCall, result: MethodChannel.Result) {
         val approved = call.argument<Boolean>("approved") ?: false
+        val sessionKeyArg = (
+            call.argument<String>("sessionKey")
+                ?: call.argument<String>("peerId")
+        )?.trim().orEmpty()
+        val hostPkArg = call.argument<String>("hostPublicKey")?.trim().orEmpty()
+        if (hostPkArg.isNotEmpty()) {
+            hostSessionPublicKey = hostPkArg
+        }
+        val sessionKey = sessionKeyArg.ifEmpty {
+            guestPublicKeyByTransport[pendingReadDevice?.address.orEmpty()].orEmpty()
+        }
+
         if (!approved) {
+            if (sessionKey.isNotEmpty()) {
+                approvedPeerHostKeys.remove(sessionKey)
+                pendingApprovalSessionKeys.remove(sessionKey)
+            }
             val device = pendingReadDevice
             val requestId = pendingReadRequestId
             if (device != null && requestId != null) {
@@ -595,8 +676,6 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 )
                 gattServer?.cancelConnection(device)
             }
-            handshakePayload = ByteArray(0)
-            handshakeCharacteristic?.value = null
             clearPendingRead()
             Log.i("AirShareNative", "Peer Handshake Blocked: connection declined by operator")
             result.success(null)
@@ -605,53 +684,56 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
         cancelApprovalTimeout()
 
-        val payload = buildHandshakePayloadOrNull()
+        if (sessionKey.isEmpty()) {
+            result.error("invalid_peer", "sessionKey (guest public key) is required for approval.", null)
+            return
+        }
+        val hostPk = hostSessionPublicKey
+        if (hostPk.isBlank()) {
+            result.error("handshake_not_ready", "Host session public key is not available.", null)
+            return
+        }
+        approvedPeerHostKeys[sessionKey] = hostPk
+        pendingApprovalSessionKeys.remove(sessionKey)
+
+        val payload = buildHandshakePayloadForSession(sessionKey)
         if (payload == null) {
             result.error("handshake_not_ready", "WLAN credentials are not available yet.", null)
             return
         }
-        handshakePayload = payload.copyOf()
         Log.i(
             "AirShareNative",
-            "Android | approveConnection | handshakePayload length=${handshakePayload.size} body=${String(handshakePayload, StandardCharsets.UTF_8).take(200)}",
+            "Android | approveConnection | session=$sessionKey payloadLen=${payload.size} " +
+                "body=${String(payload, StandardCharsets.UTF_8).take(200)}",
         )
 
         val characteristic = handshakeCharacteristic
-        characteristic?.value = handshakePayload
+        broadcastHandshakeNotifications()
 
-        val device = pendingReadDevice
+        val transportId = transportByGuestPublicKey[sessionKey].orEmpty()
+        val device = when {
+            transportId.isNotEmpty() -> try {
+                bluetoothAdapter?.getRemoteDevice(transportId)
+            } catch (_: IllegalArgumentException) {
+                null
+            }
+            else -> pendingReadDevice
+        } ?: pendingReadDevice
         val requestId = pendingReadRequestId
-        if (device != null && characteristic != null) {
-            val notified = gattServer?.notifyCharacteristicChanged(device, characteristic, false) == true
+        if (device != null && characteristic != null && requestId != null) {
+            val readResponseSent = gattServer?.sendResponse(
+                device,
+                requestId,
+                BluetoothGatt.GATT_SUCCESS,
+                pendingReadOffset,
+                payload,
+            ) == true
             Log.i(
                 "AirShareNative",
-                "notifyCharacteristicChanged() returned $notified for ${device.address} " +
-                    "(payloadBytes=${handshakePayload.size})",
+                "Handshake read response sent=$readResponseSent for ${device.address}",
             )
-            if (!notified) {
-                Log.w(
-                    "AirShareNative",
-                    "Handshake notify failed — client may not have subscribed (CCCD) or MTU too small.",
-                )
-            }
-            if (requestId != null) {
-                val readResponseSent = gattServer?.sendResponse(
-                    device,
-                    requestId,
-                    BluetoothGatt.GATT_SUCCESS,
-                    pendingReadOffset,
-                    handshakePayload,
-                ) == true
-                Log.i(
-                    "AirShareNative",
-                    "Handshake read response sent=$readResponseSent for ${device.address}",
-                )
-            }
-            Log.i("AirShareNative", "Peer Handshake Released for ${device.address}")
-        } else {
-            Log.w("AirShareNative", "Peer Handshake Released but no pending device/read request was available.")
         }
-
+        Log.i("AirShareNative", "Peer Handshake Released for session=$sessionKey transport=$transportId")
         clearPendingRead()
         result.success(null)
     }
@@ -686,8 +768,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 )
             }
             gattServer?.cancelConnection(device)
-            handshakePayload = ByteArray(0)
-            handshakeCharacteristic?.value = null
+            val sessionKey = guestPublicKeyByTransport[device.address]
+            if (sessionKey != null) {
+                pendingApprovalSessionKeys.remove(sessionKey)
+            }
             clearPendingRead()
         }
         approvalTimeoutHandler.postDelayed(approvalTimeoutRunnable!!, 45_000)
@@ -723,7 +807,106 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             "hotspot_pass" to json.optString("hotspot_pass", json.optString("password", "")),
             "hotspot_hub_ip" to json.optString("hotspot_hub_ip", ""),
             "hub_port" to json.optInt("hub_port", json.optInt("hubPort", 8080)),
+            "host_public_key" to json.optString("host_public_key", ""),
+            "tls_cert_sha256" to json.optString("tls_cert_sha256", ""),
         )
+    }
+
+    private fun handshakeSessionIsReleased(json: JSONObject): Boolean =
+        json.optString("host_public_key").isNotBlank()
+
+    private fun handshakeSessionIsReleased(payload: ByteArray): Boolean {
+        if (payload.isEmpty()) return false
+        return try {
+            handshakeSessionIsReleased(JSONObject(String(payload, StandardCharsets.UTF_8)))
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun normalizeSessionKey(guestPk: String): String = guestPk.trim()
+
+    private fun parseGuestPublicKeyFromWrite(value: ByteArray): String? {
+        if (value.isEmpty()) return null
+        val text = String(value, StandardCharsets.UTF_8).trim()
+        if (text.isEmpty()) return null
+        return try {
+            JSONObject(text).optString("guest_public_key").trim().takeIf { it.isNotBlank() }
+        } catch (_: Exception) {
+            if (!text.contains("{") && text.length >= 32) text else null
+        }
+    }
+
+    private fun registerGuestSession(transportId: String, guestPk: String) {
+        val sessionKey = normalizeSessionKey(guestPk)
+        if (sessionKey.isEmpty() || transportId.isBlank()) return
+        guestPublicKeyByTransport[transportId] = sessionKey
+        transportByGuestPublicKey[sessionKey] = transportId
+    }
+
+    private fun promptHandshakeApprovalIfNeeded(device: BluetoothDevice) {
+        val transportId = device.address
+        val sessionKey = guestPublicKeyByTransport[transportId] ?: return
+        if (approvedPeerHostKeys.containsKey(sessionKey)) return
+        if (!pendingApprovalSessionKeys.add(sessionKey)) return
+        pendingReadDevice = device
+        pendingReadRequestId = null
+        pendingReadOffset = 0
+        scheduleApprovalTimeout(device)
+        Log.i(
+            "AirShareNative",
+            "Peer Handshake approval prompted session=$sessionKey transport=$transportId",
+        )
+        val friendlyName = device.name ?: "Unknown Peer"
+        runOnUiThread {
+            bleUiChannel?.invokeMethod(
+                "notifyConnectionRequest",
+                mapOf(
+                    "friendlyName" to friendlyName,
+                    "sessionKey" to sessionKey,
+                    "deviceAddress" to transportId,
+                ),
+            )
+        }
+    }
+
+    /**
+     * Pushes per-subscriber handshake JSON to every central that enabled CCCD notifications.
+     * Uses the live [BluetoothDevice] from [activeSubscribers], not address-string lookups.
+     */
+    private fun broadcastHandshakeNotifications() {
+        val characteristic = handshakeCharacteristic ?: return
+        val server = gattServer ?: return
+        val subscribers = activeSubscribers.toList()
+        if (subscribers.isEmpty()) {
+            Log.w(
+                "AirShareNative",
+                "broadcastHandshakeNotifications: no active CCCD subscribers",
+            )
+            return
+        }
+        Log.i(
+            "AirShareNative",
+            "broadcastHandshakeNotifications: ${subscribers.size} subscriber(s)",
+        )
+        for (device in subscribers) {
+            val transportId = device.address
+            val payload = buildHandshakePayloadForTransport(transportId) ?: continue
+            if (payload.isEmpty()) continue
+            characteristic.value = payload
+            val notified =
+                server.notifyCharacteristicChanged(device, characteristic, false)
+            val sessionKey = guestPublicKeyByTransport[transportId] ?: "(unmapped)"
+            Log.i(
+                "AirShareNative",
+                "notifyCharacteristicChanged transport=$transportId session=$sessionKey " +
+                    "notified=$notified bytes=${payload.size}",
+            )
+        }
+    }
+
+    private fun notifyHandshakeSubscribers() {
+        broadcastHandshakeNotifications()
     }
 
     private fun cancelHandshakeWait() {
@@ -743,6 +926,13 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             return
         }
         if (!handshakePayloadIsReady(payload)) return
+        if (!handshakeSessionIsReleased(payload)) {
+            Log.i(
+                "AirShareNative",
+                "Android | Handshake infrastructure received ($source); awaiting Approve for session keys",
+            )
+            return
+        }
 
         handshakeDelivered = true
         cancelHandshakeWait()
@@ -773,13 +963,50 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         handshakeWaitHandler.postDelayed(handshakeWaitRunnable!!, 45_000)
     }
 
-    private fun buildHandshakePayloadOrNull(): ByteArray? {
-        val lan = pendingLanIp.trim()
-        val p2p = pendingP2pIp.trim()
+    private fun androidHotspotGatewayIp(): String = "192.168.43.1"
+
+    private fun isCellularOrWanInterfaceName(name: String): Boolean {
+        val l = name.lowercase(Locale.US)
+        return l.contains("ccmni") ||
+            l.contains("rmnet") ||
+            l.contains("pdp") ||
+            l.contains("cell") ||
+            l.contains("wwan") ||
+            l.contains("mobile") ||
+            l.contains("epdg") ||
+            l.contains("v4-rmnet") ||
+            l.contains("clat")
+    }
+
+    private fun isLikelyCarrierWanIp(ip: String): Boolean {
+        val t = ip.trim()
+        if (t.isEmpty()) return false
+        if (t == androidHotspotGatewayIp()) return false
+        return t.startsWith("10.") || t.startsWith("100.")
+    }
+
+    private fun sanitizeHotspotBleIps(lan: String, hotspotHub: String, hotspotActive: Boolean): Pair<String, String> {
+        if (!hotspotActive) return lan to hotspotHub
+        val gateway = androidHotspotGatewayIp()
+        var outLan = lan.trim()
+        var outHub = hotspotHub.trim()
+        outHub = gateway
+        if (outLan.isBlank() || isLikelyCarrierWanIp(outLan)) {
+            outLan = gateway
+        }
+        return outLan to outHub
+    }
+
+    private fun buildHandshakeInfrastructurePayloadOrNull(): ByteArray? {
         val ssid = if (hotspotActive) pendingHotspotSsid?.trim().orEmpty() else ""
         val password = if (hotspotActive) pendingHotspotPassword?.trim().orEmpty() else ""
+        val (lan, hotspotHub) = sanitizeHotspotBleIps(
+            pendingLanIp.trim(),
+            if (hotspotActive) pendingHotspotHubIp.trim() else "",
+            hotspotActive && ssid.isNotBlank(),
+        )
+        val p2p = pendingP2pIp.trim()
         val p2pMac = pendingP2pMac.trim()
-        val hotspotHub = if (hotspotActive) pendingHotspotHubIp.trim() else ""
         if (lan.isBlank() && p2p.isBlank() && ssid.isBlank()) {
             Log.w("AirShareNative", "Android | Handshake build skipped: no tier endpoints")
             return null
@@ -807,16 +1034,75 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 put("password", password)
             }
             if (p2pMac.isNotBlank()) put("p2pMac", p2pMac)
+            if (pendingTlsCertSha256.isNotBlank()) {
+                put("tls_cert_sha256", pendingTlsCertSha256)
+            }
+            if (ssid.isNotBlank()) {
+                put("platform", "android")
+                put("host_platform", "android")
+            }
         }.toString()
         Log.i(
             "AirShareNative",
-            "Android | Handshake JSON built | lan=$lan p2p=$p2p hotspot_ssid_len=${ssid.length} port=$pendingHubPort",
+            "Android | Handshake infrastructure JSON | lan=$lan p2p=$p2p port=$pendingHubPort",
         )
         return json.toByteArray(StandardCharsets.UTF_8)
     }
 
+    private fun buildHandshakePayloadForTransport(transportId: String): ByteArray? {
+        val sessionKey = guestPublicKeyByTransport[transportId]
+        return if (sessionKey != null) {
+            buildHandshakePayloadForSession(sessionKey)
+        } else {
+            buildHandshakeInfrastructurePayloadOrNull()
+        }
+    }
+
+    private fun buildHandshakePayloadForSession(sessionKey: String): ByteArray? {
+        val infra = buildHandshakeInfrastructurePayloadOrNull() ?: return null
+        val hostPk = approvedPeerHostKeys[sessionKey]?.trim().orEmpty()
+        if (hostPk.isBlank()) {
+            return infra
+        }
+        return try {
+            val json = JSONObject(String(infra, StandardCharsets.UTF_8))
+            json.put("host_public_key", hostPk)
+            json.toString().toByteArray(StandardCharsets.UTF_8)
+        } catch (e: Exception) {
+            Log.w("AirShareNative", "buildHandshakePayloadForSession failed: ${e.message}")
+            infra
+        }
+    }
+
+    /// Caches infrastructure-only handshake JSON (no global [host_public_key]).
+    private fun refreshHostHandshakePayloadCache() {
+        val payload = buildHandshakeInfrastructurePayloadOrNull()
+        if (payload == null) {
+            Log.w(
+                "AirShareNative",
+                "Android | Handshake cache refresh skipped: endpoints not ready",
+            )
+            return
+        }
+        handshakeInfrastructurePayload = payload.copyOf()
+        handshakeCharacteristic?.value = handshakeInfrastructurePayload
+        Log.i(
+            "AirShareNative",
+            "Android | Handshake infrastructure primed (${handshakeInfrastructurePayload.size} bytes) " +
+                "approvedPeers=${approvedPeerHostKeys.size}",
+        )
+    }
+
     private fun updateConnectionEndpoints(call: MethodCall, result: MethodChannel.Result) {
-        pendingLanIp = call.argument<String>("lanIp")?.trim().orEmpty()
+        var lanFromDart = call.argument<String>("lanIp")?.trim().orEmpty()
+        if (hotspotActive && isLikelyCarrierWanIp(lanFromDart)) {
+            Log.w(
+                "AirShareNative",
+                "updateConnectionEndpoints: ignoring carrier WAN lan_ip=$lanFromDart (Tier 2 uses ${androidHotspotGatewayIp()})",
+            )
+            lanFromDart = ""
+        }
+        pendingLanIp = lanFromDart
         pendingP2pIp = call.argument<String>("p2pIp")?.trim().orEmpty()
         val incomingP2pMac = call.argument<String>("p2pMac")?.trim().orEmpty()
         when {
@@ -841,10 +1127,19 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             pendingHotspotPassword = pass
         }
         val hubFromDart = call.argument<String>("hotspotHubIp")?.trim().orEmpty()
-        if (hubFromDart.isNotEmpty() && hotspotActive) {
-            pendingHotspotHubIp = hubFromDart
+        if (hotspotActive) {
+            pendingHotspotHubIp = if (hubFromDart.isNotEmpty() && !isLikelyCarrierWanIp(hubFromDart)) {
+                hubFromDart
+            } else {
+                androidHotspotGatewayIp()
+            }
         }
         pendingHubPort = call.argument<Int>("hubPort") ?: pendingHubPort
+        val incomingHostPk = call.argument<String>("hostPublicKey")?.trim().orEmpty()
+        if (incomingHostPk.isNotEmpty()) {
+            hostSessionPublicKey = incomingHostPk
+        }
+        pendingTlsCertSha256 = call.argument<String>("tlsCertSha256")?.trim().orEmpty()
 
         val primary = when {
             pendingLanIp.isNotBlank() -> pendingLanIp
@@ -857,6 +1152,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             advertisedEndpoint = "$primary:$pendingHubPort"
             endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
         }
+        refreshHostHandshakePayloadCache()
         result.success(null)
     }
 
@@ -1020,6 +1316,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     }
 
     private fun stopScanning(result: MethodChannel.Result) {
+        cancelHandshakeWait()
+        handshakeDeliveryResult = null
+        handshakeDelivered = false
+        handshakeDeliveryGatt = null
+        activeGattClient?.close()
+        activeGattClient = null
         bleScanner?.stopScan(bleScanCallback)
         isScanning = false
         result.success(null)
@@ -1084,8 +1386,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         val service = BluetoothGattService(serviceUuid, BluetoothGattService.SERVICE_TYPE_PRIMARY)
         val characteristic = BluetoothGattCharacteristic(
             handshakeCharacteristicUuid,
-            BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-            BluetoothGattCharacteristic.PERMISSION_READ,
+            BluetoothGattCharacteristic.PROPERTY_READ or
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY or
+                BluetoothGattCharacteristic.PROPERTY_WRITE,
+            BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE,
         )
         val endpoint = BluetoothGattCharacteristic(
             endpointCharacteristicUuid,
@@ -1108,8 +1412,10 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }
         handshakeCharacteristic = characteristic
         endpointCharacteristic = endpoint
-        handshakePayload = ByteArray(0)
-        handshakeCharacteristic?.value = null
+        refreshHostHandshakePayloadCache()
+        if (handshakeInfrastructurePayload.isEmpty()) {
+            handshakeCharacteristic?.value = null
+        }
         endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
 
         val advertiseSettings = AdvertiseSettings.Builder()
@@ -1146,19 +1452,93 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         Log.i("AirShareNative", "Waiting for GATT service registration before advertising")
     }
 
+    private fun resetHostHandshakeState(result: MethodChannel.Result) {
+        approvedPeerHostKeys.clear()
+        pendingApprovalSessionKeys.clear()
+        guestPublicKeyByTransport.clear()
+        transportByGuestPublicKey.clear()
+        activeSubscribers.clear()
+        clearPendingRead()
+        cancelApprovalTimeout()
+        Log.i("AirShareNative", "Host handshake state reset (approvals + CCCD subscribers)")
+        result.success(null)
+    }
+
+    private fun resetGuestHandshakeState(result: MethodChannel.Result) {
+        cancelHandshakeWait()
+        handshakeDeliveryResult?.error(
+            "handshake_reset",
+            "Guest BLE handshake reset during teardown",
+            null,
+        )
+        handshakeDeliveryResult = null
+        handshakeDelivered = false
+        handshakeDeliveryGatt = null
+        activeGattClient?.close()
+        activeGattClient = null
+        unbindGuestProcessFromHubNetwork("resetGuestHandshakeState")
+        Log.i("AirShareNative", "Guest handshake state reset")
+        result.success(null)
+    }
+
+    private fun releaseGuestWlanBinding(result: MethodChannel.Result) {
+        val connectivityManager =
+            getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        safeUnregisterHubWlanCallback(connectivityManager)
+        unbindGuestProcessFromHubNetwork("releaseGuestWlanBinding")
+        result.success(null)
+    }
+
+    private fun connectivityManager(): ConnectivityManager =
+        applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
+    private fun bindGuestProcessToHubNetwork(network: Network, reason: String): Boolean {
+        val cm = connectivityManager()
+        guestHubBoundNetwork = network
+        val bound = cm.bindProcessToNetwork(network)
+        Log.i(
+            "AirShareNative",
+            "bindProcessToNetwork($reason) network=$network bound=$bound",
+        )
+        return bound
+    }
+
+    private fun unbindGuestProcessFromHubNetwork(reason: String) {
+        guestHubBoundNetwork = null
+        try {
+            val cm = connectivityManager()
+            val cleared = cm.bindProcessToNetwork(null)
+            Log.i(
+                "AirShareNative",
+                "bindProcessToNetwork(null) reason=$reason cleared=$cleared",
+            )
+        } catch (e: Exception) {
+            Log.w(
+                "AirShareNative",
+                "bindProcessToNetwork(null) failed reason=$reason: ${e.message}",
+            )
+        }
+    }
+
     private fun stopHubAdvertising(result: MethodChannel.Result) {
+        approvedPeerHostKeys.clear()
+        pendingApprovalSessionKeys.clear()
+        guestPublicKeyByTransport.clear()
+        transportByGuestPublicKey.clear()
+        activeSubscribers.clear()
+        clearPendingRead()
+        cancelApprovalTimeout()
         bleAdvertiser?.stopAdvertising(advertiseCallback)
         isAdvertising = false
         pendingAdvertiseSettings = null
         pendingAdvertiseData = null
         pendingScanResponseData = null
         pendingAdvertiseResult = null
-        clearPendingRead()
         gattServer?.close()
         gattServer = null
         handshakeCharacteristic = null
         endpointCharacteristic = null
-        handshakePayload = ByteArray(0)
+        handshakeInfrastructurePayload = ByteArray(0)
         result.success(null)
     }
 
@@ -1166,6 +1546,11 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         val peerId = call.argument<String>("peerId")
         if (peerId.isNullOrBlank()) {
             result.error("invalid_peer", "Peer id is required.", null)
+            return
+        }
+        val guestPublicKey = call.argument<String>("guestPublicKey")?.trim().orEmpty()
+        if (guestPublicKey.isEmpty()) {
+            result.error("invalid_guest_key", "guestPublicKey is required.", null)
             return
         }
         val device = bluetoothAdapter?.getRemoteDevice(peerId)
@@ -1177,6 +1562,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         cancelHandshakeWait()
         handshakeDelivered = false
         handshakeDeliveryResult = result
+        var guestPublicKeyWritePending = true
         activeGattClient?.close()
         var handshakeSetupStarted = false
         fun beginHandshakeSetup(gatt: BluetoothGatt) {
@@ -1246,10 +1632,58 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     return
                 }
                 handshakeDeliveryGatt = gatt
-                gatt.setCharacteristicNotification(characteristic, true)
-                val descriptor = characteristic.getDescriptor(clientConfigDescriptorUuid)
+                val guestPkJson = JSONObject().put("guest_public_key", guestPublicKey).toString()
+                characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                characteristic.value = guestPkJson.toByteArray(StandardCharsets.UTF_8)
+                if (!gatt.writeCharacteristic(characteristic)) {
+                    handshakeDeliveryResult?.error(
+                        "guest_key_write_failed",
+                        "Failed to write guest_public_key to host.",
+                        null,
+                    )
+                    handshakeDeliveryResult = null
+                    gatt.close()
+                    return
+                }
+                scheduleHandshakeWait(gatt)
+            }
+
+            override fun onCharacteristicWrite(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int,
+            ) {
+                if (characteristic.uuid != handshakeCharacteristicUuid) return
+                if (!guestPublicKeyWritePending) return
+                guestPublicKeyWritePending = false
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    handshakeDeliveryResult?.error(
+                        "guest_key_write_failed",
+                        "guest_public_key write failed status=$status",
+                        null,
+                    )
+                    handshakeDeliveryResult = null
+                    gatt.close()
+                    return
+                }
+                val handshakeChar = gatt
+                    .getService(serviceUuid)
+                    ?.getCharacteristic(handshakeCharacteristicUuid)
+                if (handshakeChar == null) {
+                    handshakeDeliveryResult?.error(
+                        "characteristic_missing",
+                        "Handshake characteristic missing after guest key write.",
+                        null,
+                    )
+                    handshakeDeliveryResult = null
+                    gatt.close()
+                    return
+                }
+                handshakeDeliveryGatt = gatt
+                gatt.setCharacteristicNotification(handshakeChar, true)
+                val descriptor = handshakeChar.getDescriptor(clientConfigDescriptorUuid)
                 if (descriptor == null) {
-                    if (!gatt.readCharacteristic(characteristic)) {
+                    if (!gatt.readCharacteristic(handshakeChar)) {
                         handshakeDeliveryResult?.error(
                             "handshake_read_failed",
                             "Failed to start handshake read.",
@@ -1264,7 +1698,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 }
                 descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 if (!gatt.writeDescriptor(descriptor)) {
-                    if (!gatt.readCharacteristic(characteristic)) {
+                    if (!gatt.readCharacteristic(handshakeChar)) {
                         handshakeDeliveryResult?.error(
                             "handshake_notify_failed",
                             "Failed to enable handshake notifications.",
@@ -1580,7 +2014,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     localHotspotReservation = reservation
                     activeHotspotReservation = reservation
                     hotspotActive = true
-                    handshakePayload = ByteArray(0)
+                    handshakeInfrastructurePayload = ByteArray(0)
                     handshakeCharacteristic?.value = null
                     val (systemSsid, systemPassword) = extractLocalOnlyHotspotCredentials(reservation)
                     if (systemSsid.isBlank()) {
@@ -1606,12 +2040,11 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     pendingHotspotPassword = systemPassword
                     pendingHotspotHubIp = hubIp
                     pendingHubPort = requestedPort
-                    if (pendingLanIp.isBlank() && pendingP2pIp.isBlank()) {
-                        pendingHubIp = hubIp
+                    if (pendingLanIp.isBlank() || isLikelyCarrierWanIp(pendingLanIp)) {
+                        pendingLanIp = hubIp
                     }
-                    val endpointIp = pendingLanIp.ifBlank {
-                        pendingP2pIp.ifBlank { hubIp }
-                    }
+                    pendingHubIp = hubIp
+                    val endpointIp = hubIp
                     advertisedEndpoint = "$endpointIp:$pendingHubPort"
                     endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
                     Log.i(
@@ -1727,10 +2160,13 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             }
 
             val request = try {
-                NetworkRequest.Builder()
+                val builder = NetworkRequest.Builder()
                     .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                     .setNetworkSpecifier(specifier)
-                    .build()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    builder.removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                }
+                builder.build()
             } catch (e: Exception) {
                 Log.e("AirShareNative", "connectToHubWlan: NetworkRequest build failed: ${e.message}", e)
                 result.error(
@@ -1755,6 +2191,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 resultDelivered = true
                 hubWlanRequestTimeoutRunnable?.let { hubWlanRequestHandler.removeCallbacks(it) }
                 hubWlanRequestTimeoutRunnable = null
+                unbindGuestProcessFromHubNetwork("connectToHubWlan error")
                 safeUnregisterHubWlanCallback(connectivityManager)
                 if (throwable != null) {
                     Log.e("AirShareNative", "connectToHubWlan: $code — $message", throwable)
@@ -1773,18 +2210,39 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             connectivityCallback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     try {
-                        connectivityManager.bindProcessToNetwork(network)
-                        Log.i(
-                            "AirShareNative",
-                            "connectToHubWlan: onAvailable — bound to hub hotspot ssid=$ssid",
-                        )
-                        deliverSuccess()
+                        val bound = bindGuestProcessToHubNetwork(network, "onAvailable ssid=$ssid")
+                        if (!bound) {
+                            deliverError(
+                                "wlan_bind_failed",
+                                "Wi-Fi connected but bindProcessToNetwork returned false for ssid=$ssid",
+                            )
+                            return
+                        }
+                        hubWlanRequestHandler.postDelayed({
+                            try {
+                                bindGuestProcessToHubNetwork(network, "post-bind ssid=$ssid")
+                            } catch (_: Exception) {
+                            }
+                            deliverSuccess()
+                        }, 300L)
                     } catch (e: Exception) {
                         deliverError(
                             "wlan_bind_failed",
                             "Connected but failed to bind process to network: ${e.message}",
                             e,
                         )
+                    }
+                }
+
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    networkCapabilities: NetworkCapabilities,
+                ) {
+                    if (!networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                        return
+                    }
+                    if (guestHubBoundNetwork == null || guestHubBoundNetwork == network) {
+                        bindGuestProcessToHubNetwork(network, "onCapabilitiesChanged ssid=$ssid")
                     }
                 }
 
@@ -1798,6 +2256,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
 
                 override fun onLost(network: Network) {
                     Log.w("AirShareNative", "connectToHubWlan: onLost ssid=$ssid")
+                    if (guestHubBoundNetwork == network) {
+                        unbindGuestProcessFromHubNetwork("onLost ssid=$ssid")
+                    }
                 }
 
                 override fun onLosing(network: Network, maxMsToLive: Int) {
@@ -1879,7 +2340,11 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         gattServer = null
         handshakeCharacteristic = null
         endpointCharacteristic = null
-        handshakePayload = ByteArray(0)
+        handshakeInfrastructurePayload = ByteArray(0)
+        approvedPeerHostKeys.clear()
+        pendingApprovalSessionKeys.clear()
+        guestPublicKeyByTransport.clear()
+        transportByGuestPublicKey.clear()
         clearPendingRead()
         pendingHotspotSsid = null
         pendingHotspotPassword = null
@@ -1899,9 +2364,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         stopNativeHotspot(MethodChannelResultProxy())
         val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         safeUnregisterHubWlanCallback(connectivityManager)
-        try {
-            connectivityManager.bindProcessToNetwork(null)
-        } catch (_: Exception) {}
+        unbindGuestProcessFromHubNetwork("stopInternalLink")
         val p2pMgr = wifiP2pManager
         val p2pChan = wifiP2pChannel
         if (p2pMgr != null && p2pChan != null) {
@@ -2218,32 +2681,28 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         return l.startsWith("ap") || l.contains("softap")
     }
 
-    /// Hub IP on the LocalOnlyHotspot interface (ap0), not wlan0 or p2p.
+    /// LocalOnlyHotspot gateway — never derive from ccmni/rmnet cellular interfaces.
     private fun resolveHotspotHubIpv4Address(): String {
-        return try {
+        val gateway = androidHotspotGatewayIp()
+        try {
             val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
             for (iface in interfaces) {
                 if (!iface.isUp || iface.isLoopback || !isHotspotHubInterface(iface.name)) continue
                 for (address in Collections.list(iface.inetAddresses)) {
                     if (address is Inet4Address && !address.isLoopbackAddress) {
                         val ip = address.hostAddress ?: continue
-                        Log.i("AirShareNative", "Hotspot hub IP from ${iface.name}: $ip")
-                        return ip
+                        Log.i(
+                            "AirShareNative",
+                            "Hotspot interface ${iface.name} has $ip — advertising gateway $gateway",
+                        )
+                        return gateway
                     }
                 }
             }
-            for (iface in interfaces) {
-                if (!iface.isUp || iface.isLoopback || isExcludedFromTier1Lan(iface.name)) continue
-                for (address in Collections.list(iface.inetAddresses)) {
-                    if (address is Inet4Address && !address.isLoopbackAddress) {
-                        return address.hostAddress ?: "192.168.43.1"
-                    }
-                }
-            }
-            "192.168.43.1"
-        } catch (_: Exception) {
-            "192.168.43.1"
+        } catch (e: Exception) {
+            Log.w("AirShareNative", "resolveHotspotHubIpv4Address: ${e.message}")
         }
+        return gateway
     }
 
     private fun resolveLocalIpv4Address(): String = resolveHotspotHubIpv4Address()

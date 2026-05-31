@@ -1,3 +1,5 @@
+import 'package:air_share/host_ble_endpoint_snapshot.dart';
+
 class HubEndpointState {
   HubEndpointState._();
 
@@ -5,6 +7,7 @@ class HubEndpointState {
 
   String? pendingIp;
   int pendingPort = 8080;
+  HostBleEndpointSnapshot? lastBleSnapshot;
 
   void setPending({
     required String ip,
@@ -14,9 +17,14 @@ class HubEndpointState {
     pendingPort = port;
   }
 
+  void rememberBleSnapshot(HostBleEndpointSnapshot snapshot) {
+    lastBleSnapshot = snapshot;
+  }
+
   void clear() {
     pendingIp = null;
     pendingPort = 8080;
+    lastBleSnapshot = null;
   }
 }
 

@@ -28,6 +28,9 @@ environment:
 # the latest version available on pub.dev. To see which dependencies have newer
 # versions available, run `flutter pub outdated`.
 dependencies:
+  basic_utils: ^5.7.0
+  crypto: ^3.0.6
+  cryptography: ^2.9.0
   device_info_plus: ^11.2.0
   geolocator: ^13.0.2
   http: ^1.1.0

@@ -9,12 +9,15 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'connection_logger.dart';
+import 'hub_auth.dart';
+import 'hub_session_registry.dart';
+import 'hub_tls_credentials.dart';
 import 'hub_status.dart';
 import 'shared_file_entry.dart';
 import 'shared_room_manifest.dart';
 
 /// IPv4 all-interfaces listen address. **Not** loopback — required so other phones
-/// on the same LAN can open TCP to the hub (Android hub uses Dart [HttpServer]).
+/// on the same LAN can open TCP to the TLS hub (Dart [HttpServer.bindSecure]).
 final InternetAddress _hubListenAllIPv4 = InternetAddress('0.0.0.0');
 
 class LocalHubRuntime {
@@ -70,18 +73,22 @@ class LocalHubRuntime {
       await _ensureSharedDirectoryExists(_sharedDirPath!);
       final sharedDir = Directory(_sharedDirPath!);
 
+      HubSessionRegistry.instance.tls ??= await HubTlsCredentials.generate();
+      final tls = HubSessionRegistry.instance.tls!;
+
       _server = await _bindWithPortFallback(
         address: _hubListenAllIPv4,
         startingPort: 8080,
         maxAttempts: 10,
+        securityContext: tls.securityContext,
       );
       _activePort = _server!.port;
       final boundAddr = _server!.address.address;
       await ConnectionLogger.instance.log(
-        'HTTP Server Start',
+        'HTTPS Server Start',
         details:
-            'bind=$boundAddr port=$_activePort shared_dir=${sharedDir.path} '
-            '(expect bind=0.0.0.0 for LAN guests)',
+            'bind=$boundAddr port=$_activePort tls_sha256=${tls.certSha256Hex.substring(0, 16)}… '
+            'shared_dir=${sharedDir.path}',
       );
       stdout.writeln('[HubRuntime] shared directory (serve from): ${sharedDir.path}');
       _server!.listen((request) async {
@@ -97,7 +104,7 @@ class LocalHubRuntime {
       });
 
       status.setBroadcasting();
-      stdout.writeln('[HubRuntime] Sender HTTP server started on port $_activePort');
+      stdout.writeln('[HubRuntime] Sender HTTPS server started on port $_activePort');
     } on SocketException catch (error) {
       status.setError('Port binding failed after retries: $error');
       stdout.writeln('[HubRuntime] Port binding issue: $error');
@@ -119,6 +126,9 @@ class LocalHubRuntime {
     _server = null;
     _activePort = 8080;
     _loggedFirstInbound = false;
+    await ConnectionLogger.instance.log(
+      'Teardown | HTTPS hub stopped (guest session map cleared via registry)',
+    );
   }
 
   Future<String> _resolveSharedDirectoryPath() async {
@@ -165,6 +175,7 @@ class LocalHubRuntime {
     required InternetAddress address,
     required int startingPort,
     required int maxAttempts,
+    required SecurityContext securityContext,
   }) async {
     var attempt = 0;
     var port = startingPort;
@@ -172,7 +183,12 @@ class LocalHubRuntime {
 
     while (attempt < maxAttempts) {
       try {
-        return await HttpServer.bind(address, port, shared: true);
+        return await HttpServer.bindSecure(
+          address,
+          port,
+          securityContext,
+          shared: true,
+        );
       } catch (error) {
         lastError = error;
         stdout.writeln(
@@ -185,12 +201,53 @@ class LocalHubRuntime {
     throw SocketException('Unable to bind server port: $lastError');
   }
 
+  Future<bool> _authorizeRequest(HttpRequest request) async {
+    final hostSession = HubSessionRegistry.instance.host;
+    final auth = HubAuth.evaluate(
+      request: request,
+      hostSession: hostSession,
+    );
+    switch (auth.decision) {
+      case HubAuthDecision.allow:
+        return true;
+      case HubAuthDecision.registerGuest:
+        final guestPk = auth.message;
+        if (hostSession == null || guestPk == null || guestPk.isEmpty) {
+          return false;
+        }
+        final remote = request.connectionInfo?.remoteAddress.address;
+        await hostSession.registerGuestPublicKey(
+          guestPk,
+          remoteAddress: remote,
+        );
+        final bearer = HubAuth.parseBearer(request.headers);
+        if (hostSession.verifyBearer(bearer, remoteAddress: remote)) {
+          await ConnectionLogger.instance.log(
+            'HTTP | Guest session registered (ECDH bearer active)',
+            details:
+                'remote=${remote ?? "unknown"} guests=${hostSession.registeredGuestCount}',
+          );
+          return true;
+        }
+        return false;
+      case HubAuthDecision.unauthorized:
+        return false;
+    }
+  }
+
   Future<void> _routeRequest(HttpRequest request, String sharedDirPath) async {
+    if (!await _authorizeRequest(request)) {
+      request.response.statusCode = HttpStatus.unauthorized;
+      request.response.write('Unauthorized');
+      await request.response.close();
+      return;
+    }
+
     if (!_loggedFirstInbound) {
       _loggedFirstInbound = true;
       final remote = request.connectionInfo?.remoteAddress;
       await ConnectionLogger.instance.log(
-        'HTTP | First inbound (hub reachable for guest TCP)',
+        'HTTPS | First inbound (hub reachable for guest TLS)',
         details: 'method=${request.method} path=${request.uri.path} remote=$remote',
       );
       stdout.writeln(

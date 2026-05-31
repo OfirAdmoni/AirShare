@@ -10,7 +10,11 @@ import 'package:path_provider/path_provider.dart';
 
 import 'package:air_share/connection_logger.dart';
 import 'package:air_share/file_zone_session.dart';
+import 'package:air_share/hub_auth.dart';
+import 'package:air_share/hub_http_client.dart';
+import 'package:air_share/hub_session_registry.dart';
 import 'package:air_share/hub_status.dart';
+import 'package:air_share/wire_contract.dart';
 import 'package:air_share/local_hub_runtime.dart';
 import 'package:air_share/local_peer_identity.dart';
 import 'package:air_share/shared_file_entry.dart';
@@ -67,44 +71,95 @@ class _FileListScreenState extends State<FileListScreen> {
 
   // Transfer-cancellation state (Case A).
   bool _teardownConfirmed = false;
+  http.Client? _hubClient;
   http.Client? _activeDownloadClient;
   String? _activeDownloadPath;
 
   bool get _isTransferActive => isDownloading || isUploading;
 
-  String get baseUrl => 'http://${widget.hubHost}:${widget.hubPort}';
+  String get baseUrl =>
+      HubHttpClient.baseUrlFor(widget.hubHost, widget.hubPort);
   HubStatus get _hubStatus => HubStatusScope.of(context);
 
+  Map<String, String> _securityHeaders() {
+    final guest = HubSessionRegistry.instance.guest;
+    if (guest != null) {
+      return HubAuth.guestSecurityHeaders(guest);
+    }
+    // Host file console: authorized via loopback + [requesterRole: host] in
+    // [_roomRequestHeaders]; guests use per-peer bearers on the hub, not here.
+    return const {};
+  }
+
   Map<String, String> _roomRequestHeaders() => {
+        ..._securityHeaders(),
         if (_localPeerId != null)
-          'x-airshare-requester-peer-id': _localPeerId!,
-        'x-airshare-requester-role': widget.isHubMode ? 'host' : 'guest',
+          WireContract.requesterPeerId: _localPeerId!,
+        WireContract.requesterRole: widget.isHubMode ? 'host' : 'guest',
       };
 
   Map<String, String> _uploadSenderHeaders() => {
-        if (_localPeerId != null) 'x-airshare-sender-id': _localPeerId!,
-        'x-airshare-sender-name': _localDisplayName,
-        'x-airshare-requester-role': widget.isHubMode ? 'host' : 'guest',
+        ..._securityHeaders(),
+        if (_localPeerId != null) WireContract.senderId: _localPeerId!,
+        WireContract.senderName: _localDisplayName,
+        WireContract.requesterRole: widget.isHubMode ? 'host' : 'guest',
       };
 
-  Future<void> fetchFiles() async {
+  http.Client get _client {
+    final client = _hubClient;
+    if (client == null) {
+      throw StateError('Hub HTTPS client is not initialized');
+    }
+    return client;
+  }
+
+  Future<void> _ensureHubClient() async {
+    if (_hubClient != null) return;
+    final fingerprint = HubSessionRegistry.instance.expectedTlsFingerprint ??
+        HubSessionRegistry.instance.tls?.certSha256Hex;
+    if (fingerprint == null || fingerprint.isEmpty) {
+      throw StateError('Hub TLS fingerprint is not available');
+    }
+    _hubClient = HubHttpClient.createPinned(
+      expectedCertSha256Hex: fingerprint,
+    );
+  }
+
+  /// Refreshes the shared room file list over pinned HTTPS.
+  Future<void> refreshFiles() async {
     try {
-      final response = await http.get(Uri.parse('$baseUrl/files'));
-      if (response.statusCode == 200) {
-        final decoded = json.decode(response.body);
-        final parsed = <SharedFileEntry>[];
-        if (decoded is List) {
-          for (final item in decoded) {
+      await _ensureHubClient();
+      final response = await _client.get(
+        Uri.parse('$baseUrl/files'),
+        headers: _roomRequestHeaders(),
+      );
+      if (response.statusCode != HttpStatus.ok) {
+        debugPrint(
+          'GET /files failed: status=${response.statusCode} body=${response.body}',
+        );
+        return;
+      }
+      final decoded = json.decode(response.body);
+      final parsed = <SharedFileEntry>[];
+      if (decoded is List) {
+        for (final item in decoded) {
+          if (item is Map<String, dynamic>) {
             parsed.add(SharedFileEntry.fromJson(item));
+          } else if (item is Map) {
+            parsed.add(
+              SharedFileEntry.fromJson(Map<String, dynamic>.from(item)),
+            );
           }
         }
-        if (!mounted) return;
-        setState(() => files = parsed);
       }
+      if (!mounted) return;
+      setState(() => files = parsed);
     } catch (e) {
       debugPrint('Data directory query failed: $e');
     }
   }
+
+  Future<void> fetchFiles() => refreshFiles();
 
   Future<void> deleteFile(SharedFileEntry entry) async {
     if (!_canDelete(entry)) {
@@ -123,7 +178,8 @@ class _FileListScreenState extends State<FileListScreen> {
       );
       final request = http.Request('DELETE', uri)
         ..headers.addAll(_roomRequestHeaders());
-      final response = await request.send();
+      await _ensureHubClient();
+      final response = await _client.send(request);
       if (response.statusCode != HttpStatus.ok) {
         final body = await response.stream.bytesToString();
         throw Exception(
@@ -194,7 +250,8 @@ class _FileListScreenState extends State<FileListScreen> {
       downloadingFileName = fileName;
     });
 
-    final client = http.Client();
+    await _ensureHubClient();
+    final client = _client;
     _activeDownloadClient = client;
     // Track the IOSink so the finally block can close it before deleting the
     // partial file — required on Windows which cannot delete open file handles.
@@ -204,7 +261,8 @@ class _FileListScreenState extends State<FileListScreen> {
       final uri = Uri.parse(
         '$baseUrl/download?name=${Uri.encodeComponent(fileName)}',
       );
-      final request = http.Request('GET', uri);
+      final request = http.Request('GET', uri)
+        ..headers.addAll(_roomRequestHeaders());
       final response = await client.send(request);
 
       if (response.statusCode != HttpStatus.ok) {
@@ -257,7 +315,6 @@ class _FileListScreenState extends State<FileListScreen> {
         } catch (_) {}
       }
       _activeDownloadClient = null;
-      client.close();
 
       // Delete partial file if the user explicitly confirmed cancellation.
       if (_teardownConfirmed) {
@@ -345,10 +402,17 @@ class _FileListScreenState extends State<FileListScreen> {
       http.MultipartFile('file', uploadStream, totalBytes, filename: staged.name),
     );
 
-    final streamedResponse = await request.send();
-    if (streamedResponse.statusCode != 201) {
-      throw Exception('Upload failed (${streamedResponse.statusCode})');
+    await _ensureHubClient();
+    final streamedResponse = await _client.send(request);
+    if (streamedResponse.statusCode != HttpStatus.created) {
+      final body = await streamedResponse.stream.bytesToString();
+      throw Exception(
+        body.isNotEmpty
+            ? body
+            : 'Upload failed (${streamedResponse.statusCode})',
+      );
     }
+    await refreshFiles();
   }
 
   Future<void> pickAndUploadFile() async {
@@ -380,9 +444,9 @@ class _FileListScreenState extends State<FileListScreen> {
       var uploadedCount = 0;
       for (final file in staged) {
         await _uploadStagedFile(file);
-        await fetchFiles();
         uploadedCount++;
       }
+      await refreshFiles();
 
       if (!mounted) return;
       final label = uploadedCount == 1
@@ -420,10 +484,7 @@ class _FileListScreenState extends State<FileListScreen> {
   @override
   void initState() {
     super.initState();
-    _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-      if (mounted) fetchFiles();
-    });
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
       _enforceFileZoneGate();
       if (!mounted) return;
@@ -433,7 +494,11 @@ class _FileListScreenState extends State<FileListScreen> {
       if (session.hubHost != widget.hubHost || session.hubPort != widget.hubPort) {
         return;
       }
-      _initAfterGate();
+      await _initAfterGate();
+      if (!mounted || _hubClient == null) return;
+      _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+        if (mounted) refreshFiles();
+      });
     });
   }
 
@@ -443,6 +508,7 @@ class _FileListScreenState extends State<FileListScreen> {
     if (notifier.value == null) return;
 
     try {
+      await _ensureHubClient();
       final identity = await LocalPeerIdentity.resolve();
       if (mounted) {
         setState(() {
@@ -456,7 +522,7 @@ class _FileListScreenState extends State<FileListScreen> {
 
     if (widget.isHubMode) {
       _ingressSubscription = LocalHubRuntime.instance.ingressEvents.listen((_) {
-        fetchFiles();
+        refreshFiles();
       });
       _guestConnectedSub = LocalHubRuntime.instance.firstGuestConnected.listen((_) {
         if (mounted) {
@@ -482,6 +548,7 @@ class _FileListScreenState extends State<FileListScreen> {
     _ingressSubscription?.cancel();
     _guestConnectedSub?.cancel();
     _guestConnectionTimer?.cancel();
+    _hubClient?.close();
     super.dispose();
   }
 

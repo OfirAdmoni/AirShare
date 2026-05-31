@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -67,6 +68,22 @@ class FlutterWindow : public Win32Window {
                          flutter::MethodResult<flutter::EncodableValue>* result);
   void UpdateHubEndpoint(const flutter::EncodableMap& args,
                          flutter::MethodResult<flutter::EncodableValue>* result);
+  void UpdateConnectionEndpoints(
+      const flutter::EncodableMap& args,
+      flutter::MethodResult<flutter::EncodableValue>* result);
+  void WaitForSessionHandshake(
+      const flutter::EncodableMap& args,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void ClearGuestHandshakeSession();
+  void ResetHostHandshakeState(
+      flutter::MethodResult<flutter::EncodableValue>* result);
+  void ResetGuestHandshakeState(
+      flutter::MethodResult<flutter::EncodableValue>* result);
+  bool EnableGuestHandshakeNotifications(
+      const winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::
+          GattCharacteristic& characteristic);
+  void DisableGuestHandshakeNotifications();
+  void RefreshHostHandshakeGattCache();
   void GetLocalPeerId(
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void IsBluetoothEnabled(
@@ -79,7 +96,12 @@ class FlutterWindow : public Win32Window {
   bool IsAirShareService(const std::vector<winrt::guid>& uuids) const;
   std::string WinrtStringToUtf8(const winrt::hstring& value) const;
   void NotifyFlutterConnectionRequest(const std::string& friendly_name,
-                                      const std::string& session_id);
+                                      const std::string& session_key);
+  void RegisterGuestSession(const std::string& transport_id,
+                            const std::string& guest_public_key);
+  std::string ResolveSessionKey(const std::string& transport_id);
+  std::string ParseGuestPublicKeyFromWriteBuffer(
+      const winrt::Windows::Storage::Streams::IBuffer& buffer);
   // Runs on the Win32 message-thread (same thread Flutter expects for channels).
   void DispatchToPlatformThread(std::unique_ptr<AirSharePlatformTask> task);
 
@@ -94,7 +116,12 @@ class FlutterWindow : public Win32Window {
   void ScheduleApprovalTimeout();
   void ClearPendingReadState();
   winrt::Windows::Storage::Streams::IBuffer BuildHandshakeBuffer() const;
+  winrt::Windows::Storage::Streams::IBuffer BuildHandshakeBufferForPeer(
+      const std::string& peer_id) const;
   winrt::Windows::Storage::Streams::IBuffer BuildEndpointBuffer() const;
+  flutter::EncodableMap ParseHandshakeJsonToMap(const std::string& json) const;
+  bool JsonHasInfrastructure(const std::string& json) const;
+  bool HandshakeBufferHasInfrastructure() const;
 
   // The project to run.
   flutter::DartProject project_;
@@ -124,6 +151,7 @@ class FlutterWindow : public Win32Window {
   winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattLocalCharacteristic
       gatt_endpoint_{nullptr};
   std::optional<winrt::event_token> handshake_read_token_;
+  std::optional<winrt::event_token> handshake_write_token_;
   std::optional<winrt::event_token> endpoint_read_token_;
   bool is_advertising_ = false;
 
@@ -138,8 +166,30 @@ class FlutterWindow : public Win32Window {
 
   std::string pending_ssid_;
   std::string pending_password_;
+  std::string pending_lan_ip_;
+  std::string pending_p2p_ip_;
+  std::string pending_p2p_mac_;
+  std::string pending_hotspot_hub_ip_;
   std::string pending_hub_ip_;
   int pending_hub_port_ = 8080;
+  std::string host_session_public_key_;
+  /// guest_public_key → host_public_key after Approve.
+  std::unordered_map<std::string, std::string> approved_peer_host_keys_;
+  std::unordered_map<std::string, std::string> guest_public_key_by_transport_;
+  std::unordered_map<std::string, std::string> transport_by_guest_public_key_;
+  mutable std::mutex session_map_mutex_;
+  std::string pending_tls_cert_sha256_;
+
+  std::mutex guest_handshake_mutex_;
+  winrt::Windows::Devices::Bluetooth::BluetoothLEDevice guest_handshake_device_{
+      nullptr};
+  winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattCharacteristic
+      guest_handshake_char_{nullptr};
+  std::optional<winrt::event_token> guest_handshake_value_changed_token_;
+  std::mutex guest_session_cv_mutex_;
+  std::condition_variable guest_session_cv_;
+  std::string guest_session_notify_json_;
+  bool guest_session_received_ = false;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

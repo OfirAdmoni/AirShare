@@ -4,6 +4,7 @@ import 'package:air_share/ble_transport.dart';
 import 'package:air_share/connection_logger.dart';
 import 'package:air_share/guest_connection_guard.dart';
 import 'package:air_share/hub_endpoint_state.dart';
+import 'package:air_share/hub_session_registry.dart';
 import 'package:air_share/local_hub_runtime.dart';
 import 'package:air_share/wlan_link_manager.dart';
 
@@ -23,6 +24,7 @@ class SessionTeardown {
   static Future<void> runSenderTeardown({
     bool hotspotStartInFlight = false,
   }) async {
+    HubSessionRegistry.instance.clear();
     if (hotspotStartInFlight) {
       await ConnectionLogger.instance.log(
         'Teardown | Hotspot release called while start in progress',
@@ -30,6 +32,7 @@ class SessionTeardown {
     }
 
     try {
+      await BleTransport.instance.resetHostHandshakeState();
       await BleTransport.instance.stopHubAdvertising();
       await ConnectionLogger.instance.log('Teardown | BLE advertising stopped');
     } catch (e) {
@@ -84,8 +87,13 @@ class SessionTeardown {
 
   /// Receiver-side teardown: BLE scanner → connection guard.
   static Future<void> runReceiverTeardown() async {
+    HubSessionRegistry.instance.clear();
     try {
+      await BleTransport.instance.resetGuestHandshakeState();
       await BleTransport.instance.stopScanning();
+      if (Platform.isAndroid) {
+        await WlanLinkManager.instance.releaseGuestWlanBinding();
+      }
       await ConnectionLogger.instance.log('Teardown | BLE scanning stopped');
     } catch (e) {
       await ConnectionLogger.instance.log(

@@ -28,7 +28,13 @@ final class BleTransportPlugin: NSObject {
   // Host GATT state
   private var handshakeCharacteristic: CBMutableCharacteristic?
   private var endpointCharacteristic: CBMutableCharacteristic?
-  private var handshakePayload = Data()
+  private var handshakeInfrastructurePayload = Data()
+  private var hostSessionPublicKey = ""
+  /// guest_public_key → host_public_key after Approve.
+  private var approvedPeerHostKeys: [String: String] = [:]
+  private var guestPublicKeyByCentralId: [String: String] = [:]
+  private var centralIdByGuestPublicKey: [String: String] = [:]
+  private var pendingApprovalSessionKeys = Set<String>()
   private var advertisedEndpoint = ""
   private var pendingLanIp = ""
   private var pendingP2pIp = ""
@@ -38,9 +44,11 @@ final class BleTransportPlugin: NSObject {
   private var pendingHotspotHubIp = ""
   private var pendingHubIp: String?
   private var pendingHubPort = 8080
+  private var pendingTlsCertSha256 = ""
   private var hotspotActive = false
   private var pendingApprovalCentralId: String?
   private var approvalTimeoutWorkItem: DispatchWorkItem?
+  private var subscribedCentrals: [String: CBCentral] = [:]
 
   // Guest handshake state
   private var activeGuestPeripheral: CBPeripheral?
@@ -48,6 +56,8 @@ final class BleTransportPlugin: NSObject {
   private var handshakeDelivered = false
   private var handshakeWaitWorkItem: DispatchWorkItem?
   private var guestHandshakeCharacteristic: CBCharacteristic?
+  private var guestPublicKeyWritePending = false
+  private var pendingGuestPublicKey = ""
 
   private var pendingStartScanResult: FlutterResult?
   private var pendingAdvertiseResult: FlutterResult?
@@ -103,6 +113,10 @@ final class BleTransportPlugin: NSObject {
       updateConnectionEndpoints(call: call, result: result)
     case "approveConnection":
       approveConnection(call: call, result: result)
+    case "resetHostHandshakeState":
+      resetHostHandshakeState(result: result)
+    case "resetGuestHandshakeState":
+      resetGuestHandshakeState(result: result)
     case "isBluetoothEnabled":
       result(centralManager.state == .poweredOn)
     case "requestEnableBluetooth":
@@ -159,11 +173,50 @@ final class BleTransportPlugin: NSObject {
   }
 
   private func stopScanning(result: @escaping FlutterResult) {
+    performGuestHandshakeReset()
     if isScanning {
       centralManager.stopScan()
       isScanning = false
     }
     result(nil)
+  }
+
+  private func resetHostHandshakeState(result: @escaping FlutterResult) {
+    approvedPeerHostKeys.removeAll()
+    guestPublicKeyByCentralId.removeAll()
+    centralIdByGuestPublicKey.removeAll()
+    pendingApprovalSessionKeys.removeAll()
+    subscribedCentrals.removeAll()
+    clearPendingApproval()
+    cancelApprovalTimeout()
+    logBle("Host handshake state reset")
+    result(nil)
+  }
+
+  private func resetGuestHandshakeState(result: @escaping FlutterResult) {
+    performGuestHandshakeReset()
+    result(nil)
+  }
+
+  private func performGuestHandshakeReset() {
+    cancelHandshakeWait()
+    if let delivery = handshakeDeliveryResult {
+      delivery(
+        FlutterError(
+          code: "handshake_reset",
+          message: "Guest BLE handshake reset during teardown",
+          details: nil
+        )
+      )
+    }
+    handshakeDeliveryResult = nil
+    handshakeDelivered = false
+    guestHandshakeCharacteristic = nil
+    if let peripheral = activeGuestPeripheral {
+      centralManager.cancelPeripheralConnection(peripheral)
+      activeGuestPeripheral = nil
+    }
+    logBle("Guest handshake state reset")
   }
 
   private func emitScanPeers() {
@@ -223,9 +276,9 @@ final class BleTransportPlugin: NSObject {
     // peripheral mode via didSubscribeTo. A manual CBMutableDescriptor with value: nil crashes at add().
     let handshakeChar = CBMutableCharacteristic(
       type: Self.handshakeCharacteristicUuid,
-      properties: [.read, .notify],
+      properties: [.read, .notify, .write],
       value: nil,
-      permissions: [.readable]
+      permissions: [.readable, .writeable]
     )
     logBle("added handshake characteristic (read+notify, value=nil, no manual CCCD)")
 
@@ -277,7 +330,12 @@ final class BleTransportPlugin: NSObject {
     gattServicePublished = false
     handshakeCharacteristic = nil
     endpointCharacteristic = nil
-    handshakePayload = Data()
+    approvedPeerHostKeys.removeAll()
+    guestPublicKeyByCentralId.removeAll()
+    centralIdByGuestPublicKey.removeAll()
+    pendingApprovalSessionKeys.removeAll()
+    subscribedCentrals.removeAll()
+    handshakeInfrastructurePayload = Data()
     clearPendingApproval()
     result(nil)
   }
@@ -309,6 +367,13 @@ final class BleTransportPlugin: NSObject {
     pendingHotspotPass = (args["hotspotPass"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     pendingHotspotHubIp = (args["hotspotHubIp"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     pendingHubPort = args["hubPort"] as? Int ?? 8080
+    let incomingHostPk = (args["hostPublicKey"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !incomingHostPk.isEmpty {
+      hostSessionPublicKey = incomingHostPk
+    }
+    pendingTlsCertSha256 = (args["tlsCertSha256"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     // iOS same-Wi-Fi sender: never host offline hotspot.
     hotspotActive = false
     pendingHotspotSsid = ""
@@ -319,16 +384,43 @@ final class BleTransportPlugin: NSObject {
   }
 
   private func approveConnection(call: FlutterMethodCall, result: @escaping FlutterResult) {
-    let approved = (call.arguments as? [String: Any])?["approved"] as? Bool ?? false
+    let args = call.arguments as? [String: Any]
+    let approved = args?["approved"] as? Bool ?? false
+    let sessionKeyArg = (
+      (args?["sessionKey"] as? String) ?? (args?["peerId"] as? String)
+    )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let hostPkArg = (args?["hostPublicKey"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !hostPkArg.isEmpty {
+      hostSessionPublicKey = hostPkArg
+    }
+    let sessionKey = sessionKeyArg.isEmpty
+      ? (pendingApprovalCentralId.flatMap { guestPublicKeyByCentralId[$0] } ?? "")
+      : sessionKeyArg
+
     if !approved {
-      handshakePayload = Data()
-      handshakeCharacteristic?.value = nil
+      if !sessionKey.isEmpty {
+        approvedPeerHostKeys.removeValue(forKey: sessionKey)
+        pendingApprovalSessionKeys.remove(sessionKey)
+      }
       clearPendingApproval()
       result(nil)
       return
     }
 
-    guard let payload = buildHandshakePayloadData() else {
+    if sessionKey.isEmpty {
+      result(FlutterError(code: "invalid_peer", message: "sessionKey (guest public key) is required for approval.", details: nil))
+      return
+    }
+    if hostSessionPublicKey.isEmpty {
+      result(FlutterError(code: "handshake_not_ready", message: "Host session public key is not available.", details: nil))
+      return
+    }
+
+    approvedPeerHostKeys[sessionKey] = hostSessionPublicKey
+    pendingApprovalSessionKeys.remove(sessionKey)
+
+    guard let payload = buildHandshakePayloadForSession(sessionKey: sessionKey) else {
       result(
         FlutterError(
           code: "handshake_not_ready",
@@ -339,14 +431,10 @@ final class BleTransportPlugin: NSObject {
       return
     }
 
-    handshakePayload = payload
     if let json = String(data: payload, encoding: .utf8) {
-      logBle("approveConnection: handshake JSON sent \(json)")
+      logBle("approveConnection: session=\(sessionKey) JSON \(json)")
     }
-    if let char = handshakeCharacteristic {
-      let notified = peripheralManager.updateValue(payload, for: char, onSubscribedCentrals: nil)
-      logBle("approveConnection: notifyCharacteristicChanged=\(notified) bytes=\(payload.count)")
-    }
+    broadcastHandshakeNotifications()
     clearPendingApproval()
     result(nil)
   }
@@ -357,6 +445,9 @@ final class BleTransportPlugin: NSObject {
     guard let args = call.arguments as? [String: Any],
           let peerId = (args["peerId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
           !peerId.isEmpty,
+          let guestPublicKey = (args["guestPublicKey"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+          !guestPublicKey.isEmpty,
           let peripheral = discoveredPeripherals[peerId]
     else {
       result(FlutterError(code: "peer_not_found", message: "Unable to resolve peer device.", details: nil))
@@ -367,6 +458,8 @@ final class BleTransportPlugin: NSObject {
     handshakeDelivered = false
     handshakeDeliveryResult = result
     guestHandshakeCharacteristic = nil
+    pendingGuestPublicKey = guestPublicKey
+    guestPublicKeyWritePending = true
 
     if let active = activeGuestPeripheral, active != peripheral {
       centralManager.cancelPeripheralConnection(active)
@@ -449,30 +542,150 @@ final class BleTransportPlugin: NSObject {
   // MARK: - Handshake helpers
 
   private func refreshHostHandshakePayloadCache() {
-    if let data = buildHandshakePayloadData() {
-      handshakePayload = data
+    if let data = buildHandshakeInfrastructurePayloadData() {
+      handshakeInfrastructurePayload = data
+      handshakeCharacteristic?.value = data
       if let json = String(data: data, encoding: .utf8) {
-        logBle("handshake JSON cached: \(json)")
+        logBle("handshake infrastructure cached: \(json)")
       }
     } else {
-      handshakePayload = Data()
+      handshakeInfrastructurePayload = Data()
+      handshakeCharacteristic?.value = nil
       logBle("handshake JSON cache cleared (endpoints not ready)")
     }
   }
 
-  private func buildHandshakePayloadData() -> Data? {
-    let lan = pendingLanIp
-    let p2p = pendingP2pIp
+  private func handshakeSessionIsReleased(_ data: Data) -> Bool {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      return false
+    }
+    return handshakeSessionIsReleased(json)
+  }
+
+  private func normalizeSessionKey(_ guestPk: String) -> String {
+    guestPk.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private func parseGuestPublicKey(from data: Data) -> String? {
+    guard !data.isEmpty else { return nil }
+    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let pk = (json["guest_public_key"] as? String)?
+         .trimmingCharacters(in: .whitespacesAndNewlines),
+       !pk.isEmpty {
+      return pk
+    }
+    if let text = String(data: data, encoding: .utf8)?
+      .trimmingCharacters(in: .whitespacesAndNewlines),
+       !text.contains("{"), text.count >= 32 {
+      return text
+    }
+    return nil
+  }
+
+  private func registerGuestSession(centralId: String, guestPk: String) {
+    let sessionKey = normalizeSessionKey(guestPk)
+    guard !sessionKey.isEmpty, !centralId.isEmpty else { return }
+    guestPublicKeyByCentralId[centralId] = sessionKey
+    centralIdByGuestPublicKey[sessionKey] = centralId
+  }
+
+  private func promptHandshakeApprovalIfNeeded(centralId: String, friendlyName: String) {
+    guard let sessionKey = guestPublicKeyByCentralId[centralId] else { return }
+    if approvedPeerHostKeys[sessionKey] != nil { return }
+    if pendingApprovalSessionKeys.contains(sessionKey) { return }
+    pendingApprovalSessionKeys.insert(sessionKey)
+    pendingApprovalCentralId = centralId
+    scheduleApprovalTimeout()
+    notifyConnectionRequest(sessionKey: sessionKey, centralId: centralId, friendlyName: friendlyName)
+    logBle("handshake approval prompted session=\(sessionKey) central=\(centralId)")
+  }
+
+  private func buildHandshakePayloadForCentral(centralId: String) -> Data? {
+    guard let sessionKey = guestPublicKeyByCentralId[centralId] else {
+      return buildHandshakeInfrastructurePayloadData()
+    }
+    return buildHandshakePayloadForSession(sessionKey: sessionKey)
+  }
+
+  /// Notifies every central that subscribed to the handshake characteristic (CCCD).
+  private func broadcastHandshakeNotifications() {
+    guard let char = handshakeCharacteristic else {
+      logBle("broadcastHandshakeNotifications: handshake characteristic missing")
+      return
+    }
+    let centrals = Array(subscribedCentrals.values)
+    if centrals.isEmpty {
+      logBle("broadcastHandshakeNotifications: no active CCCD subscribers")
+      return
+    }
+    logBle("broadcastHandshakeNotifications: \(centrals.count) subscriber(s)")
+    for central in centrals {
+      let centralId = central.identifier.uuidString
+      guard let payload = buildHandshakePayloadForCentral(centralId: centralId),
+            !payload.isEmpty
+      else { continue }
+      handshakeCharacteristic?.value = payload
+      let notified = peripheralManager.updateValue(
+        payload,
+        for: char,
+        onSubscribedCentrals: [central]
+      )
+      let sessionKey = guestPublicKeyByCentralId[centralId] ?? "(unmapped)"
+      logBle(
+        "notify central=\(centralId) session=\(sessionKey) notified=\(notified) bytes=\(payload.count)"
+      )
+    }
+  }
+
+  private func buildHandshakePayloadForSession(sessionKey: String) -> Data? {
+    guard var json = buildHandshakeInfrastructurePayloadData(),
+          var dict = try? JSONSerialization.jsonObject(with: json) as? [String: Any]
+    else { return nil }
+    if let hostPk = approvedPeerHostKeys[sessionKey], !hostPk.isEmpty {
+      dict["host_public_key"] = hostPk
+      json = (try? JSONSerialization.data(withJSONObject: dict)) ?? json
+    }
+    return json
+  }
+
+  private static let iosHotspotGateway = "172.20.10.1"
+
+  private func isLikelyCarrierWanIp(_ ip: String) -> Bool {
+    let t = ip.trimmingCharacters(in: .whitespacesAndNewlines)
+    if t.isEmpty { return false }
+    if t == Self.iosHotspotGateway { return false }
+    return t.hasPrefix("10.") || t.hasPrefix("100.")
+  }
+
+  private func sanitizeHotspotBleIps(lan: String, hotspotHub: String, hotspotActive: Bool) -> (String, String) {
+    guard hotspotActive else { return (lan, hotspotHub) }
+    let gateway = Self.iosHotspotGateway
+    var outLan = lan.trimmingCharacters(in: .whitespacesAndNewlines)
+    var outHub = hotspotHub.trimmingCharacters(in: .whitespacesAndNewlines)
+    outHub = gateway
+    if outLan.isEmpty || isLikelyCarrierWanIp(outLan) {
+      outLan = gateway
+    }
+    return (outLan, outHub)
+  }
+
+  private func buildHandshakeInfrastructurePayloadData() -> Data? {
     let ssid = hotspotActive ? pendingHotspotSsid : ""
     let password = hotspotActive ? pendingHotspotPass : ""
+    let (lan, hotspotHub) = sanitizeHotspotBleIps(
+      lan: pendingLanIp,
+      hotspotHub: hotspotActive ? pendingHotspotHubIp : "",
+      hotspotActive: hotspotActive && !ssid.isEmpty
+    )
+    let p2p = pendingP2pIp
     let p2pMac = pendingP2pMac
-    let hotspotHub = hotspotActive ? pendingHotspotHubIp : ""
     if lan.isEmpty && p2p.isEmpty && ssid.isEmpty {
       return nil
     }
     var json: [String: Any] = [
       "hub_port": pendingHubPort,
       "platform": "ios",
+      "host_platform": "ios",
       "hasHotspot": false,
     ]
     if !lan.isEmpty { json["lan_ip"] = lan }
@@ -500,6 +713,7 @@ final class BleTransportPlugin: NSObject {
       json["hubPort"] = pendingHubPort
     }
     if !p2pMac.isEmpty { json["p2pMac"] = p2pMac }
+    if !pendingTlsCertSha256.isEmpty { json["tls_cert_sha256"] = pendingTlsCertSha256 }
     guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
     return data
   }
@@ -518,7 +732,15 @@ final class BleTransportPlugin: NSObject {
       "hotspot_pass": (json["hotspot_pass"] as? String) ?? (json["password"] as? String) ?? "",
       "hotspot_hub_ip": json["hotspot_hub_ip"] as? String ?? "",
       "hub_port": port,
+      "host_public_key": (json["host_public_key"] as? String) ?? "",
+      "tls_cert_sha256": (json["tls_cert_sha256"] as? String) ?? "",
     ]
+  }
+
+  private func handshakeSessionIsReleased(_ json: [String: Any]) -> Bool {
+    ((json["host_public_key"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .isEmpty == false)
   }
 
   private func handshakePayloadIsReady(_ json: [String: Any]) -> Bool {
@@ -531,6 +753,14 @@ final class BleTransportPlugin: NSObject {
 
   private func deliverGuestHandshake(_ data: Data, source: String) {
     if handshakeDelivered { return }
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+      return
+    }
+    if !handshakePayloadIsReady(json) { return }
+    if !handshakeSessionIsReleased(json) {
+      logBle("Handshake infrastructure (\(source)); awaiting Approve for session keys")
+      return
+    }
     guard let map = parseHandshakeMap(data) else { return }
     handshakeDelivered = true
     cancelHandshakeWait()
@@ -571,7 +801,7 @@ final class BleTransportPlugin: NSObject {
     cancelApprovalTimeout()
     let work = DispatchWorkItem { [weak self] in
       guard let self else { return }
-      self.handshakePayload = Data()
+      self.handshakeInfrastructurePayload = Data()
       self.handshakeCharacteristic?.value = nil
       self.clearPendingApproval()
     }
@@ -589,12 +819,13 @@ final class BleTransportPlugin: NSObject {
     cancelApprovalTimeout()
   }
 
-  private func notifyConnectionRequest(centralId: String, friendlyName: String) {
+  private func notifyConnectionRequest(sessionKey: String, centralId: String, friendlyName: String) {
     DispatchQueue.main.async { [weak self] in
       self?.uiChannel.invokeMethod(
         "notifyConnectionRequest",
         arguments: [
           "friendlyName": friendlyName,
+          "sessionKey": sessionKey,
           "deviceAddress": centralId,
         ]
       )
@@ -787,6 +1018,40 @@ extension BleTransportPlugin: CBPeripheralDelegate {
     }
 
     guestHandshakeCharacteristic = handshakeChar
+    let guestPkPayload: [String: Any] = ["guest_public_key": pendingGuestPublicKey]
+    guard let data = try? JSONSerialization.data(withJSONObject: guestPkPayload) else {
+      handshakeDeliveryResult?(
+        FlutterError(code: "guest_key_write_failed", message: "Unable to encode guest_public_key.", details: nil)
+      )
+      handshakeDeliveryResult = nil
+      cancelHandshakeWait()
+      centralManager.cancelPeripheralConnection(peripheral)
+      return
+    }
+    guestPublicKeyWritePending = true
+    peripheral.writeValue(data, for: handshakeChar, type: .withResponse)
+  }
+
+  func peripheral(
+    _ peripheral: CBPeripheral,
+    didWriteValueFor characteristic: CBCharacteristic,
+    error: Error?
+  ) {
+    guard peripheral === activeGuestPeripheral,
+          characteristic.uuid == Self.handshakeCharacteristicUuid,
+          guestPublicKeyWritePending
+    else { return }
+    guestPublicKeyWritePending = false
+    if let error {
+      handshakeDeliveryResult?(
+        FlutterError(code: "guest_key_write_failed", message: error.localizedDescription, details: nil)
+      )
+      handshakeDeliveryResult = nil
+      cancelHandshakeWait()
+      centralManager.cancelPeripheralConnection(peripheral)
+      return
+    }
+    guard let handshakeChar = guestHandshakeCharacteristic else { return }
     peripheral.setNotifyValue(true, for: handshakeChar)
     peripheral.readValue(for: handshakeChar)
   }
@@ -888,11 +1153,31 @@ extension BleTransportPlugin: CBPeripheralManagerDelegate {
     logBle(
       "central subscribed uuid=\(characteristic.uuid.uuidString) central=\(central.identifier.uuidString)"
     )
-    if characteristic.uuid == Self.handshakeCharacteristicUuid,
-       !handshakePayload.isEmpty,
-       let char = handshakeCharacteristic {
-      _ = peripheralManager.updateValue(handshakePayload, for: char, onSubscribedCentrals: [central])
-      logBle("pushed cached handshake JSON on subscribe (\(handshakePayload.count) bytes)")
+    if characteristic.uuid == Self.handshakeCharacteristicUuid {
+      subscribedCentrals[central.identifier.uuidString] = central
+      logBle(
+        "handshake CCCD subscribe central=\(central.identifier.uuidString) " +
+          "subscribers=\(subscribedCentrals.count)"
+      )
+      broadcastHandshakeNotifications()
+      let centralId = central.identifier.uuidString
+      if let payload = buildHandshakePayloadForCentral(centralId: centralId),
+         !handshakeSessionIsReleased(payload) {
+        promptHandshakeApprovalIfNeeded(
+          centralId: centralId,
+          friendlyName: "Unknown Peer"
+        )
+      }
+    }
+  }
+
+  func peripheralManager(
+    _ peripheral: CBPeripheralManager,
+    central: CBCentral,
+    didUnsubscribeFrom characteristic: CBCharacteristic
+  ) {
+    if characteristic.uuid == Self.handshakeCharacteristicUuid {
+      subscribedCentrals.removeValue(forKey: central.identifier.uuidString)
     }
   }
 
@@ -913,11 +1198,18 @@ extension BleTransportPlugin: CBPeripheralManagerDelegate {
       return
     }
 
-    if !handshakePayload.isEmpty {
-      request.value = handshakePayload
+    let centralId = request.central.identifier.uuidString
+    if let payload = buildHandshakePayloadForCentral(centralId: centralId), !payload.isEmpty {
+      request.value = payload
       peripheral.respond(to: request, withResult: .success)
-      if let json = String(data: handshakePayload, encoding: .utf8) {
-        logBle("handshake read response (cached LAN JSON): \(json)")
+      if let json = String(data: payload, encoding: .utf8) {
+        logBle("handshake read response (per-peer): \(json)")
+      }
+      if !handshakeSessionIsReleased(payload) {
+        promptHandshakeApprovalIfNeeded(
+          centralId: centralId,
+          friendlyName: "Unknown Peer"
+        )
       }
       return
     }
@@ -925,10 +1217,14 @@ extension BleTransportPlugin: CBPeripheralManagerDelegate {
     if pendingApprovalCentralId == nil {
       pendingApprovalCentralId = request.central.identifier.uuidString
       scheduleApprovalTimeout()
-      notifyConnectionRequest(
-        centralId: request.central.identifier.uuidString,
-        friendlyName: "Unknown Peer"
-      )
+      let centralId = request.central.identifier.uuidString
+      if let sessionKey = guestPublicKeyByCentralId[centralId] {
+        notifyConnectionRequest(
+          sessionKey: sessionKey,
+          centralId: centralId,
+          friendlyName: "Unknown Peer"
+        )
+      }
       logBle("handshake read empty — awaiting host UI approval")
     }
 
@@ -943,7 +1239,16 @@ extension BleTransportPlugin: CBPeripheralManagerDelegate {
     for request in requests {
       logBle("didReceiveWrite uuid=\(request.characteristic.uuid.uuidString)")
       if request.characteristic.uuid == Self.handshakeCharacteristicUuid {
-        peripheral.respond(to: request, withResult: .writeNotPermitted)
+        let centralId = request.central.identifier.uuidString
+        if let data = request.value, let guestPk = parseGuestPublicKey(from: data) {
+          registerGuestSession(centralId: centralId, guestPk: guestPk)
+          logBle("guest_public_key registered central=\(centralId)")
+          promptHandshakeApprovalIfNeeded(
+            centralId: centralId,
+            friendlyName: "Unknown Peer"
+          )
+        }
+        peripheral.respond(to: request, withResult: .success)
       } else if request.characteristic.uuid == Self.endpointCharacteristicUuid {
         peripheral.respond(to: request, withResult: .success)
       } else {

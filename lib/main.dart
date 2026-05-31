@@ -9,8 +9,10 @@ import 'package:air_share/discovery_page.dart';
 import 'package:air_share/file_list_screen.dart';
 import 'package:air_share/file_zone_session.dart';
 import 'package:air_share/hub_endpoint_state.dart';
+import 'package:air_share/hub_session_registry.dart';
 import 'package:air_share/hub_status.dart';
 import 'package:air_share/sender_staging_page.dart';
+import 'package:air_share/session_teardown.dart';
 import 'package:air_share/ux_prompts.dart';
 
 void main() {
@@ -29,6 +31,8 @@ class _AirShareAppState extends State<AirShareApp> {
   final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
   final ValueNotifier<FileZoneSession?> _fileZoneSession =
       ValueNotifier<FileZoneSession?>(null);
+  /// Prevents stacked Approve dialogs for the same BLE peer (read + CCCD fires).
+  final Set<String> _currentlyPromptedPeers = {};
 
   @override
   void initState() {
@@ -41,36 +45,71 @@ class _AirShareAppState extends State<AirShareApp> {
       }
       final args = call.arguments as Map<dynamic, dynamic>? ?? {};
       final friendlyName = (args['friendlyName'] ?? 'Unknown Device').toString();
+      final sessionKey = (args['sessionKey'] ??
+              args['guest_public_key'] ??
+              args['guestPublicKey'] ??
+              '')
+          .toString()
+          .trim();
+      final transportId = (args['deviceAddress'] ??
+              args['sessionId'] ??
+              args['peerId'] ??
+              '')
+          .toString();
+      if (sessionKey.isEmpty) {
+        await ConnectionLogger.instance.log(
+          'Connection Request Ignored',
+          details: 'peer=$friendlyName (no guest session key)',
+        );
+        return null;
+      }
+      if (_currentlyPromptedPeers.contains(sessionKey)) {
+        await ConnectionLogger.instance.log(
+          'Connection Request Ignored',
+          details: 'peer=$friendlyName session=$sessionKey (dialog already open)',
+        );
+        return null;
+      }
+      _currentlyPromptedPeers.add(sessionKey);
       await ConnectionLogger.instance.log(
         'Connection Request Prompted',
-        details: 'peer=$friendlyName',
+        details: 'peer=$friendlyName session=$sessionKey transport=$transportId',
       );
       final ctx = _navigatorKey.currentContext;
-      if (ctx == null) return null;
-      final approved = await showDialog<bool>(
-        context: ctx,
-        barrierDismissible: false,
-        builder: (context) => AlertDialog(
-          title: const Text('Connection Request'),
-          content: Text('Device $friendlyName wants to connect. Allow?'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Decline'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Approve'),
-            ),
-          ],
-        ),
-      );
+      if (ctx == null) {
+        _currentlyPromptedPeers.remove(sessionKey);
+        return null;
+      }
+      bool? approved;
+      try {
+        approved = await showDialog<bool>(
+          context: ctx,
+          barrierDismissible: false,
+          builder: (context) => AlertDialog(
+            title: const Text('Connection Request'),
+            content: Text('Device $friendlyName wants to connect. Allow?'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Decline'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop(true),
+                child: const Text('Approve'),
+              ),
+            ],
+          ),
+        );
+      } finally {
+        _currentlyPromptedPeers.remove(sessionKey);
+      }
       if (approved == true) {
         final pendingIp = HubEndpointState.instance.pendingIp;
         final pendingPort = HubEndpointState.instance.pendingPort;
         await ConnectionLogger.instance.log(
           'HS | Host | Approve tapped',
           details:
+              'sessionKey=$sessionKey transport=$transportId '
               'pendingIp=${pendingIp ?? "(null)"} pendingPort=$pendingPort',
         );
         if (pendingIp != null && pendingIp.isNotEmpty) {
@@ -78,22 +117,15 @@ class _AirShareAppState extends State<AirShareApp> {
             ip: pendingIp,
             port: pendingPort,
           );
-          await ConnectionLogger.instance.log(
-            'HS | Host | updateHubEndpoint(native GATT)',
-            details: '$pendingIp:$pendingPort',
-          );
-          await ConnectionLogger.instance.log(
-            'Connection | Advertising real IP',
-            details: '$pendingIp:$pendingPort',
-          );
-        } else {
-          await ConnectionLogger.instance.log(
-            'HS | Host | updateHubEndpoint SKIPPED',
-            details: 'pendingIp empty — handshake JSON may lack hubIp',
-          );
         }
       }
-      await BleTransport.instance.approveConnection(approved: approved == true);
+      await BleTransport.instance.approveConnection(
+        approved: approved == true,
+        sessionKey: sessionKey,
+        hostPublicKey: approved == true
+            ? (HubSessionRegistry.instance.host?.hostPublicKeyBase64Url ?? '')
+            : '',
+      );
       await ConnectionLogger.instance.log(
         'Connection Request Decision',
         details: approved == true ? 'approved' : 'declined',
@@ -174,6 +206,7 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
                     final btReady = await UxPrompts
                         .promptBluetoothRequiredForTransfer(context);
                     if (!btReady) return;
+                    await SessionTeardown.runReceiverTeardown();
                     ConnectionLogger.instance.log('Receiver Flow Opened');
                     if (!context.mounted) return;
                     Navigator.of(context).push<void>(
@@ -214,6 +247,7 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
                     final btReady = await UxPrompts
                         .promptBluetoothRequiredForTransfer(context);
                     if (!btReady) return;
+                    await SessionTeardown.runSenderTeardown();
                     ConnectionLogger.instance.log('Sender Flow Opened');
                     if (!context.mounted) return;
                     Navigator.of(context).push<void>(

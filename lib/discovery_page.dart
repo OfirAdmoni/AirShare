@@ -10,6 +10,10 @@ import 'package:air_share/connection_logger.dart';
 import 'package:air_share/connection_tier.dart';
 import 'package:air_share/guest_connection_guard.dart';
 import 'package:air_share/handshake_trace.dart';
+import 'package:air_share/hub_auth.dart';
+import 'package:air_share/hub_http_client.dart';
+import 'package:air_share/hub_session_registry.dart';
+import 'package:air_share/session_crypto.dart';
 import 'package:air_share/wlan_link_manager.dart';
 import 'package:air_share/wifi_tier_prerequisites.dart';
 import 'package:flutter/services.dart';
@@ -89,79 +93,49 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   }
 
   /// TCP probe failed: slow Wi‑Fi, or AP/client isolation (guest SYN never reaches hub).
-  bool _looksLikeTcpTimeout(Object e) {
-    if (e is TimeoutException) return true;
-    if (e is SocketException) {
-      final msg = e.message.toLowerCase();
-      final osMsg = e.osError?.message.toLowerCase() ?? '';
-      if (msg.contains('timed out') || osMsg.contains('timed out')) return true;
-      if (e.osError?.errorCode == 110) return true; // ETIMEDOUT on Android/Linux
-    }
-    return false;
-  }
-
-  Future<PeerEndpoint?> _tryTcpConnect(String ip, int port) async {
-    try {
-      await HandshakeTrace.run<void>(
-        'TCP verify (guest → hub HTTP port)',
-        () async {
-          final socket = await Socket.connect(
-            ip,
-            port,
-            timeout: const Duration(seconds: 10),
-          );
-          await socket.close();
-        },
-        extra: '$ip:$port',
-        hardTimeout: const Duration(seconds: 14),
-      );
+  Future<PeerEndpoint?> _tryTlsConnect(
+    String ip,
+    int port,
+    String tlsCertSha256,
+  ) async {
+    final rejection = await ConnectionTier.guestHubTargetRejectionReason(ip);
+    if (rejection != null) {
       await ConnectionLogger.instance.log(
-        'Socket Connection Success',
-        details: '$ip:$port',
+        'TLS Connection Blocked',
+        details: '$ip:$port rejected ($rejection) — guest must use remote BLE host IP',
       );
-      return PeerEndpoint(ip: ip, port: port);
-    } on TimeoutException catch (e) {
-      await ConnectionLogger.instance.log(
-        'Connection | TCP timeout',
-        details: '$ip:$port $e',
-      );
-    } on SocketException catch (e) {
-      if (_looksLikeTcpTimeout(e)) {
-        await ConnectionLogger.instance.log(
-          'Connection | TCP timeout (socket)',
-          details: '$ip:$port $e',
-        );
-      } else {
-        await ConnectionLogger.instance.log(
-          'Socket Connection Failed',
-          details: '$ip:$port $e',
-        );
-      }
-    }
-    final gateway = ConnectionTier.deriveGatewayIp(ip);
-    if (gateway == null || gateway == ip) return null;
-    try {
-      await HandshakeTrace.run<void>(
-        'TCP verify Fallback (Gateway)',
-        () async {
-          final socket = await Socket.connect(
-            gateway,
-            port,
-            timeout: const Duration(seconds: 10),
-          );
-          await socket.close();
-        },
-        extra: '$gateway:$port',
-        hardTimeout: const Duration(seconds: 14),
-      );
-      await ConnectionLogger.instance.log(
-        'Socket Connection Success',
-        details: 'gateway $gateway:$port',
-      );
-      return PeerEndpoint(ip: gateway, port: port);
-    } catch (_) {
       return null;
     }
+    try {
+      final ok = await HandshakeTrace.run<bool>(
+        'TLS verify (guest → hub HTTPS)',
+        () => HubHttpClient.probeHub(
+          host: ip,
+          port: port,
+          expectedCertSha256Hex: tlsCertSha256,
+          timeout: const Duration(seconds: 20),
+        ),
+        extra: '$ip:$port',
+        hardTimeout: const Duration(seconds: 16),
+      );
+      if (ok) {
+        await ConnectionLogger.instance.log(
+          'TLS Connection Success',
+          details: '$ip:$port',
+        );
+        return PeerEndpoint(ip: ip, port: port);
+      }
+      await ConnectionLogger.instance.log(
+        'TLS Connection Failed',
+        details: '$ip:$port certificate or HTTPS probe failed',
+      );
+    } catch (e) {
+      await ConnectionLogger.instance.log(
+        'TLS Connection Failed',
+        details: '$ip:$port $e',
+      );
+    }
+    return null;
   }
 
   void _pauseDiscoverySideEffects() {
@@ -209,14 +183,16 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   }
 
   Future<PeerEndpoint?> _probeHubAfterHotspot(HandshakePayload payload, int port) async {
-    final candidates = <String>[
-      if (payload.hotspotHubIp.isNotEmpty) payload.hotspotHubIp,
-      if (payload.p2pIp.isNotEmpty) payload.p2pIp,
-      '192.168.43.1',
-      '192.168.137.1',
-    ];
-    for (final ip in candidates) {
-      final endpoint = await _tryTcpConnect(ip, port);
+    final gateway = HotspotGateway.inferHostGateway(payload);
+    await ConnectionLogger.instance.log(
+      'Connection | Tier 2 hub probe',
+      details:
+          'host_platform=${payload.hostPlatform.isEmpty ? "inferred" : payload.hostPlatform} '
+          'gateway=$gateway hotspot_hub_ip=${payload.hotspotHubIp} lan_ip=${payload.lanIp}',
+    );
+    for (final ip in HotspotGateway.tier2ProbeCandidates(payload)) {
+      if (!await ConnectionTier.isAllowedGuestHubTarget(ip)) continue;
+      final endpoint = await _tryTlsConnect(ip, port, payload.tlsCertSha256);
       if (endpoint != null) return endpoint;
     }
     return null;
@@ -252,6 +228,17 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       if (!Platform.isIOS) return null;
     }
 
+    final localTarget =
+        await ConnectionTier.guestHubTargetRejectionReason(payload.lanIp);
+    if (localTarget != null) {
+      await ConnectionLogger.instance.log(
+        'Connection | Tier 1 failed',
+        details:
+            'tier=LAN lan_ip=${payload.lanIp} reason=$localTarget (not a remote host)',
+      );
+      return null;
+    }
+
     if (!mounted) throw StateError('unmounted');
     _setPhase(
       _GuestDiscoveryPhase.connecting,
@@ -262,12 +249,14 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       details: 'tier=LAN lan_ip=${payload.lanIp} hub_port=$port',
     );
     try {
-      final lanEndpoint = await _tryTcpConnect(payload.lanIp, port);
+      final lanEndpoint =
+          await _tryTlsConnect(payload.lanIp, port, payload.tlsCertSha256);
       if (lanEndpoint != null) return lanEndpoint;
       await ConnectionLogger.instance.log(
         'Connection | Tier 1 failed',
         details:
-            'tier=LAN lan_ip=${payload.lanIp} hub_port=$port reason=TCP probe failed (no reachable hub)',
+            'tier=LAN lan_ip=${payload.lanIp} hub_port=$port reason=TLS probe failed '
+            '(AP/client isolation or host unreachable) — trying Tier 2/3',
       );
     } catch (e, st) {
       await ConnectionLogger.instance.log(
@@ -281,6 +270,9 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   }
 
   Future<PeerEndpoint> _connectViaTierStrategy(HandshakePayload payload) async {
+    if (!payload.hasTlsFingerprint) {
+      throw StateError('TLS fingerprint missing from BLE handshake');
+    }
     final port = payload.hubPort;
     final skipWifiProbe = GuestConnectionGuard.isActive;
 
@@ -295,8 +287,15 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     // Tier 2 — offline hotspot join (Android guest only; iOS skips NEHotspot).
     if (_supportsHotspotGuestJoin() && payload.hasHotspot) {
       if (!mounted) throw StateError('unmounted');
+      _setPhase(
+        _GuestDiscoveryPhase.connecting,
+        'Tier 1 unavailable — joining host hotspot…',
+      );
       try {
         await _joinHostHotspotAp(payload);
+        if (Platform.isAndroid) {
+          await Future<void>.delayed(const Duration(milliseconds: 400));
+        }
         final hotspotEndpoint = await _probeHubAfterHotspot(payload, port);
         if (hotspotEndpoint != null) return hotspotEndpoint;
         await ConnectionLogger.instance.log(
@@ -343,7 +342,8 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
           hardTimeout: const Duration(seconds: 35),
         );
         final targetIp = payload.p2pIp.isNotEmpty ? payload.p2pIp : ownerIp;
-        final p2pEndpoint = await _tryTcpConnect(targetIp, port);
+        final p2pEndpoint =
+            await _tryTlsConnect(targetIp, port, payload.tlsCertSha256);
         if (p2pEndpoint != null) return p2pEndpoint;
       } on PlatformException catch (e) {
         final reason = e.details?.toString() ?? '';
@@ -363,19 +363,32 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       }
     }
 
-    throw Exception('All connection tiers failed (LAN → Hotspot → P2P)');
+    throw Exception(
+      'All connection tiers failed (LAN → Hotspot → P2P). '
+      'If LAN failed, the router may block device-to-device traffic (AP isolation); '
+      'use hotspot or Wi‑Fi Direct when available.',
+    );
   }
 
   @override
   void initState() {
     super.initState();
     _startPulseAnimation();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _startDiscovery());
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await BleTransport.instance.resetGuestHandshakeState();
+      if (!mounted) return;
+      _seenPeers.clear();
+      if (mounted) {
+        setState(() => _peers.clear());
+      }
+      await _startDiscovery();
+    });
   }
 
   @override
   void dispose() {
     GuestConnectionGuard.reset();
+    unawaited(BleTransport.instance.resetGuestHandshakeState());
     _stopDiscovery();
     _pulseTimer?.cancel();
     super.dispose();
@@ -523,11 +536,62 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         'BLE | Handshake sequence start',
         details: 'peer=${peer.friendlyName} (${peer.id})',
       );
-      final handshakePayload =
-          await BleTransport.instance.establishSecureHandshake(peer);
+      await _scanSubscription?.cancel();
+      _scanSubscription = null;
+      try {
+        await BleTransport.instance.stopScanning();
+      } catch (_) {}
+      final guestKeyPair = await SessionCrypto.generateKeyPair();
+      final guestPublicKey =
+          await SessionCrypto.publicKeyBase64Url(guestKeyPair);
+      var handshakePayload = await BleTransport.instance.establishSecureHandshake(
+        peer,
+        guestPublicKey: guestPublicKey,
+      );
       await ConnectionLogger.instance.log(
         'HS | ServerHello payload (BLE JSON, log-safe)',
         details: handshakePayload.describeForLog(),
+      );
+      if (!handshakePayload.hasTlsFingerprint) {
+        throw StateError(
+          'Host did not publish a TLS certificate fingerprint over BLE',
+        );
+      }
+      if (handshakePayload.hostPublicKey.isEmpty) {
+        await ConnectionLogger.instance.log(
+          'HS | Awaiting host Approve (session keys over BLE)',
+        );
+        if (!Platform.isWindows) {
+          throw StateError(
+            'Host session keys not released — Approve is required on the sender',
+          );
+        }
+        handshakePayload = await BleTransport.instance.waitForSessionHandshake(
+          peer,
+          guestPublicKey: guestPublicKey,
+        );
+        await ConnectionLogger.instance.log(
+          'HS | Session keys received after Approve',
+          details: handshakePayload.describeForLog(),
+        );
+      }
+      if (handshakePayload.hostPublicKey.isEmpty) {
+        throw StateError(
+          'Host session keys not released — Approve is required on the sender',
+        );
+      }
+      HubSessionRegistry.instance.expectedTlsFingerprint =
+          handshakePayload.tlsCertSha256;
+      HubSessionRegistry.instance.guest =
+          await GuestHubSession.fromExistingKeyPair(
+        guestKeyPair: guestKeyPair,
+        hostPublicKeyBase64Url: handshakePayload.hostPublicKey,
+      );
+      if (HubSessionRegistry.instance.guest == null) {
+        throw StateError('Failed to derive guest ECDH session');
+      }
+      await ConnectionLogger.instance.log(
+        'Security | Guest ECDH + TLS pin ready (HTTPS bearer)',
       );
 
       if (!mounted) return;

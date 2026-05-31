@@ -4,13 +4,18 @@ import 'package:flutter/material.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 
 import 'package:air_share/ble_transport.dart';
+import 'package:air_share/connection_tier.dart';
 import 'package:air_share/session_teardown.dart';
 import 'package:air_share/connection_logger.dart';
 import 'package:air_share/device_branding.dart';
 import 'package:air_share/file_list_screen.dart';
 import 'package:air_share/file_zone_session.dart';
+import 'package:air_share/hub_auth.dart';
+import 'package:air_share/host_ble_endpoint_snapshot.dart';
 import 'package:air_share/hub_endpoint_state.dart';
+import 'package:air_share/hub_session_registry.dart';
 import 'package:air_share/hub_status.dart';
+import 'package:air_share/session_crypto.dart';
 import 'package:air_share/local_hub_runtime.dart';
 import 'package:air_share/local_peer_identity.dart';
 import 'package:air_share/wlan_link_manager.dart';
@@ -31,6 +36,7 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
   String? _currentAdvertisedIp;
   String? _networkWarning;
   Object? _error;
+  bool _isInitializing = true;
   bool _isPreparing = false;
   bool _prepareStarted = false;
   bool _hotspotDialogShown = false;
@@ -84,7 +90,14 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
         debugPrint('[SenderStaging] Hotspot started but system SSID is empty');
         return false;
       }
-      apply(ssid, password, hubIp);
+      final gateway = HotspotGateway.forHostPlatform();
+      apply(ssid, password, gateway);
+      if (hubIp.isNotEmpty && hubIp != gateway) {
+        await ConnectionLogger.instance.log(
+          'Network | Hotspot hub IP normalized',
+          details: 'native=$hubIp → gateway=$gateway (Tier 2 standard gateway)',
+        );
+      }
       debugPrint(
         '[SenderStaging] BLE will advertise system hotspot SSID="$ssid" '
         '(password length=${password.length}, hubIp=${hubIp.isEmpty ? "pending" : hubIp})',
@@ -131,7 +144,8 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
   bool _isRealAdvertisableIp(String ip) {
     final candidate = ip.trim();
     if (candidate.isEmpty || candidate == '127.0.0.1') return false;
-    final isLan = candidate.startsWith('192.168.') || candidate.startsWith('10.');
+    if (HotspotGateway.isLikelyCarrierWanIp(candidate)) return false;
+    final isLan = candidate.startsWith('192.168.');
     if (!isLan) return false;
     final knownVirtualRanges = <String>[
       '192.168.56.',
@@ -149,13 +163,66 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
     return ip.trim().startsWith('192.168.137.');
   }
 
+  /// Pushes tier endpoints + TLS fingerprint into BLE (no [host_public_key] until Approve).
+  Future<void> _syncBleHandshakeEndpoints({
+    required int hubPort,
+    String lanIp = '',
+    String p2pIp = '',
+    String p2pMac = '',
+    String hotspotSsid = '',
+    String hotspotPass = '',
+    String hotspotHubIp = '',
+    bool includeSessionKeys = false,
+  }) async {
+    final tlsFp = HubSessionRegistry.instance.tls?.certSha256Hex ?? '';
+    final hostPk = includeSessionKeys
+        ? (HubSessionRegistry.instance.host?.hostPublicKeyBase64Url ?? '')
+        : '';
+    final snapshot = HostBleEndpointSnapshot(
+      lanIp: lanIp,
+      p2pIp: p2pIp,
+      p2pMac: p2pMac,
+      hotspotSsid: hotspotSsid,
+      hotspotPass: hotspotPass,
+      hotspotHubIp: hotspotHubIp,
+      hubPort: hubPort,
+      hostPublicKey: hostPk,
+      tlsCertSha256: tlsFp,
+    );
+    if (!snapshot.hasInfrastructure && hostPk.isEmpty) return;
+
+    await BleTransport.instance.updateConnectionEndpoints(
+      lanIp: lanIp,
+      p2pIp: p2pIp,
+      p2pMac: p2pMac,
+      hotspotSsid: hotspotSsid,
+      hotspotPass: hotspotPass,
+      hotspotHubIp: hotspotHubIp,
+      hubPort: hubPort,
+      hostPublicKey: hostPk,
+      tlsCertSha256: tlsFp,
+    );
+    HubEndpointState.instance.rememberBleSnapshot(snapshot);
+    await ConnectionLogger.instance.log(
+      includeSessionKeys
+          ? 'BLE | Session keys released (post-approve)'
+          : 'BLE | Handshake JSON primed (pre-approve)',
+      details:
+          'lan=${lanIp.isNotEmpty ? lanIp : "—"} port=$hubPort '
+          'tls_fp=${tlsFp.isNotEmpty} host_pk=${hostPk.isNotEmpty}',
+    );
+  }
+
   /// Push hub `ip:port` into the native GATT endpoint characteristic as soon as
   /// it is known (Android/Windows). Reduces Android↔Android races where the
   /// guest reads `:8080` or an empty endpoint before the approve dialog runs.
   Future<void> _primeBleGattEndpoint({required String ip, required int port}) async {
     if (!Platform.isAndroid && !Platform.isWindows && !Platform.isIOS) return;
     try {
-      await BleTransport.instance.updateHubEndpoint(ip: ip, port: port);
+      await BleTransport.instance.updateHubEndpoint(
+        ip: ip,
+        port: port,
+      );
       await ConnectionLogger.instance.log(
         'BLE | GATT endpoint primed (pre-guest)',
         details: '$ip:$port',
@@ -355,21 +422,54 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
     super.dispose();
   }
 
+  /// Ensures TLS credentials exist in [HubSessionRegistry] after [ensureStarted].
+  void _requireTlsFingerprint() {
+    final fp = HubSessionRegistry.instance.tls?.certSha256Hex;
+    if (fp == null || fp.isEmpty) {
+      throw StateError('Hub TLS fingerprint is not available');
+    }
+  }
+
   Future<void> _prepareSender() async {
     if (!mounted || _isPreparing || _teardownRan) return;
     setState(() {
+      _isInitializing = true;
       _isPreparing = true;
-      _status = 'Preparing network endpoints…';
+      _status = 'Generating TLS certificate…';
       _error = null;
     });
 
     try {
       if (!mounted) return;
 
+      HubSessionRegistry.instance.clear();
+
       if (!mounted) return;
-      setState(() => _status = 'Starting local HTTP hub…');
+      setState(() => _status = 'Starting secure HTTPS hub…');
 
       await LocalHubRuntime.instance.ensureStarted(_hubStatus);
+      _requireTlsFingerprint();
+
+      if (!mounted) return;
+      setState(() => _status = 'Preparing session keys…');
+
+      final hostKeyPair = await SessionCrypto.generateKeyPair();
+      final hostPublicKey = await SessionCrypto.publicKeyBase64Url(hostKeyPair);
+      HubSessionRegistry.instance.host = HostHubSession(
+        hostKeyPair: hostKeyPair,
+        hostPublicKeyBase64Url: hostPublicKey,
+      );
+      await ConnectionLogger.instance.log(
+        'Security | Host ECDH key ready (released on Approve)',
+        details: 'host_public_key_len=${hostPublicKey.length}',
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _isInitializing = false;
+        _status = 'Discovering network endpoints…';
+      });
+
       final localIdentity = await LocalPeerIdentity.resolve();
       await LocalHubRuntime.instance.setRoomHostIdentity(
         peerId: localIdentity.peerId,
@@ -417,6 +517,10 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
 
       if (!mounted) return;
       final lanIp = _pickRealIp([interfaceIp, discoveredIp]);
+      if (lanIp != null && lanIp.isNotEmpty) {
+        await _syncBleHandshakeEndpoints(hubPort: port, lanIp: lanIp);
+        await _primeBleGattEndpoint(ip: lanIp, port: port);
+      }
       var p2pIp = '';
       var p2pMac = '';
       var hotspotSsid = '';
@@ -578,17 +682,38 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
         );
       }
 
-      await BleTransport.instance.updateConnectionEndpoints(
-        lanIp: lanIp ?? '',
+      var effectiveLanIp = lanIp ?? '';
+      var effectiveHotspotHubIp = hotspotHubIp;
+      if (hotspotSsid.isNotEmpty) {
+        final hotspotBle = HotspotGateway.bleEndpointsForHotspotHost(
+          hostPlatform: Platform.operatingSystem,
+        );
+        effectiveHotspotHubIp = hotspotBle.hotspotHubIp;
+        if (effectiveLanIp.isEmpty ||
+            HotspotGateway.isLikelyCarrierWanIp(effectiveLanIp)) {
+          effectiveLanIp = hotspotBle.lanIp;
+        }
+        await ConnectionLogger.instance.log(
+          'BLE | Tier 2 hotspot endpoints',
+          details:
+              'lan_ip=$effectiveLanIp hotspot_hub_ip=$effectiveHotspotHubIp '
+              '(carrier WAN excluded from BLE)',
+        );
+      }
+
+      await _syncBleHandshakeEndpoints(
+        hubPort: port,
+        lanIp: effectiveLanIp,
         p2pIp: p2pIp,
         p2pMac: p2pMac,
         hotspotSsid: hotspotSsid,
         hotspotPass: hotspotPass,
-        hotspotHubIp: hotspotHubIp,
-        hubPort: port,
+        hotspotHubIp: effectiveHotspotHubIp,
       );
 
-      final advertisedIp = lanIp ?? (hotspotHubIp.isNotEmpty ? hotspotHubIp : p2pIp);
+      final advertisedIp = effectiveLanIp.isNotEmpty
+          ? effectiveLanIp
+          : (effectiveHotspotHubIp.isNotEmpty ? effectiveHotspotHubIp : p2pIp);
       if (advertisedIp.isNotEmpty) {
         HubEndpointState.instance.setPending(ip: advertisedIp, port: port);
         await _primeBleGattEndpoint(ip: advertisedIp, port: port);
@@ -694,6 +819,7 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
     } finally {
       if (!mounted) return;
       setState(() {
+        _isInitializing = false;
         _isPreparing = false;
       });
     }
@@ -701,6 +827,29 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isInitializing) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Send — Hub preparation')),
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const CircularProgressIndicator(),
+              const SizedBox(height: 24),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 32),
+                child: Text(
+                  _status,
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     return PopScope(
       onPopInvokedWithResult: (didPop, _) {
         if (didPop) {

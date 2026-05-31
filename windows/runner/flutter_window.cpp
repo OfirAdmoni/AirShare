@@ -246,6 +246,36 @@ void FlutterWindow::InitializeNativeChannels() {
           UpdateHubEndpoint(*args, result.get());
           return;
         }
+        if (call.method_name() == "updateConnectionEndpoints") {
+          const auto* args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          if (!args) {
+            result->Error("invalid_args",
+                          "Connection endpoint arguments are missing.");
+            return;
+          }
+          UpdateConnectionEndpoints(*args, result.get());
+          return;
+        }
+        if (call.method_name() == "resetHostHandshakeState") {
+          ResetHostHandshakeState(result.get());
+          return;
+        }
+        if (call.method_name() == "resetGuestHandshakeState") {
+          ResetGuestHandshakeState(result.get());
+          return;
+        }
+        if (call.method_name() == "waitForSessionHandshake") {
+          const auto* args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          if (!args) {
+            result->Error("invalid_args",
+                          "Session handshake wait arguments are missing.");
+            return;
+          }
+          WaitForSessionHandshake(*args, std::move(result));
+          return;
+        }
         if (call.method_name() == "getLocalPeerId") {
           GetLocalPeerId(std::move(result));
           return;
@@ -424,6 +454,7 @@ void FlutterWindow::StartBleScanning(
 
 void FlutterWindow::StopBleScanning(
     flutter::MethodResult<flutter::EncodableValue>* result) {
+  ClearGuestHandshakeSession();
   try {
     if (g_watcher) {
       if (watcher_received_token_) {
@@ -520,20 +551,71 @@ void FlutterWindow::EstablishSecureHandshake(
       return;
     }
 
-    std::vector<uint8_t> bytes;
-    bool handshake_ready = false;
+    ClearGuestHandshakeSession();
+    auto handshake_char = chars_result.Characteristics().GetAt(0);
+
+    std::string guest_public_key;
+    const auto guest_pk_it =
+        args_copy.find(flutter::EncodableValue("guestPublicKey"));
+    if (guest_pk_it != args_copy.end()) {
+      if (const auto* s = std::get_if<std::string>(&guest_pk_it->second)) {
+        guest_public_key = *s;
+      }
+    }
+    if (guest_public_key.empty()) {
+      try {
+        ble_device.Close();
+      } catch (...) {
+      }
+      DispatchToPlatformThread([result = std::move(result)]() mutable {
+        result->Error("invalid_guest_key", "guestPublicKey is required.");
+      });
+      return;
+    }
+    try {
+      const std::string guest_json =
+          "{\"guest_public_key\":\"" + guest_public_key + "\"}";
+      winrt::Windows::Storage::Streams::DataWriter writer;
+      writer.WriteString(winrt::to_hstring(guest_json));
+      const auto write_buffer = writer.DetachBuffer();
+      const auto write_status = handshake_char
+                                    .WriteValueAsync(write_buffer,
+                                                     GattWriteOption::WriteWithResponse)
+                                    .get();
+      if (write_status != GattCommunicationStatus::Success) {
+        try {
+          ble_device.Close();
+        } catch (...) {
+        }
+        DispatchToPlatformThread([result = std::move(result)]() mutable {
+          result->Error("guest_key_write_failed",
+                        "Failed to write guest_public_key to host.");
+        });
+        return;
+      }
+      OutputDebugStringW(
+          L"[AirShareNative] Native | guest_public_key written before handshake read.\n");
+    } catch (const winrt::hresult_error& e) {
+      const std::string err_msg = WinrtStringToUtf8(e.message());
+      try {
+        ble_device.Close();
+      } catch (...) {
+      }
+      DispatchToPlatformThread([result = std::move(result), err_msg]() mutable {
+        result->Error("guest_key_write_failed", err_msg);
+      });
+      return;
+    }
+
+    std::string json;
+    bool has_infrastructure = false;
+    bool keep_guest_connection = false;
     for (int attempt = 1; attempt <= 15; ++attempt) {
       GattReadResult read_result{nullptr};
       try {
-        read_result = chars_result.Characteristics()
-                          .GetAt(0)
-                          .ReadValueAsync(BluetoothCacheMode::Uncached)
-                          .get();
+        read_result =
+            handshake_char.ReadValueAsync(BluetoothCacheMode::Uncached).get();
       } catch (const winrt::hresult_error& e) {
-        OutputDebugStringW(
-            L"[AirShareNative] Native | BLE Read | Result Status: Exception\n");
-        OutputDebugStringW(
-            L"[AirShareNative] Native | BLE Read | Protocol Error: n/a\n");
         const std::wstring msg = L"[AirShareNative] Native | Handshake read attempt " +
                                  std::to_wstring(attempt) +
                                  L"... Status: Fail (" + e.message().c_str() + L")\n";
@@ -552,17 +634,6 @@ void FlutterWindow::EstablishSecureHandshake(
         return;
       }
       if (read_result.Status() != GattCommunicationStatus::Success) {
-        const std::wstring status_msg =
-            L"[AirShareNative] Native | BLE Read | Result Status: " +
-            std::to_wstring(static_cast<int>(read_result.Status())) + L"\n";
-        OutputDebugStringW(status_msg.c_str());
-        const auto protocol_error = read_result.ProtocolError();
-        const std::wstring protocol_msg =
-            L"[AirShareNative] Native | BLE Read | Protocol Error: " +
-            (protocol_error ? std::to_wstring(protocol_error.Value())
-                            : std::wstring(L"none")) +
-            L"\n";
-        OutputDebugStringW(protocol_msg.c_str());
         const std::wstring msg = L"[AirShareNative] Native | Handshake read attempt " +
                                  std::to_wstring(attempt) + L"... Status: Fail\n";
         OutputDebugStringW(msg.c_str());
@@ -581,92 +652,75 @@ void FlutterWindow::EstablishSecureHandshake(
       }
 
       auto buffer = read_result.Value();
-      const std::wstring status_msg =
-          L"[AirShareNative] Native | BLE Read | Result Status: " +
-          std::to_wstring(static_cast<int>(read_result.Status())) + L"\n";
-      OutputDebugStringW(status_msg.c_str());
-      const auto protocol_error = read_result.ProtocolError();
-      const std::wstring protocol_msg =
-          L"[AirShareNative] Native | BLE Read | Protocol Error: " +
-          (protocol_error ? std::to_wstring(protocol_error.Value())
-                          : std::wstring(L"none")) +
-          L"\n";
-      OutputDebugStringW(protocol_msg.c_str());
       winrt::Windows::Storage::Streams::DataReader reader =
           winrt::Windows::Storage::Streams::DataReader::FromBuffer(buffer);
       const uint32_t len = reader.UnconsumedBufferLength();
-      bytes.assign(len, 0);
-      if (len > 0) {
-        reader.ReadBytes(bytes);
-        const std::wstring msg = L"[AirShareNative] Native | Handshake read attempt " +
-                                 std::to_wstring(attempt) + L"... Status: Success\n";
-        OutputDebugStringW(msg.c_str());
-        handshake_ready = true;
+      if (len == 0) {
+        if (attempt < 15) {
+          std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        continue;
+      }
+      std::vector<uint8_t> bytes(len);
+      reader.ReadBytes(bytes);
+      json.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+      if (!JsonHasInfrastructure(json)) {
+        if (attempt < 15) {
+          std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+        continue;
+      }
+      has_infrastructure = true;
+      auto extract = [](const std::string& key, const std::string& src) {
+        const std::string needle = "\"" + key + "\":\"";
+        auto start = src.find(needle);
+        if (start == std::string::npos) return std::string();
+        start += needle.size();
+        auto end = src.find('"', start);
+        if (end == std::string::npos) return std::string();
+        return src.substr(start, end - start);
+      };
+      if (!extract("host_public_key", json).empty()) {
+        OutputDebugStringW(
+            L"[AirShareNative] Native | Handshake read complete (session keys present).\n");
         break;
       }
-      const std::wstring msg = L"[AirShareNative] Native | Handshake read attempt " +
-                               std::to_wstring(attempt) + L"... Status: Empty\n";
-      OutputDebugStringW(msg.c_str());
-      if (attempt < 15) {
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+      OutputDebugStringW(
+          L"[AirShareNative] Native | Handshake infrastructure read; "
+          L"session keys pending host Approve.\n");
+      {
+        std::lock_guard<std::mutex> lock(guest_handshake_mutex_);
+        guest_handshake_device_ = ble_device;
+        guest_handshake_char_ = handshake_char;
+        keep_guest_connection = true;
+        guest_session_received_ = false;
+        guest_session_notify_json_.clear();
       }
+      EnableGuestHandshakeNotifications(handshake_char);
+      break;
     }
-    if (!handshake_ready) {
+    if (!has_infrastructure) {
       try {
         ble_device.Close();
       } catch (...) {
       }
       DispatchToPlatformThread([result = std::move(result)]() mutable {
-        result->Error("handshake_pending", "Handshake pending UI approval.");
+        result->Error("handshake_read_failed",
+                      "Host handshake endpoints are not available yet.");
       });
       return;
     }
-    const std::string json(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    // Minimal JSON parse: expect {"ssid":"..","password":"..","hubIp":".."}
-    auto extract = [](const std::string& key, const std::string& src) {
-      const std::string needle = "\"" + key + "\":\"";
-      auto start = src.find(needle);
-      if (start == std::string::npos) return std::string();
-      start += needle.size();
-      auto end = src.find('"', start);
-      if (end == std::string::npos) return std::string();
-      return src.substr(start, end - start);
-    };
-    auto extract_int = [](const std::string& key, const std::string& src,
-                          int default_v) {
-      const std::string needle = "\"" + key + "\":";
-      auto start = src.find(needle);
-      if (start == std::string::npos) return default_v;
-      start += needle.size();
-      while (start < src.size() &&
-             std::isspace(static_cast<unsigned char>(src[start]))) {
-        start++;
+    const auto payload = ParseHandshakeJsonToMap(json);
+    if (!keep_guest_connection) {
+      OutputDebugStringW(
+          L"[AirShareNative] Peer Handshake complete; closing BLE peripheral.\n");
+      try {
+        ble_device.Close();
+      } catch (...) {
       }
-      int val = 0;
-      bool any = false;
-      while (start < src.size() &&
-             std::isdigit(static_cast<unsigned char>(src[start]))) {
-        any = true;
-        val = val * 10 + (src[start] - '0');
-        start++;
-      }
-      return any ? val : default_v;
-    };
-    flutter::EncodableMap payload = {
-        {flutter::EncodableValue("ssid"),
-         flutter::EncodableValue(extract("ssid", json))},
-        {flutter::EncodableValue("password"),
-         flutter::EncodableValue(extract("password", json))},
-        {flutter::EncodableValue("hubIp"),
-         flutter::EncodableValue(extract("hubIp", json))},
-        {flutter::EncodableValue("hubPort"),
-         flutter::EncodableValue(extract_int("hubPort", json, 8080))},
-    };
-    OutputDebugStringW(
-        L"[AirShareNative] Peer Handshake Released (client read); closing BLE peripheral before socket.\n");
-    try {
-      ble_device.Close();
-    } catch (...) {
+    } else {
+      OutputDebugStringW(
+          L"[AirShareNative] Peer Handshake partial; keeping BLE open for session keys.\n");
     }
     DispatchToPlatformThread(
         [result = std::move(result), payload = std::move(payload)]() mutable {
@@ -832,7 +886,9 @@ void FlutterWindow::StartHubAdvertising(
 
     GattLocalCharacteristicParameters params;
     params.CharacteristicProperties(GattCharacteristicProperties::Read |
-                                    GattCharacteristicProperties::Notify);
+                                    GattCharacteristicProperties::Notify |
+                                    GattCharacteristicProperties::Write);
+    params.WriteProtectionLevel(GattProtectionLevel::Plain);
     params.UserDescription(L"Secure handshake payload");
 
     auto char_result =
@@ -871,12 +927,49 @@ void FlutterWindow::StartHubAdvertising(
           deferral.Complete();
         });
 
+    handshake_write_token_ = gatt_handshake_.WriteRequested(
+        [this](GattLocalCharacteristic const&,
+               GattWriteRequestedEventArgs args) {
+          auto deferral = args.GetDeferral();
+          try {
+            auto request = args.GetRequestAsync().get();
+            const std::string transport_id =
+                WinrtStringToUtf8(args.Session().DeviceId().Id());
+            const auto guest_pk =
+                ParseGuestPublicKeyFromWriteBuffer(request.Value());
+            if (!guest_pk.empty()) {
+              RegisterGuestSession(transport_id, guest_pk);
+            }
+            request.Respond();
+          } catch (...) {
+          }
+          deferral.Complete();
+        });
+
     handshake_read_token_ = gatt_handshake_.ReadRequested(
         [this](GattLocalCharacteristic const&,
                GattReadRequestedEventArgs args) {
           auto deferral = args.GetDeferral();
           try {
             auto request = args.GetRequestAsync().get();
+            if (HandshakeBufferHasInfrastructure()) {
+              const std::string transport_id =
+                  WinrtStringToUtf8(args.Session().DeviceId().Id());
+              const std::string session_key = ResolveSessionKey(transport_id);
+              const auto buffer = BuildHandshakeBufferForPeer(session_key);
+              request.RespondWithValue(buffer);
+              deferral.Complete();
+              if (!session_key.empty() &&
+                  approved_peer_host_keys_.find(session_key) ==
+                      approved_peer_host_keys_.end()) {
+                std::lock_guard<std::mutex> lock(approval_mutex_);
+                pending_gatt_session_ = args.Session();
+                pending_session_id_ = session_key;
+                NotifyFlutterConnectionRequest("BLE Peer", session_key);
+                ScheduleApprovalTimeout();
+              }
+              return;
+            }
             std::string session_id;
             {
               std::lock_guard<std::mutex> lock(approval_mutex_);
@@ -990,15 +1083,55 @@ void FlutterWindow::StopHubAdvertising(
   result->Success(flutter::EncodableValue());
 }
 
+void FlutterWindow::ResetHostHandshakeState(
+    flutter::MethodResult<flutter::EncodableValue>* result) {
+  {
+    std::lock_guard<std::mutex> lock(approval_mutex_);
+    CancelApprovalTimeout();
+    ClearPendingReadState();
+  }
+  {
+    std::lock_guard<std::mutex> lock(session_map_mutex_);
+    guest_public_key_by_transport_.clear();
+    transport_by_guest_public_key_.clear();
+  }
+  approved_peer_host_keys_.clear();
+  result->Success(flutter::EncodableValue());
+}
+
+void FlutterWindow::ResetGuestHandshakeState(
+    flutter::MethodResult<flutter::EncodableValue>* result) {
+  ClearGuestHandshakeSession();
+  result->Success(flutter::EncodableValue());
+}
+
 void FlutterWindow::StopHubAdvertisingInternal() {
   CancelApprovalTimeout();
+  ClearGuestHandshakeSession();
+  approved_peer_host_keys_.clear();
+  pending_lan_ip_.clear();
+  pending_p2p_ip_.clear();
+  pending_p2p_mac_.clear();
+  pending_hotspot_hub_ip_.clear();
+  host_session_public_key_.clear();
+  approved_peer_host_keys_.clear();
+  pending_tls_cert_sha256_.clear();
   ClearPendingReadState();
+  {
+    std::lock_guard<std::mutex> lock(session_map_mutex_);
+    guest_public_key_by_transport_.clear();
+    transport_by_guest_public_key_.clear();
+  }
+  if (gatt_handshake_ && handshake_write_token_) {
+    gatt_handshake_.WriteRequested(*handshake_write_token_);
+  }
   if (gatt_handshake_ && handshake_read_token_) {
     gatt_handshake_.ReadRequested(*handshake_read_token_);
   }
   if (gatt_endpoint_ && endpoint_read_token_) {
     gatt_endpoint_.ReadRequested(*endpoint_read_token_);
   }
+  handshake_write_token_.reset();
   handshake_read_token_.reset();
   endpoint_read_token_.reset();
   gatt_handshake_ = nullptr;
@@ -1046,20 +1179,45 @@ void FlutterWindow::ApproveConnection(
     return;
   }
 
+  const auto session_it = args.find(flutter::EncodableValue("sessionKey"));
+  const auto peer_it = args.find(flutter::EncodableValue("peerId"));
+  std::string session_key = pending_session_id_;
+  if (session_it != args.end()) {
+    if (const auto p = std::get_if<std::string>(&session_it->second)) {
+      if (!p->empty()) session_key = *p;
+    }
+  } else if (peer_it != args.end()) {
+    if (const auto p = std::get_if<std::string>(&peer_it->second)) {
+      if (!p->empty()) session_key = *p;
+    }
+  }
+  const auto host_pk_it = args.find(flutter::EncodableValue("hostPublicKey"));
+  if (host_pk_it != args.end()) {
+    if (const auto pk = std::get_if<std::string>(&host_pk_it->second)) {
+      if (!pk->empty()) host_session_public_key_ = *pk;
+    }
+  }
+  if (session_key.empty() || host_session_public_key_.empty()) {
+    result->Error("invalid_peer", "sessionKey and host public key are required.");
+    return;
+  }
+  approved_peer_host_keys_[session_key] = host_session_public_key_;
+
   CancelApprovalTimeout();
   try {
-    if (!pending_read_request_) {
-      result->Error("no_pending_read", "No pending handshake read request.");
-      return;
+    const auto buffer = BuildHandshakeBufferForPeer(session_key);
+    if (pending_read_request_) {
+      pending_read_request_.RespondWithValue(buffer);
+      if (pending_read_deferral_) {
+        pending_read_deferral_.Complete();
+        pending_read_deferral_ = nullptr;
+      }
+      pending_read_request_ = nullptr;
     }
-    const auto buffer = BuildHandshakeBuffer();
-    pending_read_request_.RespondWithValue(buffer);
-    if (pending_read_deferral_) {
-      pending_read_deferral_.Complete();
-      pending_read_deferral_ = nullptr;
+    if (gatt_handshake_) {
+      gatt_handshake_.NotifyValueAsync(buffer).get();
     }
-    pending_read_request_ = nullptr;
-    gatt_handshake_.NotifyValueAsync(buffer).get();
+    RefreshHostHandshakeGattCache();
     OutputDebugStringW(L"[AirShareNative] Peer Handshake Released.\n");
   } catch (const winrt::hresult_error& e) {
     result->Error("handshake_release_failed", WinrtStringToUtf8(e.message()));
@@ -1087,21 +1245,342 @@ void FlutterWindow::UpdateHubEndpoint(
       pending_hub_port_ = static_cast<int>(*p64);
     }
   }
+  const auto pk_it = args.find(flutter::EncodableValue("hostPublicKey"));
+  if (pk_it != args.end()) {
+    if (const auto pk = std::get_if<std::string>(&pk_it->second)) {
+      if (!pk->empty()) {
+        host_session_public_key_ = *pk;
+      }
+    }
+  }
+  const auto tls_it = args.find(flutter::EncodableValue("tlsCertSha256"));
+  if (tls_it != args.end()) {
+    if (const auto tls = std::get_if<std::string>(&tls_it->second)) {
+      if (tls->empty()) {
+        pending_tls_cert_sha256_.clear();
+      } else {
+        pending_tls_cert_sha256_ = *tls;
+      }
+    }
+  }
+  RefreshHostHandshakeGattCache();
   result->Success(flutter::EncodableValue());
+}
+
+namespace {
+
+std::string EncodableMapString(const flutter::EncodableMap& args,
+                               const char* key) {
+  const auto it = args.find(flutter::EncodableValue(key));
+  if (it == args.end()) {
+    return {};
+  }
+  if (const auto s = std::get_if<std::string>(&it->second)) {
+    return *s;
+  }
+  return {};
+}
+
+int EncodableMapInt(const flutter::EncodableMap& args, const char* key,
+                    int default_v) {
+  const auto it = args.find(flutter::EncodableValue(key));
+  if (it == args.end()) {
+    return default_v;
+  }
+  if (const auto v = std::get_if<int>(&it->second)) {
+    return *v;
+  }
+  if (const auto v64 = std::get_if<int64_t>(&it->second)) {
+    return static_cast<int>(*v64);
+  }
+  return default_v;
+}
+
+}  // namespace
+
+void FlutterWindow::UpdateConnectionEndpoints(
+    const flutter::EncodableMap& args,
+    flutter::MethodResult<flutter::EncodableValue>* result) {
+  pending_lan_ip_ = EncodableMapString(args, "lanIp");
+  pending_p2p_ip_ = EncodableMapString(args, "p2pIp");
+  pending_p2p_mac_ = EncodableMapString(args, "p2pMac");
+  const auto hotspot_ssid = EncodableMapString(args, "hotspotSsid");
+  const auto hotspot_pass = EncodableMapString(args, "hotspotPass");
+  if (!hotspot_ssid.empty() && !hotspot_pass.empty()) {
+    pending_ssid_ = hotspot_ssid;
+    pending_password_ = hotspot_pass;
+  }
+  const auto hotspot_hub = EncodableMapString(args, "hotspotHubIp");
+  if (!hotspot_hub.empty()) {
+    pending_hotspot_hub_ip_ = hotspot_hub;
+  }
+  pending_hub_port_ = EncodableMapInt(args, "hubPort", pending_hub_port_);
+
+  const auto tls = EncodableMapString(args, "tlsCertSha256");
+  if (!tls.empty()) {
+    pending_tls_cert_sha256_ = tls;
+  }
+  const auto host_pk = EncodableMapString(args, "hostPublicKey");
+  if (!host_pk.empty()) {
+    host_session_public_key_ = host_pk;
+  }
+
+  std::string primary = pending_lan_ip_;
+  if (primary.empty()) {
+    primary = pending_p2p_ip_;
+  }
+  if (primary.empty()) {
+    primary = pending_hotspot_hub_ip_;
+  }
+  if (!primary.empty()) {
+    pending_hub_ip_ = primary;
+  }
+
+  RefreshHostHandshakeGattCache();
+  result->Success(flutter::EncodableValue());
+}
+
+void FlutterWindow::WaitForSessionHandshake(
+    const flutter::EncodableMap& args,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  (void)args;
+  std::thread([this, result = std::move(result)]() mutable {
+    using namespace winrt::Windows::Devices::Bluetooth::GenericAttributeProfile;
+    GattCharacteristic characteristic{nullptr};
+    {
+      std::lock_guard<std::mutex> lock(guest_handshake_mutex_);
+      characteristic = guest_handshake_char_;
+    }
+    if (!characteristic) {
+      DispatchToPlatformThread([result = std::move(result)]() mutable {
+        result->Error("no_guest_session",
+                      "No active BLE handshake session to wait on.");
+      });
+      return;
+    }
+
+    if (!EnableGuestHandshakeNotifications(characteristic)) {
+      DispatchToPlatformThread([result = std::move(result)]() mutable {
+        result->Error("handshake_notify_failed",
+                      "Unable to subscribe to handshake notifications.");
+      });
+      return;
+    }
+
+    OutputDebugStringW(
+        L"[AirShareNative] Native | Awaiting session keys via GATT notify…\n");
+
+    bool notified = false;
+    std::string json;
+    {
+      std::unique_lock<std::mutex> cv_lock(guest_session_cv_mutex_);
+      notified = guest_session_cv_.wait_for(
+          cv_lock, std::chrono::seconds(45),
+          [this]() {
+            std::lock_guard<std::mutex> lock(guest_handshake_mutex_);
+            return guest_session_received_;
+          });
+      if (notified) {
+        std::lock_guard<std::mutex> lock(guest_handshake_mutex_);
+        json = guest_session_notify_json_;
+      }
+    }
+
+    ClearGuestHandshakeSession();
+    if (!notified || json.empty()) {
+      DispatchToPlatformThread([result = std::move(result)]() mutable {
+        result->Error("handshake_pending",
+                      "Host session keys not released after Approve.");
+      });
+      return;
+    }
+
+    auto extract = [](const std::string& key, const std::string& src) {
+      const std::string needle = "\"" + key + "\":\"";
+      auto start = src.find(needle);
+      if (start == std::string::npos) return std::string();
+      start += needle.size();
+      auto end = src.find('"', start);
+      if (end == std::string::npos) return std::string();
+      return src.substr(start, end - start);
+    };
+    if (extract("host_public_key", json).empty()) {
+      DispatchToPlatformThread([result = std::move(result)]() mutable {
+        result->Error("handshake_pending",
+                      "Handshake notification did not include session keys.");
+      });
+      return;
+    }
+
+    const auto payload = ParseHandshakeJsonToMap(json);
+    DispatchToPlatformThread(
+        [result = std::move(result), payload = std::move(payload)]() mutable {
+          result->Success(flutter::EncodableValue(payload));
+        });
+  }).detach();
+}
+
+bool FlutterWindow::EnableGuestHandshakeNotifications(
+    const winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::
+        GattCharacteristic& characteristic) {
+  using namespace winrt::Windows::Devices::Bluetooth::GenericAttributeProfile;
+  using namespace winrt::Windows::Storage::Streams;
+  try {
+    DisableGuestHandshakeNotifications();
+    const auto status =
+        characteristic
+            .WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue::Notify)
+            .get();
+    if (status != GattCommunicationStatus::Success) {
+      OutputDebugStringW(
+          L"[AirShareNative] Native | CCCD notify enable failed.\n");
+      return false;
+    }
+
+    guest_handshake_value_changed_token_ = characteristic.ValueChanged(
+        [this](GattCharacteristic const&,
+               GattValueChangedEventArgs args) {
+          auto buffer = args.CharacteristicValue();
+          DataReader reader = DataReader::FromBuffer(buffer);
+          const uint32_t len = reader.UnconsumedBufferLength();
+          if (len == 0) return;
+          std::vector<uint8_t> bytes(len);
+          reader.ReadBytes(bytes);
+          const std::string json(reinterpret_cast<const char*>(bytes.data()),
+                                 bytes.size());
+          auto extract = [](const std::string& key, const std::string& src) {
+            const std::string needle = "\"" + key + "\":\"";
+            auto start = src.find(needle);
+            if (start == std::string::npos) return std::string();
+            start += needle.size();
+            auto end = src.find('"', start);
+            if (end == std::string::npos) return std::string();
+            return src.substr(start, end - start);
+          };
+          if (extract("host_public_key", json).empty()) {
+            OutputDebugStringW(
+                L"[AirShareNative] Native | Notify ignored (no session keys).\n");
+            return;
+          }
+          {
+            std::lock_guard<std::mutex> lock(guest_handshake_mutex_);
+            guest_session_notify_json_ = json;
+            guest_session_received_ = true;
+          }
+          OutputDebugStringW(
+              L"[AirShareNative] Native | Session keys received via GATT notify.\n");
+          guest_session_cv_.notify_all();
+        });
+    OutputDebugStringW(
+        L"[AirShareNative] Native | Subscribed to handshake notifications.\n");
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+void FlutterWindow::DisableGuestHandshakeNotifications() {
+  if (guest_handshake_char_ && guest_handshake_value_changed_token_) {
+    try {
+      guest_handshake_char_.ValueChanged(*guest_handshake_value_changed_token_);
+    } catch (...) {
+    }
+  }
+  guest_handshake_value_changed_token_.reset();
+  guest_session_received_ = false;
+  guest_session_notify_json_.clear();
+}
+
+void FlutterWindow::ClearGuestHandshakeSession() {
+  DisableGuestHandshakeNotifications();
+  std::lock_guard<std::mutex> lock(guest_handshake_mutex_);
+  guest_handshake_char_ = nullptr;
+  if (guest_handshake_device_) {
+    try {
+      guest_handshake_device_.Close();
+    } catch (...) {
+    }
+    guest_handshake_device_ = nullptr;
+  }
+}
+
+void FlutterWindow::RefreshHostHandshakeGattCache() {
+  if (!gatt_handshake_ || !HandshakeBufferHasInfrastructure()) {
+    return;
+  }
+  try {
+    const auto buffer = BuildHandshakeBuffer();
+    (void)buffer;
+  } catch (...) {
+  }
+}
+
+void FlutterWindow::RegisterGuestSession(const std::string& transport_id,
+                                         const std::string& guest_public_key) {
+  const auto trimmed = [&]() {
+    size_t start = guest_public_key.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return std::string();
+    size_t end = guest_public_key.find_last_not_of(" \t\r\n");
+    return guest_public_key.substr(start, end - start + 1);
+  }();
+  if (trimmed.empty() || transport_id.empty()) return;
+  std::lock_guard<std::mutex> lock(session_map_mutex_);
+  guest_public_key_by_transport_[transport_id] = trimmed;
+  transport_by_guest_public_key_[trimmed] = transport_id;
+}
+
+std::string FlutterWindow::ResolveSessionKey(
+    const std::string& transport_id) {
+  std::lock_guard<std::mutex> lock(session_map_mutex_);
+  const auto it = guest_public_key_by_transport_.find(transport_id);
+  if (it != guest_public_key_by_transport_.end()) {
+    return it->second;
+  }
+  return std::string();
+}
+
+std::string FlutterWindow::ParseGuestPublicKeyFromWriteBuffer(
+    const winrt::Windows::Storage::Streams::IBuffer& buffer) {
+  using namespace winrt::Windows::Storage::Streams;
+  if (!buffer) return {};
+  DataReader reader = DataReader::FromBuffer(buffer);
+  const uint32_t len = reader.UnconsumedBufferLength();
+  if (len == 0) return {};
+  std::vector<uint8_t> bytes(len);
+  reader.ReadBytes(bytes);
+  const std::string text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  const auto key_pos = text.find("\"guest_public_key\"");
+  if (key_pos != std::string::npos) {
+    const auto colon = text.find(':', key_pos);
+    const auto quote_start = text.find('"', colon);
+    if (quote_start != std::string::npos) {
+      const auto quote_end = text.find('"', quote_start + 1);
+      if (quote_end != std::string::npos && quote_end > quote_start + 1) {
+        return text.substr(quote_start + 1, quote_end - quote_start - 1);
+      }
+    }
+  }
+  if (text.find('{') == std::string::npos && text.size() >= 32) {
+    return text;
+  }
+  return {};
 }
 
 void FlutterWindow::NotifyFlutterConnectionRequest(
     const std::string& friendly_name,
-    const std::string& session_id) {
-  DispatchToPlatformThread([this, friendly_name, session_id]() {
+    const std::string& session_key) {
+  DispatchToPlatformThread([this, friendly_name, session_key]() {
     if (!ble_ui_channel_) return;
     ble_ui_channel_->InvokeMethod(
         "notifyConnectionRequest",
         std::make_unique<flutter::EncodableValue>(flutter::EncodableMap{
             {flutter::EncodableValue("friendlyName"),
              flutter::EncodableValue(friendly_name)},
+            {flutter::EncodableValue("sessionKey"),
+             flutter::EncodableValue(session_key)},
             {flutter::EncodableValue("sessionId"),
-             flutter::EncodableValue(session_id)},
+             flutter::EncodableValue(session_key)},
         }));
   });
 }
@@ -1157,12 +1636,167 @@ void FlutterWindow::ClearPendingReadState() {
   pending_session_id_.clear();
 }
 
+bool FlutterWindow::HandshakeBufferHasInfrastructure() const {
+  if (!pending_lan_ip_.empty()) return true;
+  if (!pending_p2p_ip_.empty()) return true;
+  if (!pending_p2p_mac_.empty()) return true;
+  if (!pending_ssid_.empty()) return true;
+  if (!pending_hub_ip_.empty()) return true;
+  return false;
+}
+
+bool FlutterWindow::JsonHasInfrastructure(const std::string& json) const {
+  auto extract = [](const std::string& key, const std::string& src) {
+    const std::string needle = "\"" + key + "\":\"";
+    auto start = src.find(needle);
+    if (start == std::string::npos) return std::string();
+    start += needle.size();
+    auto end = src.find('"', start);
+    if (end == std::string::npos) return std::string();
+    return src.substr(start, end - start);
+  };
+  if (!extract("lan_ip", json).empty()) return true;
+  if (!extract("hubIp", json).empty()) return true;
+  if (!extract("p2p_ip", json).empty()) return true;
+  if (!extract("p2p_mac", json).empty() || !extract("p2pMac", json).empty()) {
+    return true;
+  }
+  if (!extract("hotspot_ssid", json).empty() || !extract("ssid", json).empty()) {
+    return true;
+  }
+  return false;
+}
+
+flutter::EncodableMap FlutterWindow::ParseHandshakeJsonToMap(
+    const std::string& json) const {
+  auto extract = [](const std::string& key, const std::string& src) {
+    const std::string needle = "\"" + key + "\":\"";
+    auto start = src.find(needle);
+    if (start == std::string::npos) return std::string();
+    start += needle.size();
+    auto end = src.find('"', start);
+    if (end == std::string::npos) return std::string();
+    return src.substr(start, end - start);
+  };
+  auto extract_int = [](const std::string& key, const std::string& src,
+                        int default_v) {
+    const std::string needle = "\"" + key + "\":";
+    auto start = src.find(needle);
+    if (start == std::string::npos) return default_v;
+    start += needle.size();
+    while (start < src.size() &&
+           std::isspace(static_cast<unsigned char>(src[start]))) {
+      start++;
+    }
+    int val = 0;
+    bool any = false;
+    while (start < src.size() &&
+           std::isdigit(static_cast<unsigned char>(src[start]))) {
+      any = true;
+      val = val * 10 + (src[start] - '0');
+      start++;
+    }
+    return any ? val : default_v;
+  };
+  std::string lan_ip = extract("lan_ip", json);
+  const std::string hub_ip_legacy = extract("hubIp", json);
+  if (lan_ip.empty() && !hub_ip_legacy.empty()) {
+    lan_ip = hub_ip_legacy;
+  }
+  const int hub_port =
+      extract_int("hub_port", json, extract_int("hubPort", json, 8080));
+  return {
+      {flutter::EncodableValue("lan_ip"), flutter::EncodableValue(lan_ip)},
+      {flutter::EncodableValue("p2p_ip"),
+       flutter::EncodableValue(extract("p2p_ip", json))},
+      {flutter::EncodableValue("p2p_mac"),
+       flutter::EncodableValue(
+           extract("p2p_mac", json).empty() ? extract("p2pMac", json)
+                                            : extract("p2p_mac", json))},
+      {flutter::EncodableValue("hotspot_ssid"),
+       flutter::EncodableValue(extract("hotspot_ssid", json).empty()
+                                   ? extract("ssid", json)
+                                   : extract("hotspot_ssid", json))},
+      {flutter::EncodableValue("hotspot_pass"),
+       flutter::EncodableValue(extract("hotspot_pass", json).empty()
+                                   ? extract("password", json)
+                                   : extract("hotspot_pass", json))},
+      {flutter::EncodableValue("hotspot_hub_ip"),
+       flutter::EncodableValue(extract("hotspot_hub_ip", json))},
+      {flutter::EncodableValue("host_public_key"),
+       flutter::EncodableValue(extract("host_public_key", json))},
+      {flutter::EncodableValue("tls_cert_sha256"),
+       flutter::EncodableValue(extract("tls_cert_sha256", json))},
+      {flutter::EncodableValue("hub_port"), flutter::EncodableValue(hub_port)},
+      {flutter::EncodableValue("ssid"),
+       flutter::EncodableValue(extract("ssid", json))},
+      {flutter::EncodableValue("password"),
+       flutter::EncodableValue(extract("password", json))},
+      {flutter::EncodableValue("hubIp"), flutter::EncodableValue(hub_ip_legacy)},
+      {flutter::EncodableValue("hubPort"), flutter::EncodableValue(hub_port)},
+  };
+}
+
 winrt::Windows::Storage::Streams::IBuffer FlutterWindow::BuildHandshakeBuffer() const {
   std::ostringstream oss;
-  oss << "{\"ssid\":\"" << pending_ssid_ << "\",\"password\":\"" << pending_password_
-      << "\",\"hubIp\":\"" << pending_hub_ip_ << "\",\"hubPort\":" << pending_hub_port_
-      << "}";
+  oss << "{";
+  bool first = true;
+  auto append_field = [&](const std::string& key, const std::string& value) {
+    if (value.empty()) return;
+    if (!first) oss << ',';
+    first = false;
+    oss << "\"" << key << "\":\"" << value << "\"";
+  };
+  append_field("lan_ip", pending_lan_ip_);
+  append_field("p2p_ip", pending_p2p_ip_);
+  append_field("p2p_mac", pending_p2p_mac_);
+  append_field("hotspot_ssid", pending_ssid_);
+  append_field("hotspot_pass", pending_password_);
+  append_field("hotspot_hub_ip", pending_hotspot_hub_ip_);
+  if (!first) oss << ',';
+  oss << "\"hub_port\":" << pending_hub_port_;
+  std::string primary = pending_lan_ip_;
+  if (primary.empty()) primary = pending_p2p_ip_;
+  if (primary.empty()) primary = pending_hotspot_hub_ip_;
+  if (primary.empty()) primary = pending_hub_ip_;
+  if (!primary.empty()) {
+    oss << ",\"hubIp\":\"" << primary << "\",\"hubPort\":" << pending_hub_port_;
+  }
+  if (!pending_ssid_.empty()) {
+    oss << ",\"ssid\":\"" << pending_ssid_ << "\",\"password\":\""
+        << pending_password_ << "\"";
+  }
+  if (!pending_p2p_mac_.empty()) {
+    oss << ",\"p2pMac\":\"" << pending_p2p_mac_ << "\"";
+  }
+  if (!pending_tls_cert_sha256_.empty()) {
+    oss << ",\"tls_cert_sha256\":\"" << pending_tls_cert_sha256_ << "\"";
+  }
+  oss << "}";
   const std::string json = oss.str();
+  winrt::Windows::Storage::Streams::DataWriter writer;
+  writer.WriteString(winrt::to_hstring(json));
+  return writer.DetachBuffer();
+}
+
+winrt::Windows::Storage::Streams::IBuffer FlutterWindow::BuildHandshakeBufferForPeer(
+    const std::string& peer_id) const {
+  const auto infra = BuildHandshakeBuffer();
+  winrt::Windows::Storage::Streams::DataReader reader =
+      winrt::Windows::Storage::Streams::DataReader::FromBuffer(infra);
+  const uint32_t len = reader.UnconsumedBufferLength();
+  if (len == 0) return infra;
+  std::vector<uint8_t> bytes(len);
+  reader.ReadBytes(bytes);
+  std::string json(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  const auto it = approved_peer_host_keys_.find(peer_id);
+  if (it == approved_peer_host_keys_.end() || it->second.empty()) {
+    return infra;
+  }
+  if (json.size() >= 2 && json.back() == '}') {
+    json.pop_back();
+    json += ",\"host_public_key\":\"" + it->second + "\"}";
+  }
   winrt::Windows::Storage::Streams::DataWriter writer;
   writer.WriteString(winrt::to_hstring(json));
   return writer.DetachBuffer();
