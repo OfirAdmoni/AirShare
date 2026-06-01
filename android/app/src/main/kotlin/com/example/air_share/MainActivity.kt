@@ -108,6 +108,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private var pendingLanIp: String = ""
     private var pendingP2pIp: String = ""
     private var pendingHotspotHubIp: String = ""
+    private var pendingFriendlyName: String = ""
     /// True only after LocalOnlyHotspotCallback.onStarted — gates BLE hotspot fields.
     private var hotspotActive = false
 
@@ -580,8 +581,51 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }
     }
 
+    /** RFC1918 / link-local — includes shared Wi‑Fi subnets like 10.252.x.x (never carrier-only). */
+    private fun isPrivateLanIpv4(ip: String): Boolean {
+        val parts = ip.trim().split('.')
+        if (parts.size != 4) return false
+        val octets = parts.mapNotNull { it.toIntOrNull() }
+        if (octets.size != 4 || octets.any { it !in 0..255 }) return false
+        return when (octets[0]) {
+            10 -> true
+            172 -> octets[1] in 16..31
+            192 -> octets[1] == 168
+            169 -> octets[1] == 254
+            else -> false
+        }
+    }
+
+    private fun applyLanIpFromDart(raw: String, reason: String) {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return
+        if (!isPrivateLanIpv4(trimmed)) {
+            Log.w(
+                "AirShareNative",
+                "applyLanIpFromDart($reason): ignored non-private ip=$trimmed",
+            )
+            return
+        }
+        if (trimmed == "127.0.0.1") return
+        pendingLanIp = trimmed
+        Log.i("AirShareNative", "applyLanIpFromDart($reason): pendingLanIp=$pendingLanIp")
+    }
+
+    private fun refreshCachedHandshakePayload(reason: String) {
+        val built = buildHandshakePayloadOrNull()
+        if (built != null) {
+            handshakePayload = built
+            handshakeCharacteristic?.value = built
+            Log.i(
+                "AirShareNative",
+                "refreshCachedHandshakePayload($reason): ${String(built, StandardCharsets.UTF_8).take(220)}",
+            )
+        }
+    }
+
     private fun approveConnection(call: MethodCall, result: MethodChannel.Result) {
         val approved = call.argument<Boolean>("approved") ?: false
+        call.argument<String>("lanIp")?.let { applyLanIpFromDart(it, "approveConnection") }
         if (!approved) {
             val device = pendingReadDevice
             val requestId = pendingReadRequestId
@@ -663,10 +707,16 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             result.error("invalid_endpoint", "ip is required", null)
             return
         }
+        applyLanIpFromDart(ip, "updateHubEndpoint")
         pendingHubIp = ip
         pendingHubPort = port
         advertisedEndpoint = "$ip:$port"
         endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
+        Log.i(
+            "AirShareNative",
+            "updateHubEndpoint: pendingLanIp=$pendingLanIp endpoint=$advertisedEndpoint",
+        )
+        refreshCachedHandshakePayload("updateHubEndpoint")
         result.success(null)
     }
 
@@ -723,6 +773,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             "hotspot_pass" to json.optString("hotspot_pass", json.optString("password", "")),
             "hotspot_hub_ip" to json.optString("hotspot_hub_ip", ""),
             "hub_port" to json.optInt("hub_port", json.optInt("hubPort", 8080)),
+            "friendly_name" to json.optString("friendly_name", ""),
         )
     }
 
@@ -774,12 +825,25 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     }
 
     private fun buildHandshakePayloadOrNull(): ByteArray? {
-        val lan = pendingLanIp.trim()
+        var lan = pendingLanIp.trim()
+        if (lan.isNotEmpty() && !isPrivateLanIpv4(lan)) {
+            Log.w(
+                "AirShareNative",
+                "buildHandshakePayloadOrNull: dropping invalid pendingLanIp=$lan",
+            )
+            lan = ""
+        }
         val p2p = pendingP2pIp.trim()
         val ssid = if (hotspotActive) pendingHotspotSsid?.trim().orEmpty() else ""
         val password = if (hotspotActive) pendingHotspotPassword?.trim().orEmpty() else ""
         val p2pMac = pendingP2pMac.trim()
         val hotspotHub = if (hotspotActive) pendingHotspotHubIp.trim() else ""
+        if (lan.isBlank()) {
+            val hubFallback = pendingHubIp?.trim().orEmpty()
+            if (hubFallback.isNotEmpty() && isPrivateLanIpv4(hubFallback) && ssid.isBlank()) {
+                lan = hubFallback
+            }
+        }
         if (lan.isBlank() && p2p.isBlank() && ssid.isBlank()) {
             Log.w("AirShareNative", "Android | Handshake build skipped: no tier endpoints")
             return null
@@ -807,6 +871,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 put("password", password)
             }
             if (p2pMac.isNotBlank()) put("p2pMac", p2pMac)
+            if (pendingFriendlyName.isNotBlank()) put("friendly_name", pendingFriendlyName)
         }.toString()
         Log.i(
             "AirShareNative",
@@ -816,8 +881,14 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     }
 
     private fun updateConnectionEndpoints(call: MethodCall, result: MethodChannel.Result) {
-        pendingLanIp = call.argument<String>("lanIp")?.trim().orEmpty()
-        pendingP2pIp = call.argument<String>("p2pIp")?.trim().orEmpty()
+        applyLanIpFromDart(
+            call.argument<String>("lanIp")?.trim().orEmpty(),
+            "updateConnectionEndpoints",
+        )
+        val p2pFromDart = call.argument<String>("p2pIp")?.trim().orEmpty()
+        if (p2pFromDart.isNotEmpty()) {
+            pendingP2pIp = p2pFromDart
+        }
         val incomingP2pMac = call.argument<String>("p2pMac")?.trim().orEmpty()
         when {
             isUsableP2pMac(incomingP2pMac) -> pendingP2pMac = incomingP2pMac
@@ -857,6 +928,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             advertisedEndpoint = "$primary:$pendingHubPort"
             endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
         }
+        refreshCachedHandshakePayload("updateConnectionEndpoints")
         result.success(null)
     }
 
@@ -1040,12 +1112,13 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             Build.PRODUCT.trim().ifBlank { "Android" }
         }
         val baseName = if (fromFlutter.isNotEmpty()) fromFlutter else modelFallback
+        pendingFriendlyName = baseName
         if (pendingHubIp != null && pendingHubIp!!.isNotBlank()) {
             advertisedEndpoint = "${pendingHubIp}:${pendingHubPort}"
         }
-        var broadcastLabel = baseName.take(10).trim()
+        var broadcastLabel = baseName.trim()
         if (broadcastLabel.isEmpty()) {
-            broadcastLabel = modelFallback.take(10).trim().ifEmpty { "?" }
+            broadcastLabel = modelFallback.trim().ifEmpty { "?" }
         }
         while (broadcastLabel.toByteArray(StandardCharsets.UTF_8).size > 29) {
             broadcastLabel = broadcastLabel.dropLast(1)
@@ -1553,6 +1626,24 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private fun startTemporaryHotspot(call: MethodCall, result: MethodChannel.Result) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
             result.error("unsupported", "LocalOnlyHotspot requires Android 8.0+.", null)
+            return
+        }
+        val preConnectedLan = pendingLanIp.trim()
+            .ifBlank { resolvePreConnectedHostLanIpv4().orEmpty() }
+        if (preConnectedLan.isNotEmpty() && isPrivateLanIpv4(preConnectedLan)) {
+            Log.i(
+                "AirShareNative",
+                "startTemporaryHotspot: skipped — pre-connected Tier 1 LAN $preConnectedLan (wlan0/ap0)",
+            )
+            result.success(
+                mapOf(
+                    "ssid" to "",
+                    "password" to "",
+                    "hubIp" to preConnectedLan,
+                    "hotspotActive" to false,
+                    "tier1PreConnected" to true,
+                ),
+            )
             return
         }
         if (activeHotspotReservation != null && hotspotActive) {
@@ -2204,22 +2295,72 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         wifiP2pChannel = null
     }
 
-    private fun isExcludedFromTier1Lan(ifaceName: String): Boolean {
+    private fun isExcludedVirtualInterface(ifaceName: String): Boolean {
         val l = ifaceName.lowercase(Locale.US)
-        if (l.startsWith("ap") || l.contains("softap")) return true
         if (l.contains("p2p")) return true
         if (l.contains("rndis") || l.contains("usb")) return true
         if (l.contains("swlan")) return true
         return false
     }
 
-    private fun isHotspotHubInterface(ifaceName: String): Boolean {
+    /** Manual / active hotspot AP (`ap0`, `ap1`, softap) — valid Tier 1 when already hosting. */
+    private fun isHotspotAccessPointInterface(ifaceName: String): Boolean {
         val l = ifaceName.lowercase(Locale.US)
-        return l.startsWith("ap") || l.contains("softap")
+        if (l == "ap0" || l == "ap1") return true
+        if (l.matches(Regex("^ap\\d+$"))) return true
+        return l.contains("softap")
     }
 
-    /// Hub IP on the LocalOnlyHotspot interface (ap0), not wlan0 or p2p.
+    /** Station Wi‑Fi (`wlan0`, …) for shared LAN / home Wi‑Fi. */
+    private fun isWlanStationInterface(ifaceName: String): Boolean {
+        val l = ifaceName.lowercase(Locale.US)
+        return l.contains("wlan") || l.contains("wifi")
+    }
+
+    private fun isPreConnectedHostInterface(ifaceName: String): Boolean {
+        return isWlanStationInterface(ifaceName) || isHotspotAccessPointInterface(ifaceName)
+    }
+
+    private fun isHotspotHubInterface(ifaceName: String): Boolean =
+        isHotspotAccessPointInterface(ifaceName)
+
+    /// Best private IPv4 on wlan0 or ap0/ap1 (pre-connected Tier 1 — no LocalOnlyHotspot).
+    private fun resolvePreConnectedHostLanIpv4(): String? {
+        return try {
+            val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
+            var best: Pair<String, Int>? = null
+            for (iface in interfaces) {
+                if (!iface.isUp || iface.isLoopback || isExcludedVirtualInterface(iface.name)) continue
+                if (!isPreConnectedHostInterface(iface.name)) continue
+                for (address in Collections.list(iface.inetAddresses)) {
+                    if (address !is Inet4Address || address.isLoopbackAddress) continue
+                    val ip = address.hostAddress?.trim().orEmpty()
+                    if (ip.isEmpty() || !isPrivateLanIpv4(ip)) continue
+                    val score = when {
+                        iface.name.equals("wlan0", ignoreCase = true) -> 60
+                        isWlanStationInterface(iface.name) -> 40
+                        isHotspotAccessPointInterface(iface.name) -> 30
+                        else -> 10
+                    }
+                    if (best == null || score > best!!.second) {
+                        best = ip to score
+                        Log.i(
+                            "AirShareNative",
+                            "resolvePreConnectedHostLanIpv4: candidate $ip on ${iface.name} score=$score",
+                        )
+                    }
+                }
+            }
+            best?.first
+        } catch (e: Exception) {
+            Log.w("AirShareNative", "resolvePreConnectedHostLanIpv4 failed: ${e.message}")
+            null
+        }
+    }
+
+    /// Hub IP on LocalOnlyHotspot (ap0) after [hotspotActive], else pre-connected LAN.
     private fun resolveHotspotHubIpv4Address(): String {
+        resolvePreConnectedHostLanIpv4()?.let { return it }
         return try {
             val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
             for (iface in interfaces) {
@@ -2227,16 +2368,9 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 for (address in Collections.list(iface.inetAddresses)) {
                     if (address is Inet4Address && !address.isLoopbackAddress) {
                         val ip = address.hostAddress ?: continue
+                        if (!isPrivateLanIpv4(ip)) continue
                         Log.i("AirShareNative", "Hotspot hub IP from ${iface.name}: $ip")
                         return ip
-                    }
-                }
-            }
-            for (iface in interfaces) {
-                if (!iface.isUp || iface.isLoopback || isExcludedFromTier1Lan(iface.name)) continue
-                for (address in Collections.list(iface.inetAddresses)) {
-                    if (address is Inet4Address && !address.isLoopbackAddress) {
-                        return address.hostAddress ?: "192.168.43.1"
                     }
                 }
             }
@@ -2246,7 +2380,8 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }
     }
 
-    private fun resolveLocalIpv4Address(): String = resolveHotspotHubIpv4Address()
+    private fun resolveLocalIpv4Address(): String =
+        resolvePreConnectedHostLanIpv4() ?: resolveHotspotHubIpv4Address()
 
     override fun onDestroy() {
         stopInternalLink(MethodChannelResultProxy())

@@ -1,14 +1,13 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:network_info_plus/network_info_plus.dart';
-
 import 'package:air_share/ble_transport.dart';
 import 'package:air_share/session_teardown.dart';
 import 'package:air_share/connection_logger.dart';
 import 'package:air_share/device_branding.dart';
 import 'package:air_share/file_list_screen.dart';
 import 'package:air_share/file_zone_session.dart';
+import 'package:air_share/host_network_tier.dart';
 import 'package:air_share/hub_endpoint_state.dart';
 import 'package:air_share/hub_status.dart';
 import 'package:air_share/local_hub_runtime.dart';
@@ -74,6 +73,13 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
       final hotspotInfo = await WlanLinkManager.instance.startTemporaryHotspot(
         hubPort: hubPort,
       );
+      if (hotspotInfo?['tier1PreConnected'] == true) {
+        final hubIp = (hotspotInfo?['hubIp'] ?? '').toString().trim();
+        if (hubIp.isNotEmpty) {
+          apply('', '', hubIp);
+        }
+        return false;
+      }
       if (hotspotInfo?['hotspotActive'] != true) {
         return false;
       }
@@ -128,27 +134,6 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
     await UxPrompts.showManualHotspotFallback(context);
   }
 
-  bool _isRealAdvertisableIp(String ip) {
-    final candidate = ip.trim();
-    if (candidate.isEmpty || candidate == '127.0.0.1') return false;
-    final isLan = candidate.startsWith('192.168.') || candidate.startsWith('10.');
-    if (!isLan) return false;
-    final knownVirtualRanges = <String>[
-      '192.168.56.',
-      '192.168.153.',
-      '192.168.188.',
-      '192.168.232.',
-    ];
-    for (final prefix in knownVirtualRanges) {
-      if (candidate.startsWith(prefix)) return false;
-    }
-    return true;
-  }
-
-  bool _isHotspotFallbackIp(String ip) {
-    return ip.trim().startsWith('192.168.137.');
-  }
-
   /// Push hub `ip:port` into the native GATT endpoint characteristic as soon as
   /// it is known (Android/Windows). Reduces Android↔Android races where the
   /// guest reads `:8080` or an empty endpoint before the approve dialog runs.
@@ -168,96 +153,6 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
     }
   }
 
-  String? _pickRealIp(List<String?> candidates) {
-    String? hotspotFallback;
-    for (final candidate in candidates) {
-      final value = (candidate ?? '').trim();
-      if (!_isRealAdvertisableIp(value)) continue;
-      if (_isHotspotFallbackIp(value)) {
-        hotspotFallback ??= value;
-        continue;
-      }
-      return value;
-    }
-    return hotspotFallback;
-  }
-
-  /// Data / carrier / VPN interfaces — never use these for BLE‑advertised hub IP
-  /// when a hotspot/LAN address exists (avoids rmnet/ccmni carrier NAT IPs).
-  bool _isLikelyCellularOrWan(String name) {
-    final lower = name.toLowerCase();
-    return lower.contains('rmnet') ||
-        lower.contains('ccmni') ||
-        lower.contains('pdp') ||
-        lower.contains('cell') ||
-        lower.contains('wwan') ||
-        lower.contains('mobile') ||
-        lower.contains('epdg') ||
-        lower.contains('v4-rmnet') ||
-        lower.contains('clat') ||
-        lower.contains('tun') ||
-        lower.contains('tap') ||
-        lower.contains('vbox') ||
-        lower.contains('vmnet') ||
-        lower.contains('vpn') ||
-        lower.contains('wg') ||
-        lower.contains('dummy');
-  }
-
-  /// LocalOnlyHotspot (ap0), Wi‑Fi Direct (p2p-*), and tether USB — not home/office LAN.
-  bool _isExcludedFromTier1Lan(String ifaceName) {
-    final l = ifaceName.toLowerCase();
-    if (l.startsWith('ap') || l.contains('softap')) return true;
-    if (l.contains('p2p')) return true;
-    if (l.contains('rndis') || l.contains('usb')) return true;
-    if (l.contains('swlan')) return true;
-    return false;
-  }
-
-  /// Tier 1 candidates: station-mode Wi‑Fi (wlan0, etc.) only.
-  bool _isTier1LanEligibleInterface(String ifaceName) {
-    if (_isExcludedFromTier1Lan(ifaceName)) return false;
-    final l = ifaceName.toLowerCase();
-    if (Platform.isWindows) {
-      return l.contains('wi-fi') ||
-          l.contains('wifi') ||
-          l.contains('wlan') ||
-          l.contains('ethernet') ||
-          l.startsWith('eth');
-    }
-    return l.contains('wlan') || l.contains('wifi');
-  }
-
-  int _tier1LanPreferenceScore(String ifaceName, String ip) {
-    final l = ifaceName.toLowerCase();
-    var score = 0;
-    if (l == 'wlan0' || l.endsWith('wlan0')) score += 50;
-    if (l.contains('wlan')) score += 30;
-    if (l.contains('wifi')) score += 20;
-    final parts = ip.split('.');
-    if (parts.length == 4 && parts[3] == '1') score += 4;
-    return score;
-  }
-
-  Future<bool> _ipOnlyOnExcludedInterfaces(String ip) async {
-    var onEligible = false;
-    var onExcluded = false;
-    for (final iface in await NetworkInterface.list(
-      includeLoopback: false,
-      type: InternetAddressType.IPv4,
-    )) {
-      for (final addr in iface.addresses) {
-        if (addr.address != ip) continue;
-        if (_isTier1LanEligibleInterface(iface.name)) {
-          onEligible = true;
-        } else if (_isExcludedFromTier1Lan(iface.name)) {
-          onExcluded = true;
-        }
-      }
-    }
-    return onExcluded && !onEligible;
-  }
-
   Future<void> _logAllNetworkInterfaces(List<NetworkInterface> interfaces) async {
     debugPrint('Network | Interfaces | dump start (${interfaces.length} ifaces, IPv4)');
     await ConnectionLogger.instance.log(
@@ -273,70 +168,6 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
       }
     }
     debugPrint('Network | Interfaces | dump end');
-  }
-
-  /// Picks an IPv4 to advertise over BLE: LAN/hotspot first, never cellular rmnet/ccmni.
-  Future<({String? pickedIp, Set<String> ipsSeenOnCellular})>
-      _pickHubAdvertiseIpv4FromInterfaces() async {
-    final interfaces = await NetworkInterface.list(
-      includeLoopback: false,
-      type: InternetAddressType.IPv4,
-    );
-    await _logAllNetworkInterfaces(interfaces);
-
-    final ipsOnCellular = <String>{};
-    for (final iface in interfaces) {
-      if (!_isLikelyCellularOrWan(iface.name)) continue;
-      for (final addr in iface.addresses) {
-        if (addr.type == InternetAddressType.IPv4) {
-          ipsOnCellular.add(addr.address);
-        }
-      }
-    }
-
-    final scored = <({String name, String ip, int score})>[];
-    for (final iface in interfaces) {
-      if (_isLikelyCellularOrWan(iface.name)) continue;
-      if (!_isTier1LanEligibleInterface(iface.name)) continue;
-      for (final addr in iface.addresses) {
-        if (addr.type != InternetAddressType.IPv4) continue;
-        final ip = addr.address;
-        if (!_isRealAdvertisableIp(ip)) continue;
-        final score = _tier1LanPreferenceScore(iface.name, ip);
-        scored.add((name: iface.name, ip: ip, score: score));
-      }
-    }
-
-    if (scored.isEmpty && Platform.isWindows) {
-      for (final iface in interfaces) {
-        if (_isLikelyCellularOrWan(iface.name)) continue;
-        if (_isExcludedFromTier1Lan(iface.name)) continue;
-        for (final addr in iface.addresses) {
-          if (addr.type != InternetAddressType.IPv4) continue;
-          final ip = addr.address;
-          if (!_isRealAdvertisableIp(ip)) continue;
-          scored.add((name: iface.name, ip: ip, score: 10));
-        }
-      }
-    }
-
-    if (scored.isEmpty) {
-      await ConnectionLogger.instance.log(
-        'Network | Hub IPv4 pick',
-        details: 'no non-cellular LAN candidates (cellular_iface_ips=${ipsOnCellular.length})',
-      );
-      return (pickedIp: null, ipsSeenOnCellular: ipsOnCellular);
-    }
-
-    scored.sort((a, b) => b.score.compareTo(a.score));
-    final best = scored.first;
-    await ConnectionLogger.instance.log(
-      'Network | Hub IPv4 pick',
-      details:
-          'chose ${best.ip} on ${best.name} score=${best.score} '
-          '(candidates=${scored.length}; skipped cellular ifaces)',
-    );
-    return (pickedIp: best.ip, ipsSeenOnCellular: ipsOnCellular);
   }
 
   @override
@@ -380,43 +211,24 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
       await ConnectionLogger.instance.log(
         'HTTP Server | Listening on all interfaces (0.0.0.0:$port)',
       );
-      final networkInfo = NetworkInfo();
-      final discoveredIpRaw = (await networkInfo.getWifiIP())?.trim();
-      final ifaceAnalysis = await _pickHubAdvertiseIpv4FromInterfaces();
-      final interfaceIp = ifaceAnalysis.pickedIp;
-      final ipsOnCellular = ifaceAnalysis.ipsSeenOnCellular;
+      final interfaces = await NetworkInterface.list(
+        includeLoopback: false,
+        type: InternetAddressType.IPv4,
+      );
+      await _logAllNetworkInterfaces(interfaces);
 
-      var discoveredIp = discoveredIpRaw;
-      if (discoveredIp != null &&
-          discoveredIp.isNotEmpty &&
-          ipsOnCellular.contains(discoveredIp)) {
-        await ConnectionLogger.instance.log(
-          'Network | getWifiIP ignored',
-          details:
-              '$discoveredIp matches an address on a cellular/WAN interface — not using for BLE hub IP',
-        );
-        discoveredIp = null;
-      }
-      if (discoveredIp != null &&
-          discoveredIp.isNotEmpty &&
-          await _ipOnlyOnExcludedInterfaces(discoveredIp)) {
-        await ConnectionLogger.instance.log(
-          'Network | getWifiIP ignored',
-          details: '$discoveredIp is only on ap/p2p virtual interfaces — not Tier 1 LAN',
-        );
-        discoveredIp = null;
-      }
-
+      final networkPlan = await HostNetworkTier.planSenderStartup();
       await ConnectionLogger.instance.log(
-        'Self IP discovered',
-        details:
-            'network_info_plus=${discoveredIpRaw ?? "unavailable"}, '
-            'wifi_ip_after_filter=${discoveredIp ?? "none"}, '
-            'interface_pick=${interfaceIp ?? "none"}',
+        'Network | Sender tier plan',
+        details: networkPlan.useTier1Only
+            ? 'Tier 1 only — ${networkPlan.tier1LanIp} on ${networkPlan.pickedInterface ?? "?"} '
+                '(bypass automated hotspot/P2P)'
+            : 'no pre-connected private IP — offline Tier 2/3 may run',
       );
 
       if (!mounted) return;
-      final lanIp = _pickRealIp([interfaceIp, discoveredIp]);
+      final lanIp = networkPlan.tier1LanIp;
+      final useTier1Only = networkPlan.useTier1Only;
       var p2pIp = '';
       var p2pMac = '';
       var hotspotSsid = '';
@@ -436,13 +248,21 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
                 : 'Windows hub on 127.0.0.1 — connect receivers on the same Wi‑Fi/LAN',
           );
         }
-      } else if (lanIp != null && lanIp.isNotEmpty) {
+      } else if (useTier1Only && lanIp != null && lanIp.isNotEmpty) {
+        final ifaceHint = networkPlan.pickedInterface ?? '';
+        final onAp = HostNetworkTier.isHotspotAccessPointInterface(ifaceHint);
         await ConnectionLogger.instance.log(
           'Connection | Tier 1 LAN ready',
-          details: lanIp,
+          details: onAp
+              ? '$lanIp (pre-connected hotspot $ifaceHint — Tier 2/3 bypassed)'
+              : '$lanIp ($ifaceHint — Tier 2/3 bypassed)',
         );
         if (mounted) {
-          setState(() => _status = 'LAN ready — skipping Wi‑Fi Direct (radio save)');
+          setState(
+            () => _status = onAp
+                ? 'Hotspot/LAN ready — using existing network (no auto hotspot)'
+                : 'LAN ready — skipping automated hotspot and Wi‑Fi Direct',
+          );
         }
       } else if (Platform.isIOS) {
         await ConnectionLogger.instance.log(
@@ -588,9 +408,17 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
         hubPort: port,
       );
 
+      HubEndpointState.instance.rememberBleEndpoints(
+        lanIp: lanIp ?? '',
+        p2pIp: p2pIp,
+        p2pMac: p2pMac,
+        hotspotSsid: hotspotSsid,
+        hotspotPass: hotspotPass,
+        hotspotHubIp: hotspotHubIp,
+        hubPort: port,
+      );
       final advertisedIp = lanIp ?? (hotspotHubIp.isNotEmpty ? hotspotHubIp : p2pIp);
       if (advertisedIp.isNotEmpty) {
-        HubEndpointState.instance.setPending(ip: advertisedIp, port: port);
         await _primeBleGattEndpoint(ip: advertisedIp, port: port);
         if (mounted) {
           setState(() {
@@ -607,8 +435,7 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
         if (mounted) {
           setState(() {
             _currentAdvertisedIp = null;
-            _networkWarning = discoveredIp == '127.0.0.1'
-                || interfaceIp == '127.0.0.1'
+            _networkWarning = lanIp == '127.0.0.1'
                 ? 'No active network detected. Please connect to Wi-Fi or enable Hotspot.'
                 : null;
           });

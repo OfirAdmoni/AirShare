@@ -17,6 +17,25 @@ import 'shared_room_manifest.dart';
 /// on the same LAN can open TCP to the hub (Android hub uses Dart [HttpServer]).
 final InternetAddress _hubListenAllIPv4 = InternetAddress('0.0.0.0');
 
+/// Metadata sent by the sender before starting a file upload batch.
+class TransferApprovalRequest {
+  const TransferApprovalRequest({
+    required this.senderName,
+    required this.fileCount,
+    required this.totalBytes,
+  });
+
+  final String senderName;
+  final int fileCount;
+  final int totalBytes;
+
+  Map<String, dynamic> toJson() => {
+        'senderName': senderName,
+        'fileCount': fileCount,
+        'totalBytes': totalBytes,
+      };
+}
+
 class LocalHubRuntime {
   LocalHubRuntime._();
 
@@ -30,6 +49,15 @@ class LocalHubRuntime {
       StreamController<String>.broadcast();
   final StreamController<void> _firstGuestController =
       StreamController<void>.broadcast();
+  final StreamController<String> _guestJoinedController =
+      StreamController<String>.broadcast();
+
+  // Transfer approval state — one pending request at a time.
+  TransferApprovalRequest? _pendingTransfer;
+  Completer<bool>? _decisionCompleter;
+  Timer? _approvalTimeoutTimer;
+
+  TransferApprovalRequest? get pendingTransfer => _pendingTransfer;
 
   bool get isRunning => _server != null;
   int get activePort => _activePort;
@@ -56,6 +84,7 @@ class LocalHubRuntime {
   }
   Stream<String> get ingressEvents => _ingressEventsController.stream;
   Stream<void> get firstGuestConnected => _firstGuestController.stream;
+  Stream<String> get guestJoined => _guestJoinedController.stream;
 
   Future<void> ensureStarted(HubStatus status) async {
     if (isRunning) {
@@ -115,6 +144,13 @@ class LocalHubRuntime {
   }
 
   Future<void> stop() async {
+    _approvalTimeoutTimer?.cancel();
+    _approvalTimeoutTimer = null;
+    if (_decisionCompleter != null && !_decisionCompleter!.isCompleted) {
+      _decisionCompleter!.complete(false);
+    }
+    _decisionCompleter = null;
+    _pendingTransfer = null;
     await _server?.close(force: true);
     _server = null;
     _activePort = 8080;
@@ -221,6 +257,26 @@ class LocalHubRuntime {
       return;
     }
 
+    if (path == '/transfer-request' && method == 'POST') {
+      await _handleTransferRequest(request);
+      return;
+    }
+
+    if (path == '/pending-transfer' && method == 'GET') {
+      await _handlePendingTransfer(request);
+      return;
+    }
+
+    if (path == '/transfer-response' && method == 'POST') {
+      await _handleTransferResponse(request);
+      return;
+    }
+
+    if (path == '/join' && method == 'POST') {
+      await _handleGuestJoin(request);
+      return;
+    }
+
     request.response.statusCode = HttpStatus.notFound;
     request.response.write('Not found');
     await request.response.close();
@@ -274,7 +330,8 @@ class LocalHubRuntime {
     entries.sort((a, b) => b.sharedAt.compareTo(a.sharedAt));
     await manifest.save(sharedDirPath);
 
-    request.response.headers.contentType = ContentType.json;
+    request.response.headers.contentType =
+        ContentType('application', 'json', charset: 'utf-8');
     request.response.write(jsonEncode(entries.map((e) => e.toJson()).toList()));
     await request.response.close();
   }
@@ -318,10 +375,13 @@ class LocalHubRuntime {
     manifest.removeFile(fileName);
     await manifest.save(sharedDirPath);
 
-    request.response.headers.contentType = ContentType.json;
+    request.response.headers.contentType =
+        ContentType('application', 'json', charset: 'utf-8');
     request.response.write(jsonEncode({'status': 'ok', 'fileName': fileName}));
     await request.response.close();
-    _ingressEventsController.add('deleted:$fileName');
+    _ingressEventsController.add(
+      jsonEncode({'type': 'deleted', 'fileName': fileName}),
+    );
   }
 
   Future<void> _handleDownload(HttpRequest request, String sharedDirPath) async {
@@ -438,7 +498,7 @@ class LocalHubRuntime {
     }
 
     final headersBytes = bodyBytes.sublist(startBoundary, headerEnd);
-    final headersText = latin1.decode(headersBytes);
+    final headersText = utf8.decode(headersBytes, allowMalformed: true);
     String? fileName;
     final match = RegExp(r'filename="([^"]+)"').firstMatch(headersText);
     if (match != null) {
@@ -490,7 +550,8 @@ class LocalHubRuntime {
     );
     await manifest.save(sharedDirPath);
 
-    request.response.headers.contentType = ContentType.json;
+    request.response.headers.contentType =
+        ContentType('application', 'json', charset: 'utf-8');
     request.response.statusCode = HttpStatus.created;
     request.response.write(
       jsonEncode({
@@ -500,7 +561,120 @@ class LocalHubRuntime {
       }),
     );
     await request.response.close();
-    _ingressEventsController.add(fileName);
+    _ingressEventsController.add(
+      jsonEncode({
+        'type': 'uploaded',
+        'senderName': senderName,
+        'fileName': fileName,
+      }),
+    );
+  }
+
+  Future<Uint8List> _readBody(HttpRequest request) async {
+    final builder = BytesBuilder(copy: false);
+    await for (final chunk in request) {
+      builder.add(chunk);
+    }
+    return builder.takeBytes();
+  }
+
+  /// Sender calls this before uploading. Blocks up to 30 s waiting for the
+  /// receiver to approve or reject. Returns {"approved": true/false}.
+  Future<void> _handleTransferRequest(HttpRequest request) async {
+    if (_decisionCompleter != null) {
+      request.response.statusCode = HttpStatus.conflict;
+      request.response.write('Another transfer request is already pending');
+      await request.response.close();
+      return;
+    }
+
+    final bodyBytes = await _readBody(request);
+    Map<String, dynamic> body;
+    try {
+      body = json.decode(utf8.decode(bodyBytes)) as Map<String, dynamic>;
+    } catch (_) {
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write('Expected JSON body');
+      await request.response.close();
+      return;
+    }
+
+    _pendingTransfer = TransferApprovalRequest(
+      senderName: (body['senderName'] as String?) ?? 'Unknown sender',
+      fileCount: (body['fileCount'] as int?) ?? 1,
+      totalBytes: (body['totalBytes'] as int?) ?? 0,
+    );
+    _decisionCompleter = Completer<bool>();
+
+    // Auto-reject after 30 s if receiver does not respond.
+    _approvalTimeoutTimer = Timer(const Duration(seconds: 30), () {
+      if (_decisionCompleter != null && !_decisionCompleter!.isCompleted) {
+        _decisionCompleter!.complete(false);
+      }
+    });
+
+    final approved = await _decisionCompleter!.future;
+
+    _approvalTimeoutTimer?.cancel();
+    _approvalTimeoutTimer = null;
+    _pendingTransfer = null;
+    _decisionCompleter = null;
+
+    request.response.headers.contentType =
+        ContentType('application', 'json', charset: 'utf-8');
+    request.response.write(jsonEncode({'approved': approved}));
+    await request.response.close();
+  }
+
+  /// Receiver polls this to discover a pending transfer request.
+  Future<void> _handlePendingTransfer(HttpRequest request) async {
+    request.response.headers.contentType =
+        ContentType('application', 'json', charset: 'utf-8');
+    if (_pendingTransfer != null) {
+      request.response.write(jsonEncode(_pendingTransfer!.toJson()));
+    } else {
+      request.response.write('null');
+    }
+    await request.response.close();
+  }
+
+  /// Receiver posts {"approved": true/false} to resolve the pending request.
+  Future<void> _handleTransferResponse(HttpRequest request) async {
+    final bodyBytes = await _readBody(request);
+    Map<String, dynamic> body;
+    try {
+      body = json.decode(utf8.decode(bodyBytes)) as Map<String, dynamic>;
+    } catch (_) {
+      request.response.statusCode = HttpStatus.badRequest;
+      request.response.write('Expected JSON body');
+      await request.response.close();
+      return;
+    }
+
+    final approved = (body['approved'] as bool?) ?? false;
+    if (_decisionCompleter != null && !_decisionCompleter!.isCompleted) {
+      _decisionCompleter!.complete(approved);
+    }
+
+    request.response.headers.contentType =
+        ContentType('application', 'json', charset: 'utf-8');
+    request.response.write(jsonEncode({'status': 'ok'}));
+    await request.response.close();
+  }
+
+  Future<void> _handleGuestJoin(HttpRequest request) async {
+    final bodyBytes = await _readBody(request);
+    String guestName = 'Someone';
+    try {
+      final body = json.decode(utf8.decode(bodyBytes)) as Map<String, dynamic>;
+      final raw = (body['guestName'] as String?)?.trim() ?? '';
+      if (raw.isNotEmpty) guestName = raw;
+    } catch (_) {}
+    _guestJoinedController.add(guestName);
+    request.response.headers.contentType =
+        ContentType('application', 'json', charset: 'utf-8');
+    request.response.write(jsonEncode({'status': 'ok'}));
+    await request.response.close();
   }
 
   int _indexOfSublist(List<int> source, List<int> target, int start) {

@@ -22,7 +22,7 @@ class HubStatus extends ChangeNotifier {
     lifecycle = HubLifecycle.broadcasting;
     serverActive = true;
     advertisingActive = true;
-    message = 'System Ready - Broadcasting';
+    message = 'Room is open — ready to share!';
     lastError = null;
     notifyListeners();
   }

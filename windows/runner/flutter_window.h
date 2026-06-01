@@ -140,6 +140,7 @@ class FlutterWindow : public Win32Window {
   std::string pending_password_;
   std::string pending_hub_ip_;
   int pending_hub_port_ = 8080;
+  std::string pending_friendly_name_;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

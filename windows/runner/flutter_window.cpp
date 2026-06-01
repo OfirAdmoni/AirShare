@@ -31,6 +31,75 @@ void TrimAsciiWhitespace(std::string& s) {
   }
 }
 
+std::string ExtractJsonStringField(const std::string& key, const std::string& json) {
+  const std::string needle = "\"" + key + "\":\"";
+  auto start = json.find(needle);
+  if (start == std::string::npos) {
+    return {};
+  }
+  start += needle.size();
+  auto end = json.find('"', start);
+  if (end == std::string::npos) {
+    return {};
+  }
+  return json.substr(start, end - start);
+}
+
+int ExtractJsonIntField(const std::string& key, const std::string& json, int default_v) {
+  const std::string needle = "\"" + key + "\":";
+  auto start = json.find(needle);
+  if (start == std::string::npos) {
+    return default_v;
+  }
+  start += needle.size();
+  while (start < json.size() &&
+         std::isspace(static_cast<unsigned char>(json[start]))) {
+    start++;
+  }
+  int val = 0;
+  bool any = false;
+  while (start < json.size() &&
+         std::isdigit(static_cast<unsigned char>(json[start]))) {
+    any = true;
+    val = val * 10 + (json[start] - '0');
+    start++;
+  }
+  return any ? val : default_v;
+}
+
+flutter::EncodableMap HandshakeJsonToEncodableMap(const std::string& json) {
+  const int hub_port = ExtractJsonIntField("hub_port", json,
+                                           ExtractJsonIntField("hubPort", json, 8080));
+  return {
+      {flutter::EncodableValue("lan_ip"),
+       flutter::EncodableValue(ExtractJsonStringField("lan_ip", json))},
+      {flutter::EncodableValue("p2p_ip"),
+       flutter::EncodableValue(ExtractJsonStringField("p2p_ip", json))},
+      {flutter::EncodableValue("p2p_mac"),
+       flutter::EncodableValue(ExtractJsonStringField("p2p_mac", json))},
+      {flutter::EncodableValue("p2pMac"),
+       flutter::EncodableValue(ExtractJsonStringField("p2pMac", json))},
+      {flutter::EncodableValue("hotspot_ssid"),
+       flutter::EncodableValue(ExtractJsonStringField("hotspot_ssid", json))},
+      {flutter::EncodableValue("ssid"),
+       flutter::EncodableValue(ExtractJsonStringField("ssid", json))},
+      {flutter::EncodableValue("hotspot_pass"),
+       flutter::EncodableValue(ExtractJsonStringField("hotspot_pass", json))},
+      {flutter::EncodableValue("password"),
+       flutter::EncodableValue(ExtractJsonStringField("password", json))},
+      {flutter::EncodableValue("hotspot_hub_ip"),
+       flutter::EncodableValue(ExtractJsonStringField("hotspot_hub_ip", json))},
+      {flutter::EncodableValue("hubIp"),
+       flutter::EncodableValue(ExtractJsonStringField("hubIp", json))},
+      {flutter::EncodableValue("hub_port"), flutter::EncodableValue(hub_port)},
+      {flutter::EncodableValue("hubPort"), flutter::EncodableValue(hub_port)},
+      {flutter::EncodableValue("tls_cert_sha256"),
+       flutter::EncodableValue(ExtractJsonStringField("tls_cert_sha256", json))},
+      {flutter::EncodableValue("friendly_name"),
+       flutter::EncodableValue(ExtractJsonStringField("friendly_name", json))},
+  };
+}
+
 std::string GetHostComputerNameUtf8() {
   wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1] = {};
   DWORD n = static_cast<DWORD>(MAX_COMPUTERNAME_LENGTH + 1);
@@ -384,22 +453,46 @@ void FlutterWindow::StartBleScanning(
                                                      auto&&,
                                                      const BluetoothLEAdvertisementReceivedEventArgs&
                                                          args) {
+      const auto bt_addr = args.BluetoothAddress();
+
+      // Collect service UUIDs (present in primary advertisements, absent in
+      // scan responses — Android puts the device name in the scan response).
       std::vector<winrt::guid> uuids;
       for (const auto& uuid : args.Advertisement().ServiceUuids()) {
         uuids.push_back(uuid);
       }
-      if (!IsAirShareService(uuids)) {
-        return;
-      }
-      const auto bt_addr = args.BluetoothAddress();
-      std::stringstream id_stream;
-      id_stream << bt_addr;
-      const std::string peer_id = id_stream.str();
+
+      const bool is_known_peer =
+          (discovered_peers_.find(bt_addr) != discovered_peers_.end());
+
+      // Unknown device with no AirShare service UUID → not our peer, skip.
+      if (!IsAirShareService(uuids) && !is_known_peer) return;
+
       const std::string friendly_name =
           WinrtStringToUtf8(args.Advertisement().LocalName());
-      discovered_peers_[bt_addr] = {
-          peer_id, friendly_name.empty() ? "Nearby peer" : friendly_name};
-      PublishDiscoveredPeers();
+
+      if (is_known_peer) {
+        // Scan-response (or repeat advertisement): update the stored name only
+        // when we actually received one — never overwrite a good name with "".
+        if (!friendly_name.empty() &&
+            discovered_peers_[bt_addr].second != friendly_name) {
+          OutputDebugStringW(
+              (L"[AirShareNative] Peer name resolved from scan response: " +
+               std::wstring(friendly_name.begin(), friendly_name.end()) + L"\n")
+                  .c_str());
+          discovered_peers_[bt_addr].second = friendly_name;
+          PublishDiscoveredPeers();
+        }
+      } else {
+        // First sighting via primary advertisement.
+        std::stringstream id_stream;
+        id_stream << bt_addr;
+        const std::string peer_id = id_stream.str();
+        discovered_peers_[bt_addr] = {
+            peer_id,
+            friendly_name.empty() ? "AirShare Device" : friendly_name};
+        PublishDiscoveredPeers();
+      }
     });
 
     watcher_stopped_token_ = g_watcher.Stopped(
@@ -622,46 +715,17 @@ void FlutterWindow::EstablishSecureHandshake(
       return;
     }
     const std::string json(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    // Minimal JSON parse: expect {"ssid":"..","password":"..","hubIp":".."}
-    auto extract = [](const std::string& key, const std::string& src) {
-      const std::string needle = "\"" + key + "\":\"";
-      auto start = src.find(needle);
-      if (start == std::string::npos) return std::string();
-      start += needle.size();
-      auto end = src.find('"', start);
-      if (end == std::string::npos) return std::string();
-      return src.substr(start, end - start);
-    };
-    auto extract_int = [](const std::string& key, const std::string& src,
-                          int default_v) {
-      const std::string needle = "\"" + key + "\":";
-      auto start = src.find(needle);
-      if (start == std::string::npos) return default_v;
-      start += needle.size();
-      while (start < src.size() &&
-             std::isspace(static_cast<unsigned char>(src[start]))) {
-        start++;
+    flutter::EncodableMap payload = HandshakeJsonToEncodableMap(json);
+    {
+      std::wstring preview(json.begin(), json.end());
+      if (preview.size() > 200) {
+        preview = preview.substr(0, 200) + L"...";
       }
-      int val = 0;
-      bool any = false;
-      while (start < src.size() &&
-             std::isdigit(static_cast<unsigned char>(src[start]))) {
-        any = true;
-        val = val * 10 + (src[start] - '0');
-        start++;
-      }
-      return any ? val : default_v;
-    };
-    flutter::EncodableMap payload = {
-        {flutter::EncodableValue("ssid"),
-         flutter::EncodableValue(extract("ssid", json))},
-        {flutter::EncodableValue("password"),
-         flutter::EncodableValue(extract("password", json))},
-        {flutter::EncodableValue("hubIp"),
-         flutter::EncodableValue(extract("hubIp", json))},
-        {flutter::EncodableValue("hubPort"),
-         flutter::EncodableValue(extract_int("hubPort", json, 8080))},
-    };
+      OutputDebugStringW(
+          (L"[AirShareNative] Native | Handshake JSON parsed (full wire fields)\n" +
+           preview + L"\n")
+              .c_str());
+    }
     OutputDebugStringW(
         L"[AirShareNative] Peer Handshake Released (client read); closing BLE peripheral before socket.\n");
     try {
@@ -930,11 +994,16 @@ void FlutterWindow::StartHubAdvertising(
       if (friendly_u8.empty()) {
         friendly_u8 = "Windows";
       }
+      // Store the FULL resolved name for injection into the GATT handshake
+      // payload — this is how the receiver learns the correct custom name,
+      // because WinRT GattServiceProviderAdvertisingParameters has no API for
+      // setting the BLE local name (the OS always uses the computer name).
+      pending_friendly_name_ = friendly_u8;
+
+      // PDU size check: WinRT uses the OS BT device name for the scan
+      // response, not our friendly_u8, so this is informational only.
       winrt::hstring h_label = winrt::to_hstring(friendly_u8);
       std::wstring wname(h_label.c_str());
-      if (wname.size() > 10) {
-        wname.resize(10);
-      }
       while (wname.size() > 1) {
         const std::string u8 =
             WinrtStringToUtf8(winrt::hstring(wname.c_str()));
@@ -949,23 +1018,17 @@ void FlutterWindow::StartHubAdvertising(
                         : WinrtStringToUtf8(winrt::hstring(wname.c_str()));
       const int scan_ad_estimate =
           u8_final.empty() ? 0 : static_cast<int>(2 + u8_final.size());
-      if (scan_ad_estimate > kBleAdvPduMax) {
-        OutputDebugStringW(
-            L"[AirShareNative] BLE scan-response name still too large; refusing StartAdvertising.\n");
-        StopHubAdvertisingInternal();
-        result->Error("ble_adv_oversize",
-                      "BLE scan response would exceed 31 bytes; shorten the device name.");
-        return;
-      }
       const std::wstring wlog =
-          L"[AirShareNative] BLE adv verify: primary~" +
-          std::to_wstring(kPrimaryFlagsAnd128UuidEstimate) + L"B (flags+service UUID), scan~" +
-          std::to_wstring(scan_ad_estimate) + L"B (Flutter/local name, truncated for PDU), max PDU=" +
-          std::to_wstring(kBleAdvPduMax) + L"\n";
+          L"[AirShareNative] BLE adv: friendly_name=\"" +
+          std::wstring(h_label.c_str()) +
+          L"\", scan_response_name=<OS BT device name>, scan_est~" +
+          std::to_wstring(scan_ad_estimate) + L"B, primary~" +
+          std::to_wstring(kPrimaryFlagsAnd128UuidEstimate) +
+          L"B (flags+service UUID)\n";
       OutputDebugStringW(wlog.c_str());
     } catch (...) {
       OutputDebugStringW(
-          L"[AirShareNative] BLE adv verify: name check failed; continuing with StartAdvertising.\n");
+          L"[AirShareNative] BLE adv verify: name check skipped.\n");
     }
 
     GattServiceProviderAdvertisingParameters adv_params;
@@ -1160,8 +1223,11 @@ void FlutterWindow::ClearPendingReadState() {
 winrt::Windows::Storage::Streams::IBuffer FlutterWindow::BuildHandshakeBuffer() const {
   std::ostringstream oss;
   oss << "{\"ssid\":\"" << pending_ssid_ << "\",\"password\":\"" << pending_password_
-      << "\",\"hubIp\":\"" << pending_hub_ip_ << "\",\"hubPort\":" << pending_hub_port_
-      << "}";
+      << "\",\"hubIp\":\"" << pending_hub_ip_ << "\",\"hubPort\":" << pending_hub_port_;
+  if (!pending_friendly_name_.empty()) {
+    oss << ",\"friendly_name\":\"" << pending_friendly_name_ << "\"";
+  }
+  oss << "}";
   const std::string json = oss.str();
   winrt::Windows::Storage::Streams::DataWriter writer;
   writer.WriteString(winrt::to_hstring(json));

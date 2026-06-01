@@ -39,6 +39,8 @@ class SessionTeardown {
       );
     }
 
+    final sharedDirPath = LocalHubRuntime.instance.sharedDirPath;
+
     try {
       await LocalHubRuntime.instance.stop();
       await ConnectionLogger.instance.log('Teardown | HTTP server closed');
@@ -47,6 +49,18 @@ class SessionTeardown {
         'Teardown | HTTP server close failed',
         details: '$e',
       );
+    }
+
+    if (sharedDirPath != null) {
+      try {
+        await _cleanSharedDirectory(sharedDirPath);
+        await ConnectionLogger.instance.log('Teardown | Shared directory cleared');
+      } catch (e) {
+        await ConnectionLogger.instance.log(
+          'Teardown | Shared directory cleanup failed',
+          details: '$e',
+        );
+      }
     }
 
     if (Platform.isAndroid) {
@@ -80,6 +94,30 @@ class SessionTeardown {
         details: '$e',
       );
     }
+  }
+
+  static Future<void> _cleanSharedDirectory(String dirPath) async {
+    final dir = Directory(dirPath);
+    if (!await dir.exists()) {
+      stdout.writeln('CLEANUP: Directory not found — nothing to delete: $dirPath');
+      return;
+    }
+    var deleted = 0;
+    var failed = 0;
+    await for (final entity in dir.list()) {
+      try {
+        await entity.delete(recursive: true);
+        deleted++;
+        stdout.writeln('CLEANUP: Deleted ${entity.path}');
+      } catch (e) {
+        failed++;
+        stdout.writeln('CLEANUP ERROR: Could not delete ${entity.path}: $e');
+      }
+    }
+    stdout.writeln(
+      'CLEANUP SUCCESS: Deleted $deleted file(s) from $dirPath'
+      '${failed > 0 ? " — $failed could not be deleted" : ""}',
+    );
   }
 
   /// Receiver-side teardown: BLE scanner → connection guard.

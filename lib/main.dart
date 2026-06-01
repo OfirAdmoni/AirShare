@@ -3,8 +3,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:io';
 
+import 'package:shared_preferences/shared_preferences.dart';
+
 import 'package:air_share/ble_transport.dart';
 import 'package:air_share/connection_logger.dart';
+import 'package:air_share/onboarding_page.dart';
 import 'package:air_share/settings_page.dart';
 import 'package:air_share/discovery_page.dart';
 import 'package:air_share/file_list_screen.dart';
@@ -13,6 +16,18 @@ import 'package:air_share/hub_endpoint_state.dart';
 import 'package:air_share/hub_status.dart';
 import 'package:air_share/sender_staging_page.dart';
 import 'package:air_share/ux_prompts.dart';
+
+/// 220 ms fade for all secondary screens, consistent across Android & Windows.
+PageRouteBuilder<T> _fadeRoute<T>(Widget page) => PageRouteBuilder<T>(
+      pageBuilder: (context, animation, secondaryAnimation) => page,
+      transitionDuration: const Duration(milliseconds: 220),
+      reverseTransitionDuration: const Duration(milliseconds: 180),
+      transitionsBuilder: (context, animation, secondaryAnimation, child) =>
+          FadeTransition(
+        opacity: CurvedAnimation(parent: animation, curve: Curves.easeOut),
+        child: child,
+      ),
+    );
 
 void main() {
   runApp(const AirShareApp());
@@ -31,11 +46,15 @@ class _AirShareAppState extends State<AirShareApp> {
   final ValueNotifier<FileZoneSession?> _fileZoneSession =
       ValueNotifier<FileZoneSession?>(null);
 
+  /// null = still loading; false = show onboarding; true = show home.
+  bool? _onboardingDone;
+
   @override
   void initState() {
     super.initState();
     ConnectionLogger.instance.initialize();
     ConnectionLogger.instance.log('Application Start');
+    _checkOnboarding();
     BleTransport.instance.setUiHandler((call) async {
       if (call.method != 'notifyConnectionRequest') {
         return null;
@@ -53,56 +72,112 @@ class _AirShareAppState extends State<AirShareApp> {
       final approved = await showDialog<bool>(
         context: ctx,
         barrierDismissible: false,
-        builder: (context) => AlertDialog(
-          title: const Text('Connection Request'),
-          content: Text('Device $friendlyName wants to connect. Allow?'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: const Text('Decline'),
+        builder: (context) {
+          final dialogTt = Theme.of(context).textTheme;
+          return AlertDialog(
+            backgroundColor: const Color(0xFFF4F9FF),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
             ),
-            FilledButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: const Text('Approve'),
+            title: Text(
+              'Connection Request',
+              style: dialogTt.titleLarge?.copyWith(
+                color: const Color(0xFF0A2463),
+                fontWeight: FontWeight.w700,
+              ),
             ),
-          ],
-        ),
+            content: Text(
+              'Device $friendlyName wants to connect. Allow?',
+              style: dialogTt.bodyMedium?.copyWith(
+                color: const Color(0xFF1E3A8A),
+              ),
+            ),
+            actions: [
+              TextButton(
+                style: TextButton.styleFrom(
+                  foregroundColor: const Color(0xFF0A2463),
+                ),
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Decline'),
+              ),
+              FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFF2563EB),
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                onPressed: () => Navigator.of(context).pop(true),
+                child: const Text('Approve'),
+              ),
+            ],
+          );
+        },
       );
+      var lanForBle = '';
       if (approved == true) {
-        final pendingIp = HubEndpointState.instance.pendingIp;
-        final pendingPort = HubEndpointState.instance.pendingPort;
+        final hubState = HubEndpointState.instance;
+        final pendingIp = hubState.pendingIp;
+        final pendingPort = hubState.pendingPort;
+        lanForBle = hubState.rememberedLanIp.isNotEmpty
+            ? hubState.rememberedLanIp
+            : (pendingIp ?? '');
         await ConnectionLogger.instance.log(
           'HS | Host | Approve tapped',
           details:
-              'pendingIp=${pendingIp ?? "(null)"} pendingPort=$pendingPort',
+              'pendingIp=${pendingIp ?? "(null)"} lan_ip=$lanForBle pendingPort=$pendingPort',
         );
-        if (pendingIp != null && pendingIp.isNotEmpty) {
+        if (lanForBle.isNotEmpty) {
           await BleTransport.instance.updateHubEndpoint(
-            ip: pendingIp,
+            ip: lanForBle,
             port: pendingPort,
           );
-          await ConnectionLogger.instance.log(
-            'HS | Host | updateHubEndpoint(native GATT)',
-            details: '$pendingIp:$pendingPort',
+          await BleTransport.instance.updateConnectionEndpoints(
+            lanIp: lanForBle,
+            p2pIp: hubState.rememberedP2pIp,
+            p2pMac: hubState.rememberedP2pMac,
+            hotspotSsid: hubState.rememberedHotspotSsid,
+            hotspotPass: hubState.rememberedHotspotPass,
+            hotspotHubIp: hubState.rememberedHotspotHubIp,
+            hubPort: pendingPort,
           );
           await ConnectionLogger.instance.log(
-            'Connection | Advertising real IP',
-            details: '$pendingIp:$pendingPort',
+            'HS | Host | BLE handshake refreshed for Approve',
+            details: 'lan_ip=$lanForBle hub_port=$pendingPort',
           );
         } else {
           await ConnectionLogger.instance.log(
-            'HS | Host | updateHubEndpoint SKIPPED',
-            details: 'pendingIp empty — handshake JSON may lack hubIp',
+            'HS | Host | Approve BLE refresh SKIPPED',
+            details: 'no LAN IP — handshake JSON may lack lan_ip',
           );
         }
       }
-      await BleTransport.instance.approveConnection(approved: approved == true);
+      await BleTransport.instance.approveConnection(
+        approved: approved == true,
+        lanIp: lanForBle,
+      );
       await ConnectionLogger.instance.log(
         'Connection Request Decision',
         details: approved == true ? 'approved' : 'declined',
       );
       return null;
     });
+  }
+
+  Future<void> _checkOnboarding() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _onboardingDone = prefs.getBool('onboarding_done') ?? false;
+    });
+  }
+
+  Future<void> _completeOnboarding() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('onboarding_done', true);
+    if (!mounted) return;
+    setState(() => _onboardingDone = true);
   }
 
   @override
@@ -113,6 +188,13 @@ class _AirShareAppState extends State<AirShareApp> {
 
   @override
   Widget build(BuildContext context) {
+    // Show nothing while prefs load (usually < 1 frame).
+    final Widget home = switch (_onboardingDone) {
+      null => const SizedBox.shrink(),
+      false => OnboardingPage(onComplete: _completeOnboarding),
+      true => const ModeSelectionPage(),
+    };
+
     return HubStatusScope(
       status: _hubStatus,
       child: FileZoneSessionScope(
@@ -120,8 +202,23 @@ class _AirShareAppState extends State<AirShareApp> {
         child: MaterialApp(
           navigatorKey: _navigatorKey,
           title: 'AirShare',
-          theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
-          home: const ModeSelectionPage(),
+          debugShowCheckedModeBanner: false,
+          theme: ThemeData(
+            colorScheme: ColorScheme.fromSeed(
+              seedColor: const Color(0xFF2563EB),
+            ),
+            useMaterial3: true,
+            scaffoldBackgroundColor: const Color(0xFFDBEAFE),
+            snackBarTheme: const SnackBarThemeData(
+              backgroundColor: Color(0xFF2563EB),
+              contentTextStyle: TextStyle(color: Colors.white),
+              behavior: SnackBarBehavior.floating,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.all(Radius.circular(12)),
+              ),
+            ),
+          ),
+          home: home,
         ),
       ),
     );
@@ -144,130 +241,366 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
     });
   }
 
+  Future<void> _openJoin() async {
+    final btReady =
+        await UxPrompts.promptBluetoothRequiredForTransfer(context);
+    if (!btReady) return;
+    ConnectionLogger.instance.log('Join Session Flow Opened');
+    if (!mounted) return;
+    Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (discoveryContext) => DiscoveryPage(
+          onEndpointReady: (endpoint) async {
+            if (!discoveryContext.mounted) return;
+            final n = FileZoneSessionScope.of(discoveryContext);
+            final navigator = Navigator.of(discoveryContext);
+            await ConnectionLogger.instance.log(
+              'Connection | Triggering auto-connect',
+              details: 'hub=${endpoint.ip}:${endpoint.port}',
+            );
+            if (!navigator.mounted) return;
+            n.value = FileZoneSession(
+              hubHost: endpoint.ip,
+              hubPort: endpoint.port,
+            );
+            await navigator.push<void>(
+              MaterialPageRoute<void>(
+                builder: (_) => FileListScreen(
+                  hubHost: endpoint.ip,
+                  hubPort: endpoint.port,
+                  modeTitle: 'Join Session',
+                  isHubMode: false,
+                ),
+              ),
+            );
+            n.value = null;
+          },
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openHost() async {
+    final btReady =
+        await UxPrompts.promptBluetoothRequiredForTransfer(context);
+    if (!btReady) return;
+    ConnectionLogger.instance.log('Host Session Flow Opened');
+    if (!mounted) return;
+    Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(builder: (_) => const SenderStagingPage()),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final tt = Theme.of(context).textTheme;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('AirShare Transfer Console'),
+        foregroundColor: const Color(0xFF0A2463),
+        iconTheme: const IconThemeData(color: Color(0xFF0A2463)),
+        actionsIconTheme: const IconThemeData(color: Color(0xFF0A2463)),
+        title: Text(
+          'AirShare',
+          style: tt.headlineMedium?.copyWith(
+            fontWeight: FontWeight.w800,
+            letterSpacing: -0.5,
+            color: const Color(0xFF0A2463),
+          ),
+        ),
         actions: [
           IconButton(
             tooltip: 'Settings',
-            icon: const Icon(Icons.settings_outlined),
-            onPressed: () {
-              Navigator.of(context).push<void>(
-                MaterialPageRoute<void>(builder: (_) => const SettingsPage()),
-              );
+            iconSize: 28,
+            icon: const Icon(
+              Icons.settings_outlined,
+              color: Color(0xFF0A2463),
+            ),
+            onPressed: () => Navigator.of(context)
+                .push<void>(_fadeRoute(const SettingsPage())),
+          ),
+          PopupMenuButton<_HomeMenuAction>(
+            tooltip: 'More options',
+            onSelected: (action) {
+              switch (action) {
+                case _HomeMenuAction.history:
+                  Navigator.of(context)
+                      .push<void>(_fadeRoute(const ConnectionLogPage()));
+                case _HomeMenuAction.manual:
+                  Navigator.of(context)
+                      .push<void>(_fadeRoute(const ManualConnectionPage()));
+              }
             },
+            itemBuilder: (_) => const [
+              PopupMenuItem(
+                value: _HomeMenuAction.history,
+                child: ListTile(
+                  leading: Icon(Icons.history_outlined),
+                  title: Text('Transfer History'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              PopupMenuItem(
+                value: _HomeMenuAction.manual,
+                child: ListTile(
+                  leading: Icon(Icons.link_outlined),
+                  title: Text('Connect Manually'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+            ],
           ),
         ],
       ),
-      body: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 360),
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                ElevatedButton.icon(
-                  onPressed: () async {
-                    final btReady =
-                        await UxPrompts.promptBluetoothRequiredForTransfer(
-                          context,
-                        );
-                    if (!btReady) return;
-                    ConnectionLogger.instance.log('Receiver Flow Opened');
-                    if (!context.mounted) return;
-                    Navigator.of(context).push<void>(
-                      MaterialPageRoute<void>(
-                        builder: (discoveryContext) => DiscoveryPage(
-                          onEndpointReady: (endpoint) async {
-                            if (!discoveryContext.mounted) return;
-                            final n = FileZoneSessionScope.of(discoveryContext);
-                            final navigator = Navigator.of(discoveryContext);
-                            await ConnectionLogger.instance.log(
-                              'Connection | Triggering auto-connect',
-                              details: 'hub=${endpoint.ip}:${endpoint.port}',
-                            );
-                            if (!navigator.mounted) return;
-                            n.value = FileZoneSession(
-                              hubHost: endpoint.ip,
-                              hubPort: endpoint.port,
-                            );
-                            await navigator.push<void>(
-                              MaterialPageRoute<void>(
-                                builder: (_) => FileListScreen(
-                                  hubHost: endpoint.ip,
-                                  hubPort: endpoint.port,
-                                  modeTitle: 'Receive Files',
-                                  isHubMode: false,
-                                ),
-                              ),
-                            );
-                            n.value = null;
-                          },
+      body: SafeArea(
+        child: Align(
+          alignment: const Alignment(0, -0.85),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 860),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Column(
+                    children: [
+                      Text(
+                        'Air it, Share it',
+                        textAlign: TextAlign.center,
+                        style: tt.headlineLarge?.copyWith(
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: -0.5,
+                          color: const Color(0xFF0A2463),
+                          fontSize: 40,
                         ),
                       ),
-                    );
-                  },
-                  icon: const Icon(Icons.move_to_inbox),
-                  label: const Text('Receive Files'),
-                ),
-                const SizedBox(height: 12),
-                OutlinedButton.icon(
-                  onPressed: () async {
-                    final btReady =
-                        await UxPrompts.promptBluetoothRequiredForTransfer(
-                          context,
-                        );
-                    if (!btReady) return;
-                    ConnectionLogger.instance.log('Sender Flow Opened');
-                    if (!context.mounted) return;
-                    Navigator.of(context).push<void>(
-                      MaterialPageRoute<void>(
-                        builder: (_) => const SenderStagingPage(),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Join an existing session or start a new one with nearby devices.',
+                        textAlign: TextAlign.center,
+                        style: tt.bodyLarge?.copyWith(
+                          color: const Color(0xFF1E40AF),
+                          fontSize: 17,
+                          height: 1.5,
+                        ),
                       ),
-                    );
-                  },
-                  icon: const Icon(Icons.send),
-                  label: const Text('Send Files'),
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  'Android can host an offline hotspot. iPhone/iPad can join an Android '
-                  'host\'s hotspot. iOS cannot host a hotspot. '
-                  'iOS-to-iOS offline: TODO (Multipeer Connectivity).',
-                  textAlign: TextAlign.center,
-                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    ],
                   ),
+                  const SizedBox(height: 40),
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final isCompact = constraints.maxWidth < 560;
+                      return IntrinsicHeight(
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            Expanded(
+                              child: _SessionCard(
+                                icon: Icons.sensors,
+                                title: 'Join a Session',
+                                description: 'Connect to a friend',
+                                ctaLabel: 'Join Now',
+                                gradientColors: const [
+                                  Color(0xFF1E40AF),
+                                  Color(0xFF3B82F6),
+                                ],
+                                onTap: _openJoin,
+                                isCompact: isCompact,
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: _SessionCard(
+                                icon: Icons.wifi_tethering,
+                                title: 'Start Sharing',
+                                description: 'Share with anyone nearby',
+                                ctaLabel: 'Host Now',
+                                gradientColors: const [
+                                  Color(0xFF5B21B6),
+                                  Color(0xFF8B5CF6),
+                                ],
+                                onTap: _openHost,
+                                isCompact: isCompact,
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+enum _HomeMenuAction { history, manual }
+
+class _SessionCard extends StatefulWidget {
+  const _SessionCard({
+    required this.icon,
+    required this.title,
+    required this.description,
+    required this.ctaLabel,
+    required this.gradientColors,
+    required this.onTap,
+    this.isCompact = false,
+  });
+
+  final IconData icon;
+  final String title;
+  final String description;
+  final String ctaLabel;
+  final List<Color> gradientColors;
+  final VoidCallback onTap;
+  final bool isCompact;
+
+  @override
+  State<_SessionCard> createState() => _SessionCardState();
+}
+
+class _SessionCardState extends State<_SessionCard> {
+  bool _hovered = false;
+  bool _pressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final tt = Theme.of(context).textTheme;
+    final accentColor = widget.gradientColors.last;
+    final hPad = widget.isCompact ? 14.0 : 28.0;
+    final vPad = widget.isCompact ? 20.0 : 30.0;
+    final iconBoxSize = widget.isCompact ? 48.0 : 64.0;
+    final iconSize = widget.isCompact ? 26.0 : 34.0;
+
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      child: AnimatedScale(
+        scale: _pressed ? 0.97 : 1.0,
+        duration: const Duration(milliseconds: 100),
+        curve: Curves.easeOut,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(24),
+            gradient: LinearGradient(
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+              colors: widget.gradientColors,
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: accentColor.withValues(
+                  alpha: _pressed ? 0.15 : (_hovered ? 0.50 : 0.32),
                 ),
-                const SizedBox(height: 12),
-                OutlinedButton.icon(
-                  onPressed: () {
-                    Navigator.of(context).push<void>(
-                      MaterialPageRoute<void>(
-                        builder: (_) => const ManualConnectionPage(),
+                blurRadius: _pressed ? 4 : (_hovered ? 26 : 16),
+                spreadRadius: _pressed ? -2 : (_hovered ? 2 : 0),
+                offset: Offset(0, _pressed ? 2 : (_hovered ? 10 : 6)),
+              ),
+            ],
+          ),
+          child: Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(24),
+            child: InkWell(
+              onTap: () {
+                HapticFeedback.lightImpact();
+                widget.onTap();
+              },
+              onTapDown: (_) => setState(() => _pressed = true),
+              onTapUp: (_) => setState(() => _pressed = false),
+              onTapCancel: () => setState(() => _pressed = false),
+              borderRadius: BorderRadius.circular(24),
+              splashColor: Colors.white.withValues(alpha: 0.18),
+              highlightColor: Colors.white.withValues(alpha: 0.06),
+              child: Padding(
+                padding:
+                    EdgeInsets.symmetric(horizontal: hPad, vertical: vPad),
+                child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Container(
+                        width: iconBoxSize,
+                        height: iconBoxSize,
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.18),
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        child: Icon(
+                          widget.icon,
+                          size: iconSize,
+                          color: Colors.white,
+                        ),
                       ),
-                    );
-                  },
-                  icon: const Icon(Icons.link),
-                  label: const Text('Connect Manually'),
-                ),
-                const SizedBox(height: 12),
-                TextButton.icon(
-                  onPressed: () {
-                    Navigator.of(context).push<void>(
-                      MaterialPageRoute<void>(
-                        builder: (_) => const ConnectionLogPage(),
+                      SizedBox(height: widget.isCompact ? 12 : 20),
+                      FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          widget.title,
+                          style: (widget.isCompact
+                                  ? tt.titleLarge
+                                  : tt.headlineSmall)
+                              ?.copyWith(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: -0.3,
+                            height: 1.2,
+                          ),
+                        ),
                       ),
-                    );
-                  },
-                  icon: const Icon(Icons.article_outlined),
-                  label: const Text('Log View'),
-                ),
-              ],
+                      SizedBox(height: widget.isCompact ? 6 : 10),
+                      Text(
+                        widget.description,
+                        style: (widget.isCompact ? tt.bodySmall : tt.bodyMedium)
+                            ?.copyWith(
+                          color: Colors.white.withValues(alpha: 0.78),
+                          height: 1.55,
+                        ),
+                        maxLines: widget.isCompact ? 2 : 3,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      SizedBox(height: widget.isCompact ? 12 : 18),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 14, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.20),
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  widget.ctaLabel,
+                                  style: tt.labelMedium?.copyWith(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                const SizedBox(width: 4),
+                                const Icon(
+                                  Icons.arrow_forward_ios,
+                                  size: 13,
+                                  color: Colors.white,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+              ),
             ),
           ),
         ),
@@ -516,7 +849,39 @@ class _ConnectionLogPageState extends State<ConnectionLogPage> {
           valueListenable: ConnectionLogger.instance.entries,
           builder: (context, lines, _) {
             if (lines.isEmpty) {
-              return const Center(child: Text('No logs yet'));
+              return Center(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 40),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.history_outlined,
+                        size: 72,
+                        color: Theme.of(context).colorScheme.outlineVariant,
+                      ),
+                      const SizedBox(height: 20),
+                      Text(
+                        'No transfer history yet.',
+                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurfaceVariant,
+                            ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Your sent and received files will appear here.',
+                        textAlign: TextAlign.center,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                              color:
+                                  Theme.of(context).colorScheme.outlineVariant,
+                            ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
             }
             return ListView.builder(
               padding: const EdgeInsets.all(12),
