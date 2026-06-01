@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 
 import 'package:air_share/air_share_constants.dart';
+import 'package:air_share/ble_peer_filter.dart';
 import 'package:air_share/ble_transport.dart';
 import 'package:air_share/connection_logger.dart';
 import 'package:air_share/connection_tier.dart';
@@ -40,8 +41,10 @@ const String _kOfflineTransferPlatformNote =
     'iPhone/iPad uses LAN first, then manual hotspot join if the sender advertises hotspot credentials.\n'
     'iOS Send works on the same Wi‑Fi only (offline hotspot host is not supported).';
 
-/// Offline hotspot join (Tier 2) — Android only; iOS shows manual join UI instead.
+/// Offline hotspot join (Tier 2) — Android automatic join; iOS/macOS manual settings UI.
 bool _supportsHotspotGuestJoin() => Platform.isAndroid;
+
+bool _usesManualHotspotJoinUi() => Platform.isIOS || Platform.isMacOS;
 
 class _DiscoveryPageState extends State<DiscoveryPage> {
   StreamSubscription<List<BlePeer>>? _scanSubscription;
@@ -92,16 +95,23 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   }
 
   Future<void> _logNetworkInterfaces() async {
-    final interfaces = await NetworkInterface.list(
-      includeLoopback: true,
-      type: InternetAddressType.IPv4,
-    );
-    for (final iface in interfaces) {
-      for (final addr in iface.addresses) {
-        await ConnectionLogger.instance.log(
-          'Network | Interface ${iface.name}: ${addr.address}',
-        );
+    try {
+      final interfaces = await NetworkInterface.list(
+        includeLoopback: true,
+        type: InternetAddressType.IPv4,
+      );
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          await ConnectionLogger.instance.log(
+            'Network | Interface ${iface.name}: ${addr.address}',
+          );
+        }
       }
+    } catch (e) {
+      await ConnectionLogger.instance.log(
+        'Network | Interface dump failed',
+        details: '$e',
+      );
     }
   }
 
@@ -158,6 +168,12 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
           details: '$ip:$port $e',
         );
       }
+    } catch (e, st) {
+      await ConnectionLogger.instance.log(
+        'Socket Connection Failed',
+        details: '$ip:$port ${e.runtimeType}: $e',
+      );
+      debugPrint('[Discovery] TCP probe exception:\n$st');
     }
     final gateway = ConnectionTier.deriveGatewayIp(ip);
     if (gateway == null || gateway == ip) return null;
@@ -184,6 +200,61 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     } catch (_) {
       return null;
     }
+  }
+
+  Future<PeerEndpoint?> _probeHttpHealth(String ip, int port) async {
+    if (_leavingForMainMenu) return null;
+    final uri = Uri(scheme: 'http', host: ip, port: port, path: '/health');
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+    try {
+      await HandshakeTrace.run<void>(
+        'HTTP health probe (guest → hub)',
+        () async {
+          final request = await client
+              .getUrl(uri)
+              .timeout(const Duration(seconds: 6));
+          final response = await request.close().timeout(
+            const Duration(seconds: 8),
+          );
+          await response.drain<void>().timeout(const Duration(seconds: 3));
+          if (response.statusCode != HttpStatus.ok) {
+            throw HttpException(
+              'Health endpoint returned HTTP ${response.statusCode}',
+              uri: uri,
+            );
+          }
+        },
+        extra: uri.toString(),
+        hardTimeout: const Duration(seconds: 10),
+      );
+      if (_leavingForMainMenu) return null;
+      await ConnectionLogger.instance.log(
+        'HTTP Health Success',
+        details: uri.toString(),
+      );
+      return PeerEndpoint(ip: ip, port: port);
+    } on TimeoutException catch (e) {
+      await ConnectionLogger.instance.log(
+        'HTTP Health Timeout',
+        details: '$uri $e',
+      );
+    } on SocketException catch (e) {
+      await ConnectionLogger.instance.log(
+        _looksLikeTcpTimeout(e)
+            ? 'HTTP Health Timeout (socket)'
+            : 'HTTP Health Failed',
+        details: '$uri $e',
+      );
+    } catch (e, st) {
+      await ConnectionLogger.instance.log(
+        'HTTP Health Failed',
+        details: '$uri ${e.runtimeType}: $e',
+      );
+      debugPrint('[Discovery] HTTP health probe exception:\n$st');
+    } finally {
+      client.close(force: true);
+    }
+    return null;
   }
 
   void _pauseDiscoverySideEffects() {
@@ -290,6 +361,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
   ) async {
     final probeGeneration = _manualProbeGeneration;
     final candidates = _manualHotspotCandidateIps(payload);
+    await _logNetworkInterfaces();
     await ConnectionLogger.instance.log(
       'Connection | Manual hotspot retry probe',
       details:
@@ -298,44 +370,52 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
           'candidates=${candidates.map((c) => "${c.source}:${c.ip}").join(",")} '
           'hub_port=$port',
     );
-    for (final candidate in candidates) {
-      if (_leavingForMainMenu || probeGeneration != _manualProbeGeneration) {
+    try {
+      for (final candidate in candidates) {
+        if (_leavingForMainMenu || probeGeneration != _manualProbeGeneration) {
+          await ConnectionLogger.instance.log(
+            'Connection | Manual hotspot retry abandoned',
+            details: 'navigation changed before ${candidate.ip}:$port',
+          );
+          return null;
+        }
         await ConnectionLogger.instance.log(
-          'Connection | Manual hotspot retry abandoned',
-          details: 'navigation changed before ${candidate.ip}:$port',
+          'Connection | Manual hotspot candidate probe',
+          details: '${candidate.source} ${candidate.ip}:$port via=/health',
         );
-        return null;
+        final endpoint = await _probeHttpHealth(candidate.ip, port);
+        if (_leavingForMainMenu || probeGeneration != _manualProbeGeneration) {
+          await ConnectionLogger.instance.log(
+            'Connection | Manual hotspot retry abandoned',
+            details: 'navigation changed after ${candidate.ip}:$port',
+          );
+          return null;
+        }
+        if (endpoint != null) {
+          await ConnectionLogger.instance.log(
+            'Connection | Manual hotspot retry success',
+            details: '${candidate.source} ${endpoint.ip}:${endpoint.port}',
+          );
+          return endpoint;
+        }
+        await ConnectionLogger.instance.log(
+          'Connection | Manual hotspot candidate failed',
+          details: '${candidate.source} ${candidate.ip}:$port',
+        );
       }
       await ConnectionLogger.instance.log(
-        'Connection | Manual hotspot candidate probe',
-        details: '${candidate.source} ${candidate.ip}:$port',
+        'Connection | Manual hotspot retry failed',
+        details:
+            'no hub on candidates=${candidates.map((c) => "${c.source}:${c.ip}").join(",")} '
+            'hub_port=$port',
       );
-      final endpoint = await _tryTcpConnect(candidate.ip, port);
-      if (_leavingForMainMenu || probeGeneration != _manualProbeGeneration) {
-        await ConnectionLogger.instance.log(
-          'Connection | Manual hotspot retry abandoned',
-          details: 'navigation changed after ${candidate.ip}:$port',
-        );
-        return null;
-      }
-      if (endpoint != null) {
-        await ConnectionLogger.instance.log(
-          'Connection | Manual hotspot retry success',
-          details: '${candidate.source} ${endpoint.ip}:${endpoint.port}',
-        );
-        return endpoint;
-      }
+    } catch (e, st) {
       await ConnectionLogger.instance.log(
-        'Connection | Manual hotspot candidate failed',
-        details: '${candidate.source} ${candidate.ip}:$port',
+        'Connection | Manual hotspot retry error',
+        details: '${e.runtimeType}: $e',
       );
+      debugPrint('[Discovery] Manual hotspot retry exception:\n$st');
     }
-    await ConnectionLogger.instance.log(
-      'Connection | Manual hotspot retry failed',
-      details:
-          'no hub on candidates=${candidates.map((c) => "${c.source}:${c.ip}").join(",")} '
-          'hub_port=$port',
-    );
     return null;
   }
 
@@ -406,11 +486,12 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                 Navigator.of(context).pop(endpoint);
                 return;
               }
+              if (_leavingForMainMenu || !context.mounted) return;
               setDialogState(() {
                 retrying = false;
                 errorText =
-                    'Could not reach the sender yet. Make sure this iPad is joined to '
-                    '"${payload.hotspotSsid}", then try again.';
+                    'Could not reach the sender. Join the hotspot in System Settings, '
+                    'return to AirShare, then try again.';
               });
             }
 
@@ -478,8 +559,15 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                               'Connection | Manual hotspot open Wi-Fi settings',
                               details: 'ssid=${payload.hotspotSsid}',
                             );
-                            await WlanLinkManager.instance
-                                .openWirelessSettings();
+                            try {
+                              await WlanLinkManager.instance
+                                  .openWirelessSettings();
+                            } catch (e) {
+                              await ConnectionLogger.instance.log(
+                                'Connection | Manual hotspot open settings failed',
+                                details: '$e',
+                              );
+                            }
                           },
                     child: const Text('Open Wi‑Fi Settings'),
                   ),
@@ -563,96 +651,164 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     return null;
   }
 
+  Future<void> _logTierStrategyExhausted({
+    required HandshakePayload payload,
+    required bool tier1Attempted,
+    required bool tier2AndroidAttempted,
+    required bool tier2ManualEligible,
+    required bool tier3Attempted,
+  }) async {
+    await ConnectionLogger.instance.log(
+      'Connection | Tier strategy exhausted',
+      details:
+          'platform=${Platform.operatingSystem} ${payload.describeForLog()} '
+          'hasLan=${payload.hasLan} hasHotspot=${payload.hasHotspot} hasP2p=${payload.hasP2p} '
+          'raw_hotspot_hub_ip=${payload.rawHotspotHubIp} legacy_hub_ip=${payload.legacyHubIp} '
+          'tier1_attempted=$tier1Attempted tier2_android=$tier2AndroidAttempted '
+          'tier2_manual_eligible=$tier2ManualEligible tier3_attempted=$tier3Attempted',
+    );
+    debugPrint(
+      '[Discovery] All tiers failed on ${Platform.operatingSystem}: '
+      '${payload.describeForLog()}',
+    );
+  }
+
   Future<PeerEndpoint> _connectViaTierStrategy(HandshakePayload payload) async {
     final port = payload.hubPort;
     final skipWifiProbe = GuestConnectionGuard.isActive;
+    var tier1Attempted = false;
+    var tier2AndroidAttempted = false;
+    final tier2ManualEligible =
+        _usesManualHotspotJoinUi() && payload.hasHotspot;
+    var tier3Attempted = false;
 
-    // Tier 1 — same LAN first (Android sender → iOS/Android guest on home Wi‑Fi).
-    final lanEndpoint = await _tryTier1Lan(
-      payload: payload,
-      port: port,
-      skipWifiProbe: skipWifiProbe,
-    );
-    if (lanEndpoint != null) return lanEndpoint;
+    try {
+      // Tier 1 — same LAN first (Android sender → iOS/Android/macOS guest on home Wi‑Fi).
+      tier1Attempted = payload.hasLan;
+      final lanEndpoint = await _tryTier1Lan(
+        payload: payload,
+        port: port,
+        skipWifiProbe: skipWifiProbe,
+      );
+      if (lanEndpoint != null) return lanEndpoint;
 
-    // Tier 2 — offline hotspot join (Android automatic; iOS manual settings flow).
-    if (_supportsHotspotGuestJoin() && payload.hasHotspot) {
-      if (!mounted) throw StateError('unmounted');
-      try {
-        await _joinHostHotspotAp(payload);
-        final hotspotEndpoint = await _probeHubAfterHotspot(payload, port);
-        if (hotspotEndpoint != null) return hotspotEndpoint;
-        await ConnectionLogger.instance.log(
-          'Connection | Tier 2 TCP failed after hotspot join',
-          details:
-              'tier=hotspot lan_ip=${payload.lanIp} hub_port=$port reason=no hub on candidate IPs',
-        );
-      } on PlatformException catch (e) {
-        await ConnectionLogger.instance.log(
-          'Connection | Tier 2 hotspot failed',
-          details:
-              'tier=hotspot lan_ip=${payload.lanIp} hub_port=$port reason=${e.code}: ${e.message}',
-        );
-      } catch (e) {
-        await ConnectionLogger.instance.log(
-          'Connection | Tier 2 hotspot failed',
-          details:
-              'tier=hotspot lan_ip=${payload.lanIp} hub_port=$port reason=$e',
-        );
-      }
-    } else if (Platform.isIOS && payload.hasHotspot) {
-      _setPhase(
-        _GuestDiscoveryPhase.connecting,
-        'Join sender hotspot manually…',
-      );
-      return _showIosManualHotspotJoinDialog(payload, port);
-    }
-
-    // Tier 3 — Wi‑Fi Direct (last-resort fallback).
-    if (Platform.isAndroid && payload.hasP2p) {
-      if (!mounted) throw StateError('unmounted');
-      await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
-      if (!mounted) throw StateError('unmounted');
-      _setPhase(
-        _GuestDiscoveryPhase.connecting,
-        'Tier 3: Joining Wi‑Fi Direct group…',
-      );
-      await ConnectionLogger.instance.log(
-        'Connection | Tier 3 P2P',
-        details: 'mac=${payload.p2pMac}',
-      );
-      try {
-        final ownerIp = await HandshakeTrace.run<String>(
-          'WLAN connect (guest → hub P2P group)',
-          () =>
-              WlanLinkManager.instance.connectToWifiDirectPeer(payload.p2pMac),
-          extra: 'peerMac=${payload.p2pMac}',
-          hardTimeout: const Duration(seconds: 35),
-        );
-        final targetIp = payload.p2pIp.isNotEmpty ? payload.p2pIp : ownerIp;
-        final p2pEndpoint = await _tryTcpConnect(targetIp, port);
-        if (p2pEndpoint != null) return p2pEndpoint;
-      } on PlatformException catch (e) {
-        final reason = e.details?.toString() ?? '';
-        await ConnectionLogger.instance.log(
-          'Connection | Tier 3 P2P failed',
-          details: '${e.code} $reason',
-        );
-        final busy =
-            reason.contains('reason=2') ||
-            e.message?.contains('reason=2') == true;
-        if (!busy && e.code != 'p2p_timeout') {
-          // Non-busy hard failure — P2P is the last resort; no further tier to try.
+      // Tier 2 — offline hotspot join (Android automatic; iOS/macOS manual settings flow).
+      if (_supportsHotspotGuestJoin() && payload.hasHotspot) {
+        tier2AndroidAttempted = true;
+        if (!mounted) throw StateError('unmounted');
+        try {
+          await _joinHostHotspotAp(payload);
+          final hotspotEndpoint = await _probeHubAfterHotspot(payload, port);
+          if (hotspotEndpoint != null) return hotspotEndpoint;
+          await ConnectionLogger.instance.log(
+            'Connection | Tier 2 TCP failed after hotspot join',
+            details:
+                'tier=hotspot lan_ip=${payload.lanIp} hub_port=$port reason=no hub on candidate IPs',
+          );
+        } on PlatformException catch (e) {
+          await ConnectionLogger.instance.log(
+            'Connection | Tier 2 hotspot failed',
+            details:
+                'tier=hotspot lan_ip=${payload.lanIp} hub_port=$port reason=${e.code}: ${e.message}',
+          );
+        } catch (e) {
+          await ConnectionLogger.instance.log(
+            'Connection | Tier 2 hotspot failed',
+            details:
+                'tier=hotspot lan_ip=${payload.lanIp} hub_port=$port reason=$e',
+          );
         }
-      } catch (e) {
+      } else if (_usesManualHotspotJoinUi() && payload.hasHotspot) {
+        _setPhase(
+          _GuestDiscoveryPhase.connecting,
+          'Join sender hotspot manually…',
+        );
+        return _showIosManualHotspotJoinDialog(payload, port);
+      } else if (payload.hasHotspot && !_supportsHotspotGuestJoin()) {
         await ConnectionLogger.instance.log(
-          'Connection | Tier 3 P2P failed',
-          details: e.toString(),
+          'Connection | Tier 2 manual hotspot skipped',
+          details:
+              'platform=${Platform.operatingSystem} hasHotspot=true '
+              'manual_ui=${_usesManualHotspotJoinUi()}',
         );
       }
-    }
 
-    throw Exception('All connection tiers failed (LAN → Hotspot → P2P)');
+      // Tier 3 — Wi‑Fi Direct (last-resort fallback).
+      if (Platform.isAndroid && payload.hasP2p) {
+        tier3Attempted = true;
+        if (!mounted) throw StateError('unmounted');
+        await WifiTierPrerequisites.ensureReadyForWifiTier(context: context);
+        if (!mounted) throw StateError('unmounted');
+        _setPhase(
+          _GuestDiscoveryPhase.connecting,
+          'Tier 3: Joining Wi‑Fi Direct group…',
+        );
+        await ConnectionLogger.instance.log(
+          'Connection | Tier 3 P2P',
+          details: 'mac=${payload.p2pMac}',
+        );
+        try {
+          final ownerIp = await HandshakeTrace.run<String>(
+            'WLAN connect (guest → hub P2P group)',
+            () => WlanLinkManager.instance.connectToWifiDirectPeer(
+              payload.p2pMac,
+            ),
+            extra: 'peerMac=${payload.p2pMac}',
+            hardTimeout: const Duration(seconds: 35),
+          );
+          final targetIp = payload.p2pIp.isNotEmpty ? payload.p2pIp : ownerIp;
+          final p2pEndpoint = await _tryTcpConnect(targetIp, port);
+          if (p2pEndpoint != null) return p2pEndpoint;
+        } on PlatformException catch (e) {
+          final reason = e.details?.toString() ?? '';
+          await ConnectionLogger.instance.log(
+            'Connection | Tier 3 P2P failed',
+            details: '${e.code} $reason',
+          );
+          final busy =
+              reason.contains('reason=2') ||
+              e.message?.contains('reason=2') == true;
+          if (!busy && e.code != 'p2p_timeout') {
+            // Non-busy hard failure — P2P is the last resort; no further tier to try.
+          }
+        } catch (e) {
+          await ConnectionLogger.instance.log(
+            'Connection | Tier 3 P2P failed',
+            details: e.toString(),
+          );
+        }
+      }
+
+      await _logTierStrategyExhausted(
+        payload: payload,
+        tier1Attempted: tier1Attempted,
+        tier2AndroidAttempted: tier2AndroidAttempted,
+        tier2ManualEligible: tier2ManualEligible,
+        tier3Attempted: tier3Attempted,
+      );
+      throw Exception('All connection tiers failed (LAN → Hotspot → P2P)');
+    } on _ManualHotspotFlowCancelled {
+      rethrow;
+    } on TimeoutException catch (e) {
+      await ConnectionLogger.instance.log(
+        'Connection | Tier strategy timeout',
+        details: 'hub_port=$port $e',
+      );
+      throw Exception('Connection timed out. Please retry.');
+    } on SocketException catch (e) {
+      await ConnectionLogger.instance.log(
+        'Connection | Tier strategy socket failure',
+        details: 'hub_port=$port $e',
+      );
+      throw Exception('Could not reach the sender. Please retry.');
+    } catch (e, st) {
+      await ConnectionLogger.instance.log(
+        'Connection | Tier strategy failed safely',
+        details: '${e.runtimeType}: $e',
+      );
+      debugPrint('[Discovery] Tier strategy exception:\n$st');
+      rethrow;
+    }
   }
 
   @override
@@ -740,16 +896,18 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
 
       await _logNetworkInterfaces();
       await ConnectionLogger.instance.log('BLE Scan Start');
+      await BlePeerFilter.ensureInitialized();
       await BleTransport.instance.startScanning();
       if (!mounted || _leavingForMainMenu) return;
       _scanSubscription?.cancel();
       _seenPeers.clear();
       _scanSubscription = BleTransport.instance.scanPeers().listen(
-        (peers) {
+        (peers) async {
           if (GuestConnectionGuard.isActive || _connectionUiLocked) return;
-          for (final peer in peers) {
+          final filtered = await BlePeerFilter.filterPeers(peers);
+          for (final peer in filtered) {
             if (_seenPeers.add(peer.id)) {
-              ConnectionLogger.instance.log(
+              await ConnectionLogger.instance.log(
                 'BLE Scan Peer Found',
                 details: '${peer.friendlyName} (${peer.id})',
               );
@@ -763,7 +921,7 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
           setState(() {
             _peers
               ..clear()
-              ..addAll(peers);
+              ..addAll(filtered);
             if (_phase == _GuestDiscoveryPhase.scanning) {
               _status = 'Peer Discovery via BLE';
             }

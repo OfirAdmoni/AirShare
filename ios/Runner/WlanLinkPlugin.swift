@@ -1,7 +1,7 @@
 import Flutter
-import NetworkExtension
+import UIKit
 
-/// iOS `air_share/wlan_link` — guest join to host hotspot via NEHotspotConfiguration.
+/// iOS `air_share/wlan_link` — manual Wi-Fi settings bridge only.
 final class WlanLinkPlugin {
   private static let channelName = "air_share/wlan_link"
 
@@ -16,53 +16,40 @@ final class WlanLinkPlugin {
     channel.setMethodCallHandler { call, result in
       switch call.method {
       case "connectToHubWlan":
-        connectToHubWlan(call: call, result: result)
+        result(
+          FlutterError(
+            code: "unsupported",
+            message: "Automatic hotspot join is not supported on iOS.",
+            details: nil
+          )
+        )
+      case "openWirelessSettings":
+        openWirelessSettings(result: result)
       default:
         result(FlutterMethodNotImplemented)
       }
     }
   }
 
-  private static func connectToHubWlan(call: FlutterMethodCall, result: @escaping FlutterResult) {
-    guard let args = call.arguments as? [String: Any],
-          let ssid = (args["ssid"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-          !ssid.isEmpty,
-          let password = args["password"] as? String,
-          !password.isEmpty
-    else {
-      result(
-        FlutterError(
-          code: "invalid_wlan_credentials",
-          message: "SSID and password are required.",
-          details: nil
-        )
-      )
+  private static func openWirelessSettings(result: @escaping FlutterResult) {
+    guard let wifiUrl = URL(string: "App-Prefs:root=WIFI") else {
+      result(nil)
       return
     }
 
-    let configuration = NEHotspotConfiguration(ssid: ssid, passphrase: password, isWEP: false)
-    configuration.joinOnce = true
-
-    NEHotspotConfigurationManager.shared.apply(configuration) { error in
-      if let error {
-        let nsError = error as NSError
-        if nsError.domain == NEHotspotConfigurationErrorDomain,
-           nsError.code == NEHotspotConfigurationError.alreadyAssociated.rawValue
-        {
-          result(nil)
-          return
-        }
-        result(
-          FlutterError(
-            code: "wlan_join_failed",
-            message: error.localizedDescription,
-            details: nil
-          )
-        )
+    UIApplication.shared.open(wifiUrl, options: [:]) { success in
+      if success {
+        result(nil)
         return
       }
-      result(nil)
+
+      guard let settingsUrl = URL(string: UIApplication.openSettingsURLString) else {
+        result(nil)
+        return
+      }
+      UIApplication.shared.open(settingsUrl, options: [:]) { _ in
+        result(nil)
+      }
     }
   }
 }

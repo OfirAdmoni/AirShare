@@ -28,7 +28,10 @@ final class BleTransportPlugin: NSObject {
   // Host GATT state
   private var handshakeCharacteristic: CBMutableCharacteristic?
   private var endpointCharacteristic: CBMutableCharacteristic?
+  /// Released to GATT only after Flutter [approveConnection]; until then reads stay empty.
   private var handshakePayload = Data()
+  /// Built when endpoints update; not exposed over BLE until host approves.
+  private var draftHandshakePayload = Data()
   private var advertisedEndpoint = ""
   private var pendingLanIp = ""
   private var pendingP2pIp = ""
@@ -204,7 +207,8 @@ final class BleTransportPlugin: NSObject {
       advertisedEndpoint = "\(hubIp):\(pendingHubPort)"
     }
     hotspotActive = false
-    refreshHostHandshakePayloadCache()
+    clearReleasedHandshakePayload(reason: "startHubAdvertising")
+    refreshDraftHandshakePayload(reason: "startHubAdvertising")
 
     pendingAdvertiseResult = result
     pendingGattAdvertiseLabel = label
@@ -277,7 +281,7 @@ final class BleTransportPlugin: NSObject {
     gattServicePublished = false
     handshakeCharacteristic = nil
     endpointCharacteristic = nil
-    handshakePayload = Data()
+    clearReleasedHandshakePayload(reason: "stopHubAdvertising")
     clearPendingApproval()
     result(nil)
   }
@@ -322,21 +326,23 @@ final class BleTransportPlugin: NSObject {
     pendingHotspotSsid = ""
     pendingHotspotPass = ""
     pendingHotspotHubIp = ""
-    refreshHostHandshakePayloadCache()
+    refreshDraftHandshakePayload(reason: "updateConnectionEndpoints")
+    clearReleasedHandshakePayload(reason: "updateConnectionEndpoints")
     result(nil)
   }
 
   private func approveConnection(call: FlutterMethodCall, result: @escaping FlutterResult) {
     let approved = (call.arguments as? [String: Any])?["approved"] as? Bool ?? false
     if !approved {
-      handshakePayload = Data()
-      handshakeCharacteristic?.value = nil
+      logBle("approveConnection: declined — keeping handshake sealed")
+      clearReleasedHandshakePayload(reason: "approveConnection_declined")
       clearPendingApproval()
       result(nil)
       return
     }
 
     guard let payload = buildHandshakePayloadData() else {
+      logBle("approveConnection: blocked — handshake draft not ready")
       result(
         FlutterError(
           code: "handshake_not_ready",
@@ -348,12 +354,13 @@ final class BleTransportPlugin: NSObject {
     }
 
     handshakePayload = payload
+    draftHandshakePayload = payload
     if let json = String(data: payload, encoding: .utf8) {
-      logBle("approveConnection: handshake JSON sent \(json)")
+      logBle("approveConnection: handshake JSON released \(json.prefix(220))")
     }
     if let char = handshakeCharacteristic {
       let notified = peripheralManager.updateValue(payload, for: char, onSubscribedCentrals: nil)
-      logBle("approveConnection: notifyCharacteristicChanged=\(notified) bytes=\(payload.count)")
+      logBle("approveConnection: ServerHello notify sent=\(notified) bytes=\(payload.count)")
     }
     clearPendingApproval()
     result(nil)
@@ -456,16 +463,22 @@ final class BleTransportPlugin: NSObject {
 
   // MARK: - Handshake helpers
 
-  private func refreshHostHandshakePayloadCache() {
+  private func refreshDraftHandshakePayload(reason: String) {
     if let data = buildHandshakePayloadData() {
-      handshakePayload = data
+      draftHandshakePayload = data
       if let json = String(data: data, encoding: .utf8) {
-        logBle("handshake JSON cached: \(json)")
+        logBle("handshake draft prepared (\(reason)): \(json.prefix(180))")
       }
     } else {
-      handshakePayload = Data()
-      logBle("handshake JSON cache cleared (endpoints not ready)")
+      draftHandshakePayload = Data()
+      logBle("handshake draft cleared (\(reason)) — endpoints not ready")
     }
+  }
+
+  private func clearReleasedHandshakePayload(reason: String) {
+    handshakePayload = Data()
+    handshakeCharacteristic?.value = nil
+    logBle("handshake released payload cleared (\(reason))")
   }
 
   private func buildHandshakePayloadData() -> Data? {
@@ -583,8 +596,7 @@ final class BleTransportPlugin: NSObject {
     cancelApprovalTimeout()
     let work = DispatchWorkItem { [weak self] in
       guard let self else { return }
-      self.handshakePayload = Data()
-      self.handshakeCharacteristic?.value = nil
+      self.clearReleasedHandshakePayload(reason: "approval_timeout")
       self.clearPendingApproval()
     }
     approvalTimeoutWorkItem = work
@@ -602,7 +614,9 @@ final class BleTransportPlugin: NSObject {
   }
 
   private func notifyConnectionRequest(centralId: String, friendlyName: String) {
+    logBle("approval requested central=\(centralId) friendlyName=\(friendlyName)")
     DispatchQueue.main.async { [weak self] in
+      self?.logBle("approval dialog invoke notifyConnectionRequest central=\(centralId)")
       self?.uiChannel.invokeMethod(
         "notifyConnectionRequest",
         arguments: [
@@ -900,11 +914,23 @@ extension BleTransportPlugin: CBPeripheralManagerDelegate {
     logBle(
       "central subscribed uuid=\(characteristic.uuid.uuidString) central=\(central.identifier.uuidString)"
     )
-    if characteristic.uuid == Self.handshakeCharacteristicUuid,
-       !handshakePayload.isEmpty,
-       let char = handshakeCharacteristic {
-      _ = peripheralManager.updateValue(handshakePayload, for: char, onSubscribedCentrals: [central])
-      logBle("pushed cached handshake JSON on subscribe (\(handshakePayload.count) bytes)")
+    if characteristic.uuid == Self.handshakeCharacteristicUuid {
+      if handshakePayload.isEmpty {
+        logBle(
+          "handshake subscribe before approval central=\(central.identifier.uuidString) "
+            + "— no ServerHello pushed"
+        )
+      } else if let char = handshakeCharacteristic {
+        let notified = peripheralManager.updateValue(
+          handshakePayload,
+          for: char,
+          onSubscribedCentrals: [central]
+        )
+        logBle(
+          "handshake subscribe after approval central=\(central.identifier.uuidString) "
+            + "notify_sent=\(notified) bytes=\(handshakePayload.count)"
+        )
+      }
     }
   }
 
@@ -929,19 +955,19 @@ extension BleTransportPlugin: CBPeripheralManagerDelegate {
       request.value = handshakePayload
       peripheral.respond(to: request, withResult: .success)
       if let json = String(data: handshakePayload, encoding: .utf8) {
-        logBle("handshake read response (cached LAN JSON): \(json)")
+        logBle("handshake read response (approved ServerHello): \(json.prefix(180))")
       }
       return
     }
 
+    let centralId = request.central.identifier.uuidString
     if pendingApprovalCentralId == nil {
-      pendingApprovalCentralId = request.central.identifier.uuidString
+      pendingApprovalCentralId = centralId
       scheduleApprovalTimeout()
-      notifyConnectionRequest(
-        centralId: request.central.identifier.uuidString,
-        friendlyName: "Unknown Peer"
-      )
-      logBle("handshake read empty — awaiting host UI approval")
+      notifyConnectionRequest(centralId: centralId, friendlyName: "Unknown Peer")
+      logBle("handshake read empty — approval required central=\(centralId)")
+    } else {
+      logBle("handshake read empty — approval already pending central=\(centralId)")
     }
 
     request.value = Data()

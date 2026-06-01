@@ -875,7 +875,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         }.toString()
         Log.i(
             "AirShareNative",
-            "Android | Handshake JSON built | lan=$lan p2p=$p2p hotspot_ssid_len=${ssid.length} port=$pendingHubPort",
+            "Android | Handshake JSON built | lan_ip=$lan hotspot_hub_ip=$hotspotHub p2p_ip=$p2p hotspot_ssid_len=${ssid.length} port=$pendingHubPort",
         )
         return json.toByteArray(StandardCharsets.UTF_8)
     }
@@ -889,6 +889,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         if (p2pFromDart.isNotEmpty()) {
             pendingP2pIp = p2pFromDart
         }
+        val hubFromDart = call.argument<String>("hotspotHubIp")?.trim().orEmpty()
+        Log.i(
+            "AirShareNative",
+            "updateConnectionEndpoints: requested lan_ip=$pendingLanIp hotspot_hub_ip=$hubFromDart p2p_ip=$pendingP2pIp",
+        )
+        logAllIpv4Interfaces("updateConnectionEndpoints")
         val incomingP2pMac = call.argument<String>("p2pMac")?.trim().orEmpty()
         when {
             isUsableP2pMac(incomingP2pMac) -> pendingP2pMac = incomingP2pMac
@@ -911,7 +917,6 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             pendingHotspotSsid = ssid
             pendingHotspotPassword = pass
         }
-        val hubFromDart = call.argument<String>("hotspotHubIp")?.trim().orEmpty()
         if (hubFromDart.isNotEmpty() && hotspotActive) {
             pendingHotspotHubIp = hubFromDart
         }
@@ -1693,6 +1698,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                         return
                     }
                     val hubIp = resolveHotspotHubIpv4Address()
+                    logAllIpv4Interfaces("LocalOnlyHotspot.onStarted")
                     pendingHotspotSsid = systemSsid
                     pendingHotspotPassword = systemPassword
                     pendingHotspotHubIp = hubIp
@@ -1707,7 +1713,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     endpointCharacteristic?.value = advertisedEndpoint.toByteArray(StandardCharsets.UTF_8)
                     Log.i(
                         "AirShareNative",
-                        "LocalOnlyHotspot onStarted: system_ssid=$systemSsid hubIp=$hubIp (hotspotActive=true)",
+                        "LocalOnlyHotspot onStarted: system_ssid=$systemSsid hotspot_hub_ip=$hubIp lan_ip=$pendingLanIp (hotspotActive=true)",
                     )
                     result.success(
                         mapOf(
@@ -2355,6 +2361,24 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         } catch (e: Exception) {
             Log.w("AirShareNative", "resolvePreConnectedHostLanIpv4 failed: ${e.message}")
             null
+        }
+    }
+
+    private fun logAllIpv4Interfaces(reason: String) {
+        try {
+            val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
+            for (iface in interfaces) {
+                for (address in Collections.list(iface.inetAddresses)) {
+                    if (address is Inet4Address) {
+                        Log.i(
+                            "AirShareNative",
+                            "IPv4 interface [$reason]: ${iface.name} up=${iface.isUp} loopback=${iface.isLoopback} addr=${address.hostAddress}",
+                        )
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("AirShareNative", "IPv4 interface dump failed [$reason]: ${e.message}")
         }
     }
 

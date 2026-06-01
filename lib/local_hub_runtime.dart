@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 
+import 'package:mime/mime.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -57,6 +58,9 @@ class LocalHubRuntime {
   Completer<bool>? _decisionCompleter;
   Timer? _approvalTimeoutTimer;
 
+  /// Guest HTTP (/files, /download, /upload, /delete) allowed only after BLE approve.
+  bool _guestHttpAccessGranted = false;
+
   TransferApprovalRequest? get pendingTransfer => _pendingTransfer;
 
   bool get isRunning => _server != null;
@@ -82,11 +86,43 @@ class LocalHubRuntime {
     manifest.setRoomHost(peerId: peerId, displayName: displayName);
     await manifest.save(dir);
   }
+
   Stream<String> get ingressEvents => _ingressEventsController.stream;
   Stream<void> get firstGuestConnected => _firstGuestController.stream;
   Stream<String> get guestJoined => _guestJoinedController.stream;
 
+  void resetGuestHttpSession({required String reason}) {
+    _guestHttpAccessGranted = false;
+    unawaited(
+      ConnectionLogger.instance.log(
+        'HTTP | Guest session reset',
+        details: reason,
+      ),
+    );
+  }
+
+  void grantGuestHttpAccess({required String reason}) {
+    _guestHttpAccessGranted = true;
+    unawaited(
+      ConnectionLogger.instance.log(
+        'HTTP | Guest access token issued',
+        details: reason,
+      ),
+    );
+  }
+
+  void revokeGuestHttpAccess({required String reason}) {
+    _guestHttpAccessGranted = false;
+    unawaited(
+      ConnectionLogger.instance.log(
+        'HTTP | Guest access revoked',
+        details: reason,
+      ),
+    );
+  }
+
   Future<void> ensureStarted(HubStatus status) async {
+    resetGuestHttpSession(reason: 'sender_hub_ensureStarted');
     if (isRunning) {
       status.setBroadcasting();
       return;
@@ -112,7 +148,10 @@ class LocalHubRuntime {
             'bind=$boundAddr port=$_activePort shared_dir=${sharedDir.path} '
             '(expect bind=0.0.0.0 for LAN guests)',
       );
-      stdout.writeln('[HubRuntime] shared directory (serve from): ${sharedDir.path}');
+      await _logHubIpv4Interfaces(bindAddress: boundAddr, port: _activePort);
+      stdout.writeln(
+        '[HubRuntime] shared directory (serve from): ${sharedDir.path}',
+      );
       _server!.listen((request) async {
         try {
           await _routeRequest(request, sharedDir.path);
@@ -126,7 +165,9 @@ class LocalHubRuntime {
       });
 
       status.setBroadcasting();
-      stdout.writeln('[HubRuntime] Sender HTTP server started on port $_activePort');
+      stdout.writeln(
+        '[HubRuntime] Sender HTTP server started on port $_activePort',
+      );
     } on SocketException catch (error) {
       status.setError('Port binding failed after retries: $error');
       stdout.writeln('[HubRuntime] Port binding issue: $error');
@@ -144,6 +185,7 @@ class LocalHubRuntime {
   }
 
   Future<void> stop() async {
+    resetGuestHttpSession(reason: 'hub_stop');
     _approvalTimeoutTimer?.cancel();
     _approvalTimeoutTimer = null;
     if (_decisionCompleter != null && !_decisionCompleter!.isCompleted) {
@@ -221,13 +263,44 @@ class LocalHubRuntime {
     throw SocketException('Unable to bind server port: $lastError');
   }
 
+  Future<void> _logHubIpv4Interfaces({
+    required String bindAddress,
+    required int port,
+  }) async {
+    try {
+      final interfaces = await NetworkInterface.list(
+        includeLoopback: false,
+        type: InternetAddressType.IPv4,
+      );
+      await ConnectionLogger.instance.log(
+        'HTTP Server | Bind Address',
+        details: 'bind=$bindAddress:$port',
+      );
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          if (addr.type != InternetAddressType.IPv4) continue;
+          await ConnectionLogger.instance.log(
+            'HTTP Server | Android IPv4 Interface',
+            details: '${iface.name}: ${addr.address}',
+          );
+        }
+      }
+    } catch (e) {
+      await ConnectionLogger.instance.log(
+        'HTTP Server | Interface dump failed',
+        details: '$e',
+      );
+    }
+  }
+
   Future<void> _routeRequest(HttpRequest request, String sharedDirPath) async {
     if (!_loggedFirstInbound) {
       _loggedFirstInbound = true;
       final remote = request.connectionInfo?.remoteAddress;
       await ConnectionLogger.instance.log(
         'HTTP | First inbound (hub reachable for guest TCP)',
-        details: 'method=${request.method} path=${request.uri.path} remote=$remote',
+        details:
+            'method=${request.method} path=${request.uri.path} remote=$remote',
       );
       stdout.writeln(
         '[HubRuntime] First inbound request method=${request.method} path=${request.uri.path} remote=$remote',
@@ -236,6 +309,11 @@ class LocalHubRuntime {
     }
     final method = request.method;
     final path = request.uri.path;
+
+    if (path == '/health' && method == 'GET') {
+      await _handleHealth(request);
+      return;
+    }
 
     if (path == '/files' && method == 'GET') {
       await _handleFiles(request, sharedDirPath);
@@ -282,6 +360,19 @@ class LocalHubRuntime {
     await request.response.close();
   }
 
+  Future<void> _handleHealth(HttpRequest request) async {
+    request.response.statusCode = HttpStatus.ok;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(
+      jsonEncode({
+        'status': 'ok',
+        'port': _activePort,
+        'bind': _server?.address.address ?? 'unknown',
+      }),
+    );
+    await request.response.close();
+  }
+
   String? _headerValue(HttpRequest request, String name) {
     final values = request.headers[name];
     if (values == null || values.isEmpty) return null;
@@ -289,9 +380,49 @@ class LocalHubRuntime {
     return trimmed.isEmpty ? null : trimmed;
   }
 
+  bool _isHostHttpRequester(HttpRequest request) {
+    final role =
+        (_headerValue(request, 'x-airshare-requester-role') ?? 'guest')
+            .toLowerCase();
+    return role == 'host';
+  }
+
+  bool _isGuestHttpRequestAllowed(HttpRequest request) {
+    if (_isHostHttpRequester(request)) return true;
+    return _guestHttpAccessGranted;
+  }
+
+  Future<void> _rejectGuestHttpNotApproved(
+    HttpRequest request, {
+    required String path,
+  }) async {
+    final remote = request.connectionInfo?.remoteAddress;
+    await ConnectionLogger.instance.log(
+      'HTTP | Guest request rejected (not approved)',
+      details: 'path=$path remote=$remote',
+    );
+    stdout.writeln(
+      '[HubRuntime] $path rejected — guest HTTP not approved remote=$remote',
+    );
+    request.response.statusCode = HttpStatus.forbidden;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(
+      jsonEncode({'error': 'not_approved', 'message': 'Host has not approved this guest'}),
+    );
+    await request.response.close();
+  }
+
   Future<void> _handleFiles(HttpRequest request, String sharedDirPath) async {
+    if (!_isGuestHttpRequestAllowed(request)) {
+      await _rejectGuestHttpNotApproved(request, path: 'GET /files');
+      return;
+    }
     final dir = Directory(sharedDirPath);
     stdout.writeln('[HubRuntime] GET /files list sharedDirPath=$sharedDirPath');
+    await ConnectionLogger.instance.log(
+      'HTTP | GET /files accepted',
+      details: 'remote=${request.connectionInfo?.remoteAddress}',
+    );
     final manifest = await SharedRoomManifest.load(sharedDirPath);
     final entities = await dir.list().toList();
     final entries = <SharedFileEntry>[];
@@ -337,6 +468,10 @@ class LocalHubRuntime {
   }
 
   Future<void> _handleDelete(HttpRequest request, String sharedDirPath) async {
+    if (!_isGuestHttpRequestAllowed(request)) {
+      await _rejectGuestHttpNotApproved(request, path: 'DELETE /files');
+      return;
+    }
     final rawName = request.uri.queryParameters['name'] ?? '';
     final fileName = _sanitizeClientFileName(rawName);
     if (fileName == null) {
@@ -357,7 +492,8 @@ class LocalHubRuntime {
     final meta = manifest.entryFor(fileName);
     final senderId = meta?.senderId ?? '';
 
-    final allowed = isHostRequester ||
+    final allowed =
+        isHostRequester ||
         (requesterPeerId.isNotEmpty &&
             senderId.isNotEmpty &&
             requesterPeerId == senderId);
@@ -384,7 +520,14 @@ class LocalHubRuntime {
     );
   }
 
-  Future<void> _handleDownload(HttpRequest request, String sharedDirPath) async {
+  Future<void> _handleDownload(
+    HttpRequest request,
+    String sharedDirPath,
+  ) async {
+    if (!_isGuestHttpRequestAllowed(request)) {
+      await _rejectGuestHttpNotApproved(request, path: 'GET /download');
+      return;
+    }
     final rawName = request.uri.queryParameters['name'] ?? '';
     stdout.writeln(
       '[HubRuntime] GET /download remote=${request.connectionInfo?.remoteAddress} '
@@ -423,7 +566,9 @@ class LocalHubRuntime {
         'HTTP Download start',
         details: 'name=$fileName bytes=$size path=$absolutePath',
       );
-      debugPrint('[HubRuntime] GET /download name=$fileName size=$size path=$absolutePath');
+      debugPrint(
+        '[HubRuntime] GET /download name=$fileName size=$size path=$absolutePath',
+      );
 
       request.response.statusCode = HttpStatus.ok;
       request.response.headers.contentType = ContentType.binary;
@@ -444,7 +589,8 @@ class LocalHubRuntime {
       stdout.writeln('$stackTrace');
       await ConnectionLogger.instance.log(
         'HTTP Download error',
-        details: 'name=$fileName path=$absolutePath committed=$responseCommitted err=$error',
+        details:
+            'name=$fileName path=$absolutePath committed=$responseCommitted err=$error',
       );
       if (!responseCommitted) {
         try {
@@ -453,7 +599,9 @@ class LocalHubRuntime {
           request.response.write('Unable to read or stream file');
           await request.response.close();
         } catch (closeError) {
-          stdout.writeln('[HubRuntime] Download error response failed: $closeError');
+          stdout.writeln(
+            '[HubRuntime] Download error response failed: $closeError',
+          );
         }
       } else {
         try {
@@ -464,6 +612,10 @@ class LocalHubRuntime {
   }
 
   Future<void> _handleUpload(HttpRequest request, String sharedDirPath) async {
+    if (!_isGuestHttpRequestAllowed(request)) {
+      await _rejectGuestHttpNotApproved(request, path: 'POST /upload');
+      return;
+    }
     final contentType = request.headers.contentType;
     if (contentType == null || contentType.mimeType != 'multipart/form-data') {
       request.response.statusCode = HttpStatus.badRequest;
@@ -480,94 +632,123 @@ class LocalHubRuntime {
       return;
     }
 
-    final bodyBuilder = BytesBuilder(copy: false);
-    await for (final chunk in request) {
-      bodyBuilder.add(chunk);
-    }
-    final bodyBytes = bodyBuilder.takeBytes();
-
-    final delimiter = ascii.encode('--$boundary');
-    final headerSeparator = <int>[13, 10, 13, 10];
-    final startBoundary = _indexOfSublist(bodyBytes, delimiter, 0);
-    final headerEnd = _indexOfSublist(bodyBytes, headerSeparator, startBoundary);
-    if (startBoundary < 0 || headerEnd < 0) {
-      request.response.statusCode = HttpStatus.badRequest;
-      request.response.write('Missing file payload');
-      await request.response.close();
-      return;
-    }
-
-    final headersBytes = bodyBytes.sublist(startBoundary, headerEnd);
-    final headersText = utf8.decode(headersBytes, allowMalformed: true);
-    String? fileName;
-    final match = RegExp(r'filename="([^"]+)"').firstMatch(headersText);
-    if (match != null) {
-      fileName = match.group(1);
-    }
-    fileName ??= 'received_${DateTime.now().millisecondsSinceEpoch}.bin';
-    fileName = fileName.split('/').last.split(r'\').last;
-    final uploadSafe = _sanitizeClientFileName(fileName);
-    if (uploadSafe == null) {
-      request.response.statusCode = HttpStatus.badRequest;
-      request.response.write('Invalid file name');
-      await request.response.close();
-      return;
-    }
-    fileName = uploadSafe;
-
-    final contentStart = headerEnd + headerSeparator.length;
-    final endDelimiter = ascii.encode('\r\n--$boundary');
-    final contentEnd = _indexOfSublist(bodyBytes, endDelimiter, contentStart);
-    if (contentEnd < 0 || contentEnd <= contentStart) {
-      request.response.statusCode = HttpStatus.badRequest;
-      request.response.write('Invalid multipart payload');
-      await request.response.close();
-      return;
-    }
-
-    final fileBytes = bodyBytes.sublist(contentStart, contentEnd);
-    final outPath = _joinSharedPath(sharedDirPath, fileName);
-    stdout.writeln('[HubRuntime] POST /upload name=$fileName outPath=$outPath bytes=${fileBytes.length}');
-    final outFile = File(outPath);
-    await outFile.writeAsBytes(fileBytes, flush: true);
-
-    final senderId = _headerValue(request, 'x-airshare-sender-id') ?? '';
-    final senderName = _headerValue(request, 'x-airshare-sender-name') ?? 'Unknown';
-    final manifest = await SharedRoomManifest.load(sharedDirPath);
-    if (manifest.roomHostPeerId.isEmpty &&
-        _headerValue(request, 'x-airshare-requester-role') == 'host' &&
-        senderId.isNotEmpty) {
-      manifest.setRoomHost(peerId: senderId, displayName: senderName);
-    }
-    manifest.upsertFile(
-      SharedFileEntry(
-        name: fileName,
-        senderId: senderId,
-        senderName: senderName,
-        sharedAt: DateTime.now().toUtc(),
-        sizeBytes: fileBytes.length,
-      ),
+    final contentLength = request.headers.contentLength;
+    await ConnectionLogger.instance.log(
+      'HTTP Upload start',
+      details:
+          'content_length=$contentLength boundary_len=${boundary.length} '
+          'shared_dir=$sharedDirPath',
     );
-    await manifest.save(sharedDirPath);
+    stdout.writeln(
+      '[HubRuntime] POST /upload start contentLength=$contentLength '
+      'sharedDirPath=$sharedDirPath',
+    );
 
-    request.response.headers.contentType =
-        ContentType('application', 'json', charset: 'utf-8');
-    request.response.statusCode = HttpStatus.created;
-    request.response.write(
-      jsonEncode({
-        'status': 'ok',
-        'message': 'file uploaded',
-        'fileName': fileName,
-      }),
-    );
-    await request.response.close();
-    _ingressEventsController.add(
-      jsonEncode({
-        'type': 'uploaded',
-        'senderName': senderName,
-        'fileName': fileName,
-      }),
-    );
+    try {
+      final transformer = MimeMultipartTransformer(boundary);
+      String? fileName;
+      var sizeBytes = 0;
+      File? outFile;
+
+      await for (final part
+          in request.cast<List<int>>().transform(transformer)) {
+        final disposition = part.headers['content-disposition'] ?? '';
+        final match = RegExp(r'filename="([^"]*)"').firstMatch(disposition);
+        final partName = match?.group(1);
+        if (partName == null || partName.isEmpty) {
+          await part.forEach((_) {});
+          continue;
+        }
+
+        fileName = partName.split('/').last.split(r'\').last;
+        final uploadSafe = _sanitizeClientFileName(fileName);
+        if (uploadSafe == null) {
+          await part.forEach((_) {});
+          continue;
+        }
+        fileName = uploadSafe;
+
+        final outPath = _joinSharedPath(sharedDirPath, fileName);
+        outFile = File(outPath);
+        final sink = outFile.openWrite();
+        try {
+          await for (final chunk in part) {
+            sink.add(chunk);
+            sizeBytes += chunk.length;
+          }
+          await sink.flush();
+        } finally {
+          await sink.close();
+        }
+        stdout.writeln(
+          '[HubRuntime] POST /upload streamed name=$fileName outPath=$outPath '
+          'bytes=$sizeBytes',
+        );
+        break;
+      }
+
+      if (fileName == null || outFile == null) {
+        request.response.statusCode = HttpStatus.badRequest;
+        request.response.write('Missing file payload');
+        await request.response.close();
+        return;
+      }
+
+      final senderId = _headerValue(request, 'x-airshare-sender-id') ?? '';
+      final senderName =
+          _headerValue(request, 'x-airshare-sender-name') ?? 'Unknown';
+      final manifest = await SharedRoomManifest.load(sharedDirPath);
+      if (manifest.roomHostPeerId.isEmpty &&
+          _headerValue(request, 'x-airshare-requester-role') == 'host' &&
+          senderId.isNotEmpty) {
+        manifest.setRoomHost(peerId: senderId, displayName: senderName);
+      }
+      manifest.upsertFile(
+        SharedFileEntry(
+          name: fileName,
+          senderId: senderId,
+          senderName: senderName,
+          sharedAt: DateTime.now().toUtc(),
+          sizeBytes: sizeBytes,
+        ),
+      );
+      await manifest.save(sharedDirPath);
+
+      await ConnectionLogger.instance.log(
+        'HTTP Upload success',
+        details: 'name=$fileName bytes=$sizeBytes sender=$senderName',
+      );
+
+      request.response.headers.contentType =
+          ContentType('application', 'json', charset: 'utf-8');
+      request.response.statusCode = HttpStatus.created;
+      request.response.write(
+        jsonEncode({
+          'status': 'ok',
+          'message': 'file uploaded',
+          'fileName': fileName,
+        }),
+      );
+      await request.response.close();
+      _ingressEventsController.add(
+        jsonEncode({
+          'type': 'uploaded',
+          'senderName': senderName,
+          'fileName': fileName,
+        }),
+      );
+    } catch (error, stackTrace) {
+      stdout.writeln('[HubRuntime] POST /upload failed: $error\n$stackTrace');
+      await ConnectionLogger.instance.log(
+        'HTTP Upload error',
+        details: '$error',
+      );
+      try {
+        request.response.statusCode = HttpStatus.internalServerError;
+        request.response.write('Upload failed');
+        await request.response.close();
+      } catch (_) {}
+    }
   }
 
   Future<Uint8List> _readBody(HttpRequest request) async {
@@ -670,6 +851,12 @@ class LocalHubRuntime {
       final raw = (body['guestName'] as String?)?.trim() ?? '';
       if (raw.isNotEmpty) guestName = raw;
     } catch (_) {}
+    await ConnectionLogger.instance.log(
+      'HTTP | Guest registered',
+      details:
+          'name=$guestName remote=${request.connectionInfo?.remoteAddress} '
+          'http_approved=$_guestHttpAccessGranted',
+    );
     _guestJoinedController.add(guestName);
     request.response.headers.contentType =
         ContentType('application', 'json', charset: 'utf-8');

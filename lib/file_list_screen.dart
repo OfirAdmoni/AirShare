@@ -8,6 +8,7 @@ import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'package:air_share/connection_logger.dart';
 import 'package:air_share/file_zone_session.dart';
 import 'package:air_share/hub_status.dart';
 import 'package:air_share/local_hub_runtime.dart';
@@ -334,12 +335,13 @@ class _FileListScreenState extends State<FileListScreen> {
       }
       return receivedDir;
     }
-    if (Platform.isIOS) {
-      return getApplicationDocumentsDirectory();
+    // Sandbox-safe: never write directly to ~/Downloads on macOS/Windows without entitlement.
+    final docs = await getApplicationDocumentsDirectory();
+    final receivedDir = Directory(p.join(docs.path, 'AirShare', 'Received'));
+    if (!await receivedDir.exists()) {
+      await receivedDir.create(recursive: true);
     }
-    final fallback = await getDownloadsDirectory();
-    if (fallback != null) return fallback;
-    return getApplicationDocumentsDirectory();
+    return receivedDir;
   }
 
   Future<void> downloadFile(String fileName) async {
@@ -357,18 +359,32 @@ class _FileListScreenState extends State<FileListScreen> {
       final uri = Uri.parse(
         '$baseUrl/download?name=${Uri.encodeComponent(fileName)}',
       );
+      await ConnectionLogger.instance.log(
+        'Download start',
+        details: 'url=$uri platform=${Platform.operatingSystem}',
+      );
       final request = http.Request('GET', uri);
-      final response = await client.send(request);
+      final response = await client
+          .send(request)
+          .timeout(const Duration(minutes: 10));
+
+      await ConnectionLogger.instance.log(
+        'Download response',
+        details:
+            'status=${response.statusCode} content_length=${response.contentLength} '
+            'content_type=${response.headers['content-type']}',
+      );
 
       if (response.statusCode != HttpStatus.ok) {
-        throw Exception('Download failed (${response.statusCode})');
+        final body = await response.stream.bytesToString();
+        throw Exception(
+          body.isNotEmpty
+              ? body
+              : 'Download failed (${response.statusCode})',
+        );
       }
 
       final targetDir = await _resolveDownloadDirectory();
-      if (!await targetDir.exists()) {
-        await targetDir.create(recursive: true);
-      }
-
       final outputFile = File(p.join(targetDir.path, fileName));
       _activeDownloadPath = outputFile.path;
       sink = outputFile.openWrite();
@@ -376,11 +392,17 @@ class _FileListScreenState extends State<FileListScreen> {
       final totalBytes = response.contentLength;
       var receivedBytes = 0;
 
-      await for (final chunk in response.stream) {
+      await for (final chunk in response.stream.timeout(
+        const Duration(minutes: 10),
+      )) {
         sink.add(chunk);
         receivedBytes += chunk.length;
-        if (totalBytes != null && totalBytes > 0 && mounted) {
-          setState(() => downloadProgress = receivedBytes / totalBytes);
+        if (mounted) {
+          if (totalBytes != null && totalBytes > 0) {
+            setState(() => downloadProgress = receivedBytes / totalBytes);
+          } else if (receivedBytes > 0) {
+            setState(() => downloadProgress = 0.5);
+          }
         }
       }
 
@@ -388,18 +410,32 @@ class _FileListScreenState extends State<FileListScreen> {
       await sink.close();
       sink = null;
 
-      // Lock progress at 100 % and show "Completed!" for 1.5 s.
+      await ConnectionLogger.instance.log(
+        'Download success',
+        details:
+            'name=$fileName bytes=$receivedBytes path=${outputFile.path}',
+      );
+
       if (mounted) {
         setState(() {
           downloadProgress = 1.0;
           _downloadCompleted = true;
         });
-        await Future.delayed(const Duration(milliseconds: 3500));
+        await Future.delayed(const Duration(milliseconds: 1500));
       }
 
       if (!mounted) return;
       _showEventSnackBar('Saved to: ${outputFile.path}');
+    } on TimeoutException {
+      if (!mounted) return;
+      _showEventSnackBar(
+        'Download timed out. Check Wi‑Fi and try again.',
+      );
     } catch (e) {
+      await ConnectionLogger.instance.log(
+        'Download error',
+        details: 'name=$fileName err=$e',
+      );
       if (!mounted) return;
       _showEventSnackBar('Download error: $e');
     } finally {
@@ -455,6 +491,7 @@ class _FileListScreenState extends State<FileListScreen> {
   Future<void> _uploadStagedFile(_StagedFile staged) async {
     int totalBytes;
     Stream<List<int>> uploadStream;
+    final ext = p.extension(staged.name).toLowerCase();
 
     if (staged.path != null) {
       final sourceFile = File(staged.path!);
@@ -466,6 +503,13 @@ class _FileListScreenState extends State<FileListScreen> {
     } else {
       throw Exception('Could not read selected file');
     }
+
+    await ConnectionLogger.instance.log(
+      'Upload start',
+      details:
+          'name=${staged.name} bytes=$totalBytes ext=$ext path=${staged.path ?? "memory"} '
+          'hub=$baseUrl',
+    );
 
     var uploadedBytes = 0;
     uploadStream = uploadStream.transform(
@@ -500,17 +544,28 @@ class _FileListScreenState extends State<FileListScreen> {
       ),
     );
 
-    final streamedResponse = await request.send();
+    final streamedResponse = await request.send().timeout(
+      const Duration(minutes: 30),
+    );
     if (streamedResponse.statusCode != 201) {
-      throw Exception('Upload failed (${streamedResponse.statusCode})');
+      final body = await streamedResponse.stream.bytesToString();
+      throw Exception(
+        body.isNotEmpty
+            ? body
+            : 'Upload failed (${streamedResponse.statusCode})',
+      );
     }
+    await ConnectionLogger.instance.log(
+      'Upload success',
+      details: 'name=${staged.name} bytes=$totalBytes',
+    );
   }
 
   Future<void> pickAndUploadFile() async {
     try {
       final result = await FilePicker.platform.pickFiles(
         allowMultiple: true,
-        withData: true,
+        withData: false,
       );
       if (result == null || result.files.isEmpty) return;
 
@@ -532,17 +587,34 @@ class _FileListScreenState extends State<FileListScreen> {
 
       var uploadedCount = 0;
       for (final file in staged) {
-        await _uploadStagedFile(file);
-        await fetchFiles(silent: true);
-        uploadedCount++;
+        try {
+          await _uploadStagedFile(file);
+          await fetchFiles(silent: true);
+          uploadedCount++;
+        } catch (e, st) {
+          await ConnectionLogger.instance.log(
+            'Upload failure',
+            details: 'name=${file.name} err=$e',
+          );
+          debugPrint('[FileList] Upload failed for ${file.name}:\n$st');
+          if (mounted) {
+            _showEventSnackBar('Upload failed for ${file.name}: $e');
+          }
+        }
       }
 
       if (!mounted) return;
+      if (uploadedCount == 0) {
+        _showEventSnackBar('No files were uploaded');
+        return;
+      }
       final label = uploadedCount == 1
           ? 'Uploaded: ${staged.first.name}'
           : 'Uploaded $uploadedCount files';
       _showEventSnackBar(label);
-    } catch (e) {
+    } catch (e, st) {
+      await ConnectionLogger.instance.log('Upload error', details: '$e');
+      debugPrint('[FileList] pickAndUploadFile error:\n$st');
       if (mounted) _showEventSnackBar('Upload error: $e');
     } finally {
       if (mounted) {

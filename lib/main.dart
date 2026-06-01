@@ -14,6 +14,7 @@ import 'package:air_share/file_list_screen.dart';
 import 'package:air_share/file_zone_session.dart';
 import 'package:air_share/hub_endpoint_state.dart';
 import 'package:air_share/hub_status.dart';
+import 'package:air_share/local_hub_runtime.dart';
 import 'package:air_share/sender_staging_page.dart';
 import 'package:air_share/ux_prompts.dart';
 
@@ -64,6 +65,10 @@ class _AirShareAppState extends State<AirShareApp> {
           .toString();
       await ConnectionLogger.instance.log(
         'Connection Request Prompted',
+        details: 'peer=$friendlyName',
+      );
+      await ConnectionLogger.instance.log(
+        'BLE | Approval dialog shown',
         details: 'peer=$friendlyName',
       );
       if (!mounted) return null;
@@ -117,6 +122,9 @@ class _AirShareAppState extends State<AirShareApp> {
       );
       var lanForBle = '';
       if (approved == true) {
+        LocalHubRuntime.instance.grantGuestHttpAccess(
+          reason: 'ble_approved peer=$friendlyName',
+        );
         final hubState = HubEndpointState.instance;
         final pendingIp = hubState.pendingIp;
         final pendingPort = hubState.pendingPort;
@@ -152,6 +160,10 @@ class _AirShareAppState extends State<AirShareApp> {
             details: 'no LAN IP — handshake JSON may lack lan_ip',
           );
         }
+      } else {
+        LocalHubRuntime.instance.revokeGuestHttpAccess(
+          reason: 'ble_declined peer=$friendlyName',
+        );
       }
       await BleTransport.instance.approveConnection(
         approved: approved == true,

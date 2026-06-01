@@ -28,5 +28,7 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>AirShare uses Bluetooth to discover nearby devices and exchange connection details securely.</string>
 </dict>
 </plist>

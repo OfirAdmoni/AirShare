@@ -27,7 +27,10 @@ class LocalPeerIdentity {
     final prefs = await SharedPreferences.getInstance();
     var peerId = prefs.getString(_prefPeerIdKey);
     if (peerId == null || peerId.trim().isEmpty) {
-      if (Platform.isAndroid || Platform.isWindows) {
+      if (Platform.isAndroid ||
+          Platform.isWindows ||
+          Platform.isIOS ||
+          Platform.isMacOS) {
         try {
           peerId = await BleTransport.instance.getLocalPeerId();
         } catch (_) {

@@ -29,25 +29,28 @@ class WlanLinkManager {
     String? ssid,
     String? password,
   }) async {
-    final args = <String, dynamic>{
-      'hubPort': ?hubPort,
-    };
+    final args = <String, dynamic>{'hubPort': ?hubPort};
     if (Platform.isWindows) {
       args['ssid'] = ssid ?? 'AirShareLink';
       args['password'] = password ?? 'AirShare@2026';
     }
     if (!Platform.isWindows && !_isAndroidMobile) {
-      throw UnsupportedError('Temporary hotspot is only supported on Android and Windows');
+      throw UnsupportedError(
+        'Temporary hotspot is only supported on Android and Windows',
+      );
     }
-    return _channel.invokeMethod<Map<dynamic, dynamic>>('startTemporaryHotspot', args);
+    return _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'startTemporaryHotspot',
+      args,
+    );
   }
 
   Future<void> connectToHubWlan({
     required String ssid,
     required String password,
   }) async {
-    if (!Platform.isAndroid && !Platform.isIOS) {
-      throw UnsupportedError('connectToHubWlan is only supported on Android and iOS');
+    if (!Platform.isAndroid) {
+      throw UnsupportedError('connectToHubWlan is only supported on Android');
     }
     await _channel.invokeMethod('connectToHubWlan', {
       'ssid': ssid,
@@ -76,9 +79,9 @@ class WlanLinkManager {
   /// Connects to the Wi-Fi Direct group owned by [peerMac] using
   /// WifiP2pManager.connect(). Returns the group owner's IP address
   /// (typically "192.168.49.1") once the connection is established.
-  /// Opens the system wireless settings panel (Android).
+  /// Opens the system wireless settings panel.
   Future<void> openWirelessSettings() async {
-    if (!Platform.isAndroid) return;
+    if (!Platform.isAndroid && !Platform.isIOS && !Platform.isMacOS) return;
     await _channel.invokeMethod<void>('openWirelessSettings');
   }
 

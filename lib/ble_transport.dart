@@ -10,17 +10,23 @@ class BlePeer {
     required this.id,
     required this.friendlyName,
     required this.serviceUuid,
+    this.platform,
   });
 
   final String id;
   final String friendlyName;
   final String serviceUuid;
 
+  /// Optional observer hint from native scan (e.g. `macos`); hosts may omit.
+  final String? platform;
+
   factory BlePeer.fromMap(Map<dynamic, dynamic> map) {
+    final platformRaw = (map['platform'] ?? '').toString().trim();
     return BlePeer(
       id: (map['id'] ?? '').toString(),
       friendlyName: (map['friendlyName'] ?? 'Unknown Peer').toString(),
       serviceUuid: (map['serviceUuid'] ?? '').toString(),
+      platform: platformRaw.isEmpty ? null : platformRaw,
     );
   }
 }
@@ -146,7 +152,10 @@ class BleTransport {
 
   /// Android and Windows: whether the Bluetooth adapter is powered on.
   Future<bool> isBluetoothEnabled() async {
-    if (!Platform.isAndroid && !Platform.isWindows && !Platform.isIOS) {
+    if (!Platform.isAndroid &&
+        !Platform.isWindows &&
+        !Platform.isIOS &&
+        !Platform.isMacOS) {
       return true;
     }
     final enabled = await _methodChannel.invokeMethod<bool>(
@@ -289,9 +298,12 @@ class BleTransport {
 
   /// Local BLE peer id (Android BT address when available, else stable persisted id).
   Future<String> getLocalPeerId() async {
-    if (!Platform.isAndroid && !Platform.isWindows && !Platform.isIOS) {
+    if (!Platform.isAndroid &&
+        !Platform.isWindows &&
+        !Platform.isIOS &&
+        !Platform.isMacOS) {
       throw UnsupportedError(
-        'getLocalPeerId is only supported on Android, iOS, and Windows',
+        'getLocalPeerId is only supported on Android, iOS, Windows, and macOS',
       );
     }
     final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
@@ -302,5 +314,17 @@ class BleTransport {
       throw Exception('getLocalPeerId returned empty id');
     }
     return id;
+  }
+
+  /// macOS: caches local identity for native BLE self-filtering during scan.
+  Future<void> syncLocalBleIdentity({
+    required String peerId,
+    required String advertisingName,
+  }) async {
+    if (!Platform.isMacOS) return;
+    await _methodChannel.invokeMethod<void>('syncLocalBleIdentity', {
+      'peerId': peerId,
+      'advertisingName': advertisingName,
+    });
   }
 }

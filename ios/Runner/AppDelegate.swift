@@ -13,5 +13,6 @@ import UIKit
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     WlanLinkPlugin.register(with: engineBridge.pluginRegistry)
+    BleTransportPlugin.register(with: engineBridge.pluginRegistry)
   }
 }
