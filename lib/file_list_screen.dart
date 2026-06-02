@@ -139,6 +139,9 @@ class _FileListScreenState extends State<FileListScreen> {
   int _consecutiveHostErrors = 0;
   bool _hostDisconnectShown = false;
 
+  StreamSubscription<String>? _joinRequestSub;
+  bool _joinDialogShowing = false;
+
   bool get _isTransferActive => isDownloading || isUploading;
 
   String get baseUrl => 'http://${widget.hubHost}:${widget.hubPort}';
@@ -230,6 +233,13 @@ class _FileListScreenState extends State<FileListScreen> {
         ),
         actions: [
           FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFF2563EB),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
             onPressed: () {
               Navigator.of(ctx).pop();
               if (mounted) {
@@ -248,12 +258,10 @@ class _FileListScreenState extends State<FileListScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(message, style: const TextStyle(color: Colors.white)),
-        backgroundColor: const Color(0xFF2563EB),
+        backgroundColor: const Color(0xFF0A2463),
         behavior: SnackBarBehavior.floating,
         duration: const Duration(seconds: 5),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-        ),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
     );
   }
@@ -263,12 +271,24 @@ class _FileListScreenState extends State<FileListScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(message, style: const TextStyle(color: Colors.white)),
-        backgroundColor: Colors.green.shade600,
+        backgroundColor: const Color(0xFF16A34A),
         behavior: SnackBarBehavior.floating,
         duration: const Duration(seconds: 4),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-        ),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    );
+  }
+
+  void _showErrorSnackBar(String message, {bool isWarning = false}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message, style: const TextStyle(color: Colors.white)),
+        backgroundColor:
+            isWarning ? const Color(0xFFEA580C) : const Color(0xFFDC2626),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 5),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
     );
   }
@@ -292,12 +312,19 @@ class _FileListScreenState extends State<FileListScreen> {
         ),
         actions: [
           TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFF0A2463).withValues(alpha: 0.55),
+            ),
             onPressed: () => Navigator.of(ctx).pop(false),
             child: const Text('Cancel'),
           ),
           FilledButton(
             style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(ctx).colorScheme.error,
+              backgroundColor: const Color(0xFFDC2626),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
             ),
             onPressed: () => Navigator.of(ctx).pop(true),
             child: const Text('Delete'),
@@ -311,7 +338,7 @@ class _FileListScreenState extends State<FileListScreen> {
 
   Future<void> _deleteFile(SharedFileEntry entry) async {
     if (!_canDelete(entry)) {
-      _showEventSnackBar('You can only delete files you shared');
+      _showErrorSnackBar('You can only delete files you shared', isWarning: true);
       return;
     }
     try {
@@ -332,7 +359,7 @@ class _FileListScreenState extends State<FileListScreen> {
       _showEventSnackBar('"${entry.name}" deleted');
     } catch (e) {
       if (!mounted) return;
-      _showEventSnackBar('Delete failed: $e');
+      _showErrorSnackBar('Delete failed: $e');
     }
   }
 
@@ -476,7 +503,7 @@ class _FileListScreenState extends State<FileListScreen> {
 
     } on TimeoutException {
       if (mounted) {
-        _showEventSnackBar('Download timed out. Check Wi‑Fi and try again.');
+        _showErrorSnackBar('Download timed out. Check Wi‑Fi and try again.', isWarning: true);
       }
       return null;
     } catch (e) {
@@ -484,7 +511,7 @@ class _FileListScreenState extends State<FileListScreen> {
         'Download error',
         details: 'name=$fileName err=$e',
       );
-      if (mounted) _showEventSnackBar('Download error: $e');
+      if (mounted) _showErrorSnackBar('Download error: $e');
       return null;
     } finally {
       if (sink != null) {
@@ -518,7 +545,7 @@ class _FileListScreenState extends State<FileListScreen> {
     try {
       (targetDir, pathLabel) = await _resolveDownloadDirectory();
     } catch (e) {
-      _showEventSnackBar('Cannot access storage: $e');
+      _showErrorSnackBar('Cannot access storage: $e');
       return;
     }
 
@@ -531,10 +558,10 @@ class _FileListScreenState extends State<FileListScreen> {
       _downloadCompleted = false;
     });
 
-    final savedPath = await _fetchAndSave(fileName, targetDir);
+    try {
+      final savedPath = await _fetchAndSave(fileName, targetDir);
 
-    if (mounted) {
-      if (savedPath != null) {
+      if (mounted && savedPath != null) {
         setState(() {
           _downloadCompleted = true;
           downloadProgress = 1.0;
@@ -542,14 +569,19 @@ class _FileListScreenState extends State<FileListScreen> {
         await Future.delayed(const Duration(milliseconds: 1200));
         if (mounted) _showDownloadSuccessSnackbar(fileName, savedPath, pathLabel);
       }
-      setState(() {
-        isDownloading = false;
-        downloadProgress = 0;
-        downloadingFileName = null;
-        _batchDownloadTotal = 0;
-        _batchDownloadCompleted = 0;
-        _downloadCompleted = false;
-      });
+    } finally {
+      // Guarantee the overlay is removed regardless of success, failure, or
+      // cancellation — prevents the progress bar from getting permanently stuck.
+      if (mounted) {
+        setState(() {
+          isDownloading = false;
+          downloadProgress = 0;
+          downloadingFileName = null;
+          _batchDownloadTotal = 0;
+          _batchDownloadCompleted = 0;
+          _downloadCompleted = false;
+        });
+      }
     }
   }
 
@@ -565,7 +597,7 @@ class _FileListScreenState extends State<FileListScreen> {
     try {
       (targetDir, pathLabel) = await _resolveDownloadDirectory();
     } catch (e) {
-      _showEventSnackBar('Cannot access storage: $e');
+      _showErrorSnackBar('Cannot access storage: $e');
       return;
     }
 
@@ -578,27 +610,32 @@ class _FileListScreenState extends State<FileListScreen> {
       _downloadCompleted = false;
     });
 
-    int successCount = 0;
-    for (int i = 0; i < toDownload.length; i++) {
-      if (!mounted || _teardownConfirmed) break;
-      setState(() {
-        downloadingFileName = toDownload[i];
-        _batchDownloadCompleted = i;
-      });
-      final savedPath = await _fetchAndSave(toDownload[i], targetDir);
-      if (savedPath != null) successCount++;
-      if (mounted) setState(() => _batchDownloadCompleted = i + 1);
-    }
-
-    if (mounted) {
-      setState(() {
-        _downloadCompleted = true;
-        downloadProgress = 1.0;
-      });
-      await Future.delayed(const Duration(milliseconds: 1200));
-      if (mounted) {
-        _showBatchSuccessSnackbar(successCount, toDownload.length, pathLabel);
+    try {
+      int successCount = 0;
+      for (int i = 0; i < toDownload.length; i++) {
+        if (!mounted || _teardownConfirmed) break;
+        setState(() {
+          downloadingFileName = toDownload[i];
+          _batchDownloadCompleted = i;
+        });
+        final savedPath = await _fetchAndSave(toDownload[i], targetDir);
+        if (savedPath != null) successCount++;
+        if (mounted) setState(() => _batchDownloadCompleted = i + 1);
       }
+
+      if (mounted) {
+        setState(() {
+          _downloadCompleted = true;
+          downloadProgress = 1.0;
+        });
+        await Future.delayed(const Duration(milliseconds: 1200));
+        if (mounted) {
+          _showBatchSuccessSnackbar(successCount, toDownload.length, pathLabel);
+        }
+      }
+    } finally {
+      // Guarantee the overlay is removed regardless of success, failure, or
+      // cancellation — prevents the progress bar from getting permanently stuck.
       if (mounted) {
         setState(() {
           isDownloading = false;
@@ -626,7 +663,7 @@ class _FileListScreenState extends State<FileListScreen> {
           'Completed! Saved to $pathLabel',
           style: const TextStyle(color: Colors.white),
         ),
-        backgroundColor: Colors.green.shade600,
+        backgroundColor: const Color(0xFF16A34A),
         behavior: SnackBarBehavior.floating,
         duration: const Duration(seconds: 8),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -648,8 +685,8 @@ class _FileListScreenState extends State<FileListScreen> {
       SnackBar(
         content: Text(label, style: const TextStyle(color: Colors.white)),
         backgroundColor: success == total
-            ? Colors.green.shade600
-            : Colors.orange.shade700,
+            ? const Color(0xFF16A34A)
+            : const Color(0xFFEA580C),
         behavior: SnackBarBehavior.floating,
         duration: const Duration(seconds: 6),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -819,7 +856,7 @@ class _FileListScreenState extends State<FileListScreen> {
           );
           debugPrint('[FileList] Upload failed for ${file.name}:\n$st');
           if (mounted) {
-            _showEventSnackBar('Upload failed for ${file.name}: $e');
+            _showErrorSnackBar('Upload failed for ${file.name}: $e');
           }
         }
       }
@@ -836,7 +873,7 @@ class _FileListScreenState extends State<FileListScreen> {
     } catch (e, st) {
       await ConnectionLogger.instance.log('Upload error', details: '$e');
       debugPrint('[FileList] pickAndUploadFile error:\n$st');
-      if (mounted) _showEventSnackBar('Upload error: $e');
+      if (mounted) _showErrorSnackBar('Upload error: $e');
     } finally {
       if (mounted) {
         setState(() {
@@ -951,6 +988,13 @@ class _FileListScreenState extends State<FileListScreen> {
           setState(() => _guestConnectionTimedOut = true);
         }
       });
+
+      _joinRequestSub =
+          LocalHubRuntime.instance.joinRequests.listen((guestName) {
+        if (mounted && !_joinDialogShowing) {
+          _showJoinApprovalDialog(guestName);
+        }
+      });
     }
 
     await fetchFiles(silent: true);
@@ -965,6 +1009,7 @@ class _FileListScreenState extends State<FileListScreen> {
     _guestConnectedSub?.cancel();
     _guestJoinedSub?.cancel();
     _guestConnectionTimer?.cancel();
+    _joinRequestSub?.cancel();
     if (!_screenTeardownRan) {
       _screenTeardownRan = true;
       if (widget.isHubMode) {
@@ -1065,6 +1110,13 @@ class _FileListScreenState extends State<FileListScreen> {
               SizedBox(
                 width: double.infinity,
                 child: FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF2563EB),
+                    foregroundColor: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
                   onPressed: () {
                     countdownTimer?.cancel();
                     Navigator.of(ctx).pop(true);
@@ -1075,7 +1127,11 @@ class _FileListScreenState extends State<FileListScreen> {
               const SizedBox(height: 8),
               SizedBox(
                 width: double.infinity,
-                child: OutlinedButton(
+                child: TextButton(
+                  style: TextButton.styleFrom(
+                    foregroundColor:
+                        const Color(0xFF0A2463).withValues(alpha: 0.55),
+                  ),
                   onPressed: () {
                     countdownTimer?.cancel();
                     Navigator.of(ctx).pop(false);
@@ -1101,6 +1157,43 @@ class _FileListScreenState extends State<FileListScreen> {
     } catch (_) {}
   }
 
+  // ── Join approval dialog (host only) ─────────────────────────────────────
+
+  Future<void> _showJoinApprovalDialog(String guestName) async {
+    if (_joinDialogShowing || !mounted) return;
+    _joinDialogShowing = true;
+    final approved = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Join Request'),
+        content: Text('$guestName wants to join this session.'),
+        actions: [
+          TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFF0A2463).withValues(alpha: 0.55),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Decline'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFF2563EB),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Approve'),
+          ),
+        ],
+      ),
+    );
+    _joinDialogShowing = false;
+    LocalHubRuntime.instance.respondToJoinRequest(approved ?? true);
+  }
+
   // ── Cancel-during-transfer dialog ─────────────────────────────────────────
 
   Future<void> _showCancelDialog() async {
@@ -1115,10 +1208,20 @@ class _FileListScreenState extends State<FileListScreen> {
         ),
         actions: [
           FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFF2563EB),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
             onPressed: () => Navigator.of(ctx).pop(false),
             child: const Text('Continue'),
           ),
           TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFF0A2463).withValues(alpha: 0.55),
+            ),
             onPressed: () => Navigator.of(ctx).pop(true),
             child: const Text('Cancel transfer'),
           ),
@@ -1136,15 +1239,51 @@ class _FileListScreenState extends State<FileListScreen> {
 
   Future<void> _postJoinNotification() async {
     try {
-      await http.post(
-        Uri.parse('$baseUrl/join'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'guestName': _localDisplayName}),
-      );
-      if (mounted) {
-        _showConnectionSnackBar('Connected to session successfully!');
+      // The hub blocks on /join until the host approves or declines (max 30 s).
+      // We allow up to 35 s so the server's auto-approve has time to fire first.
+      final response = await http
+          .post(
+            Uri.parse('$baseUrl/join'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({'guestName': _localDisplayName}),
+          )
+          .timeout(const Duration(seconds: 35));
+
+      if (!mounted) return;
+
+      final body = json.decode(response.body) as Map<String, dynamic>?;
+      final status = (body?['status'] as String?)?.trim() ?? 'approved';
+
+      if (status == 'declined') {
+        // Stop all hub-polling timers immediately — no further requests should
+        // be sent to this host after a decline.
+        _refreshTimer?.cancel();
+        _refreshTimer = null;
+        _approvalPollTimer?.cancel();
+        _approvalPollTimer = null;
+
+        // Show the snackbar. Because MaterialApp provides a root-level
+        // ScaffoldMessenger, this snackbar persists across the navigation below.
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Connection Declined by Host.'),
+            backgroundColor: Colors.redAccent,
+            behavior: SnackBarBehavior.floating,
+            duration: Duration(seconds: 4),
+          ),
+        );
+        // Navigate back immediately — no delay — to prevent any further
+        // reconnect attempts or polling while waiting.
+        if (mounted) Navigator.of(context).popUntil((route) => route.isFirst);
+      } else {
+        _showConnectionSnackBar(
+          'Connection Approved! You are now joined to the room.',
+        );
       }
-    } catch (_) {}
+    } catch (_) {
+      // Network error or timeout — show a generic connected message.
+      if (mounted) _showConnectionSnackBar('Connected to session successfully!');
+    }
   }
 
   // ── Formatting helpers ────────────────────────────────────────────────────

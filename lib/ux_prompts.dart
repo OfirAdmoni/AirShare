@@ -6,6 +6,19 @@ import 'package:flutter/material.dart';
 import 'package:air_share/ble_transport.dart';
 import 'package:air_share/wlan_link_manager.dart';
 
+final _kPrimaryButtonStyle = FilledButton.styleFrom(
+  backgroundColor: const Color(0xFF2563EB),
+  foregroundColor: Colors.white,
+  shape: const RoundedRectangleBorder(
+    borderRadius: BorderRadius.all(Radius.circular(12)),
+  ),
+);
+
+final _kSecondaryButtonStyle = TextButton.styleFrom(
+  foregroundColor: const Color(0xFF0A2463),
+  // intentionally full-opacity so "Not now" stands out enough to be tappable
+);
+
 /// User-facing reminders for Bluetooth and manual hotspot setup.
 class UxPrompts {
   UxPrompts._();
@@ -46,10 +59,12 @@ class UxPrompts {
             ),
             actions: [
               TextButton(
+                style: _kSecondaryButtonStyle,
                 onPressed: () => Navigator.of(ctx).pop(false),
                 child: const Text('Not now'),
               ),
               FilledButton(
+                style: _kPrimaryButtonStyle,
                 onPressed: () => Navigator.of(ctx).pop(true),
                 child: const Text('Turn on'),
               ),
@@ -73,10 +88,12 @@ class UxPrompts {
             ),
             actions: [
               TextButton(
+                style: _kSecondaryButtonStyle,
                 onPressed: () => Navigator.of(ctx).pop(),
                 child: const Text('Not now'),
               ),
               FilledButton(
+                style: _kPrimaryButtonStyle,
                 onPressed: () async {
                   Navigator.of(ctx).pop();
                   try {
@@ -100,10 +117,12 @@ class UxPrompts {
           ),
           actions: [
             TextButton(
+              style: _kSecondaryButtonStyle,
               onPressed: () => Navigator.of(ctx).pop(),
               child: const Text('Not now'),
             ),
             FilledButton(
+              style: _kPrimaryButtonStyle,
               onPressed: () async {
                 Navigator.of(ctx).pop();
                 try {
@@ -149,6 +168,7 @@ class UxPrompts {
         ),
         actions: [
           FilledButton(
+            style: _kPrimaryButtonStyle,
             onPressed: () async {
               Navigator.of(ctx).pop();
               try {
@@ -177,10 +197,12 @@ class UxPrompts {
         ),
         actions: [
           TextButton(
+            style: _kSecondaryButtonStyle,
             onPressed: () => Navigator.of(ctx).pop(),
             child: const Text('Cancel'),
           ),
           FilledButton(
+            style: _kPrimaryButtonStyle,
             onPressed: () async {
               Navigator.of(ctx).pop();
               if (Platform.isAndroid) {

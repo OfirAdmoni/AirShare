@@ -91,7 +91,11 @@ class _SettingsPageState extends State<SettingsPage> {
     LocalPeerIdentity.invalidate();
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Device name saved')),
+      const SnackBar(
+        content: Text('Device name saved'),
+        backgroundColor: Color(0xFF16A34A),
+        duration: Duration(seconds: 2),
+      ),
     );
   }
 
@@ -99,7 +103,11 @@ class _SettingsPageState extends State<SettingsPage> {
     final pin = _pinController.text.trim();
     if (_pinEnabled && pin.length < 4) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('PIN must be at least 4 digits')),
+        const SnackBar(
+          content: Text('PIN must be at least 4 digits'),
+          backgroundColor: Color(0xFFDC2626),
+          duration: Duration(seconds: 3),
+        ),
       );
       return;
     }
@@ -114,6 +122,9 @@ class _SettingsPageState extends State<SettingsPage> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(_pinEnabled ? 'PIN saved' : 'PIN protection disabled'),
+        backgroundColor:
+            _pinEnabled ? const Color(0xFF16A34A) : const Color(0xFF0A2463),
+        duration: const Duration(seconds: 2),
       ),
     );
   }

@@ -77,48 +77,31 @@ class _AirShareAppState extends State<AirShareApp> {
       final approved = await showDialog<bool>(
         context: ctx,
         barrierDismissible: false,
-        builder: (context) {
-          final dialogTt = Theme.of(context).textTheme;
-          return AlertDialog(
-            backgroundColor: const Color(0xFFF4F9FF),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(20),
-            ),
-            title: Text(
-              'Connection Request',
-              style: dialogTt.titleLarge?.copyWith(
-                color: const Color(0xFF0A2463),
-                fontWeight: FontWeight.w700,
+        builder: (context) => AlertDialog(
+          // backgroundColor, shape and text styles from global DialogTheme.
+          title: const Text('Connection Request'),
+          content: Text('Device $friendlyName wants to connect. Allow?'),
+          actions: [
+            TextButton(
+              style: TextButton.styleFrom(
+                foregroundColor: const Color(0xFF0A2463).withValues(alpha: 0.55),
               ),
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Decline'),
             ),
-            content: Text(
-              'Device $friendlyName wants to connect. Allow?',
-              style: dialogTt.bodyMedium?.copyWith(
-                color: const Color(0xFF1E3A8A),
-              ),
-            ),
-            actions: [
-              TextButton(
-                style: TextButton.styleFrom(
-                  foregroundColor: const Color(0xFF0A2463),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFF2563EB),
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
                 ),
-                onPressed: () => Navigator.of(context).pop(false),
-                child: const Text('Decline'),
               ),
-              FilledButton(
-                style: FilledButton.styleFrom(
-                  backgroundColor: const Color(0xFF2563EB),
-                  foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                onPressed: () => Navigator.of(context).pop(true),
-                child: const Text('Approve'),
-              ),
-            ],
-          );
-        },
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Approve'),
+            ),
+          ],
+        ),
       );
       var lanForBle = '';
       if (approved == true) {
@@ -221,8 +204,27 @@ class _AirShareAppState extends State<AirShareApp> {
             ),
             useMaterial3: true,
             scaffoldBackgroundColor: const Color(0xFFDBEAFE),
+            // Global dialog theme — every AlertDialog inherits these automatically.
+            dialogTheme: const DialogThemeData(
+              backgroundColor: Color(0xFFF3E8FF),
+              titleTextStyle: TextStyle(
+                color: Color(0xFF0A2463),
+                fontSize: 20,
+                fontWeight: FontWeight.w700,
+              ),
+              contentTextStyle: TextStyle(
+                color: Color(0xFF0A2463),
+                fontSize: 14,
+                height: 1.5,
+              ),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.all(Radius.circular(20)),
+              ),
+            ),
+            // Dark Navy is the neutral/info default; success and error callers
+            // override backgroundColor explicitly.
             snackBarTheme: const SnackBarThemeData(
-              backgroundColor: Color(0xFF2563EB),
+              backgroundColor: Color(0xFF0A2463),
               contentTextStyle: TextStyle(color: Colors.white),
               behavior: SnackBarBehavior.floating,
               shape: RoundedRectangleBorder(
@@ -647,7 +649,11 @@ class _ManualConnectionPageState extends State<ManualConnectionPage> {
     final port = int.tryParse(_portController.text.trim());
     if (ip.isEmpty || port == null || port <= 0 || port > 65535) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Enter a valid IP and port')),
+        const SnackBar(
+          content: Text('Enter a valid IP and port'),
+          backgroundColor: Color(0xFFDC2626),
+          duration: Duration(seconds: 3),
+        ),
       );
       return;
     }
@@ -673,9 +679,13 @@ class _ManualConnectionPageState extends State<ManualConnectionPage> {
         details: e.toString(),
       );
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Connection check failed: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Connection check failed: $e'),
+          backgroundColor: const Color(0xFFDC2626),
+          duration: const Duration(seconds: 4),
+        ),
+      );
       setState(() => _connecting = false);
       return;
     }
@@ -777,9 +787,12 @@ class _ConnectionLogPageState extends State<ConnectionLogPage> {
   Future<void> _shareLogs() async {
     final lines = ConnectionLogger.instance.entries.value;
     if (lines.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('No logs to share')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No logs to share'),
+          duration: Duration(seconds: 3),
+        ),
+      );
       return;
     }
     if (!mounted) return;
@@ -789,7 +802,11 @@ class _ConnectionLogPageState extends State<ConnectionLogPage> {
         await Clipboard.setData(ClipboardData(text: lines.join('\n')));
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Log copied to clipboard')),
+          const SnackBar(
+            content: Text('Log copied to clipboard'),
+            backgroundColor: Color(0xFF16A34A),
+            duration: Duration(seconds: 2),
+          ),
         );
       } else {
         await ConnectionLogger.instance.shareDisplayedLogs();
@@ -797,7 +814,11 @@ class _ConnectionLogPageState extends State<ConnectionLogPage> {
     } on PlatformException catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not share logs: ${e.message ?? e.code}')),
+        SnackBar(
+          content: Text('Could not share logs: ${e.message ?? e.code}'),
+          backgroundColor: const Color(0xFFDC2626),
+          duration: const Duration(seconds: 4),
+        ),
       );
     } finally {
       if (mounted) setState(() => _sharing = false);
@@ -810,9 +831,13 @@ class _ConnectionLogPageState extends State<ConnectionLogPage> {
     try {
       await ConnectionLogger.instance.clear();
       if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Logs cleared')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Logs cleared'),
+          backgroundColor: Color(0xFF16A34A),
+          duration: Duration(seconds: 2),
+        ),
+      );
     } finally {
       if (mounted) setState(() => _clearing = false);
     }

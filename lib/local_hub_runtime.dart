@@ -58,6 +58,13 @@ class LocalHubRuntime {
   Completer<bool>? _decisionCompleter;
   Timer? _approvalTimeoutTimer;
 
+  // Join approval state — one pending join request at a time.
+  String? _pendingJoinGuestName;
+  Completer<bool>? _joinDecisionCompleter;
+  Timer? _joinTimeoutTimer;
+  final StreamController<String> _joinRequestController =
+      StreamController<String>.broadcast();
+
   /// Guest HTTP (/files, /download, /upload, /delete) allowed only after BLE approve.
   bool _guestHttpAccessGranted = false;
 
@@ -90,6 +97,18 @@ class LocalHubRuntime {
   Stream<String> get ingressEvents => _ingressEventsController.stream;
   Stream<void> get firstGuestConnected => _firstGuestController.stream;
   Stream<String> get guestJoined => _guestJoinedController.stream;
+
+  /// Emits the guest's display name whenever a new join request arrives.
+  /// The host UI listens to this and calls [respondToJoinRequest] with its decision.
+  Stream<String> get joinRequests => _joinRequestController.stream;
+
+  /// Called by the host UI to resolve a pending [joinRequests] event.
+  void respondToJoinRequest(bool approved) {
+    if (_joinDecisionCompleter != null &&
+        !_joinDecisionCompleter!.isCompleted) {
+      _joinDecisionCompleter!.complete(approved);
+    }
+  }
 
   void resetGuestHttpSession({required String reason}) {
     _guestHttpAccessGranted = false;
@@ -193,6 +212,14 @@ class LocalHubRuntime {
     }
     _decisionCompleter = null;
     _pendingTransfer = null;
+    // Reject any pending join so the guest's HTTP request unblocks.
+    _joinTimeoutTimer?.cancel();
+    _joinTimeoutTimer = null;
+    if (_joinDecisionCompleter != null && !_joinDecisionCompleter!.isCompleted) {
+      _joinDecisionCompleter!.complete(false);
+    }
+    _joinDecisionCompleter = null;
+    _pendingJoinGuestName = null;
     await _server?.close(force: true);
     _server = null;
     _activePort = 8080;
@@ -846,17 +873,82 @@ class LocalHubRuntime {
       final raw = (body['guestName'] as String?)?.trim() ?? '';
       if (raw.isNotEmpty) guestName = raw;
     } catch (_) {}
+
+    // If an approval dialog is already open for another guest, auto-approve
+    // this one immediately so concurrent joiners are never silently dropped.
+    if (_joinDecisionCompleter != null) {
+      grantGuestHttpAccess(reason: 'auto_approve_concurrent_$guestName');
+      _guestJoinedController.add(guestName);
+      await ConnectionLogger.instance.log(
+        'HTTP | Guest join auto-approved (another approval in progress)',
+        details: 'name=$guestName',
+      );
+      try {
+        request.response.headers.contentType =
+            ContentType('application', 'json', charset: 'utf-8');
+        request.response.write(
+          jsonEncode({'status': 'approved', 'guestName': guestName}),
+        );
+        await request.response.close();
+      } catch (_) {}
+      return;
+    }
+
+    // Signal the host UI and wait for their decision (auto-approve after 30 s).
+    _pendingJoinGuestName = guestName;
+    _joinDecisionCompleter = Completer<bool>();
+    _joinRequestController.add(guestName);
     await ConnectionLogger.instance.log(
-      'HTTP | Guest registered',
+      'HTTP | Guest join awaiting host approval',
       details:
-          'name=$guestName remote=${request.connectionInfo?.remoteAddress} '
-          'http_approved=$_guestHttpAccessGranted',
+          'name=$guestName remote=${request.connectionInfo?.remoteAddress}',
     );
-    _guestJoinedController.add(guestName);
-    request.response.headers.contentType =
-        ContentType('application', 'json', charset: 'utf-8');
-    request.response.write(jsonEncode({'status': 'ok'}));
-    await request.response.close();
+
+    _joinTimeoutTimer = Timer(const Duration(seconds: 30), () {
+      if (_joinDecisionCompleter != null &&
+          !_joinDecisionCompleter!.isCompleted) {
+        _joinDecisionCompleter!.complete(true);
+      }
+    });
+
+    final approved = await _joinDecisionCompleter!.future;
+
+    _joinTimeoutTimer?.cancel();
+    _joinTimeoutTimer = null;
+    _pendingJoinGuestName = null;
+    _joinDecisionCompleter = null;
+
+    await ConnectionLogger.instance.log(
+      'HTTP | Guest join decision',
+      details: 'name=$guestName approved=$approved',
+    );
+
+    if (approved) {
+      grantGuestHttpAccess(reason: 'host_approved_join_$guestName');
+      _guestJoinedController.add(guestName);
+    } else {
+      // Revoke any HTTP access that was previously granted at the BLE level
+      // so the guest cannot access files even if the BLE approval already ran.
+      revokeGuestHttpAccess(reason: 'host_declined_join_$guestName');
+    }
+
+    try {
+      request.response.headers.contentType =
+          ContentType('application', 'json', charset: 'utf-8');
+      request.response.write(
+        jsonEncode({
+          'status': approved ? 'approved' : 'declined',
+          'guestName': guestName,
+        }),
+      );
+      await request.response.close();
+    } catch (e) {
+      // Server was closed before the response could be sent (e.g., host left).
+      await ConnectionLogger.instance.log(
+        'HTTP | Guest join response failed (server closing)',
+        details: '$e',
+      );
+    }
   }
 
   int _indexOfSublist(List<int> source, List<int> target, int start) {

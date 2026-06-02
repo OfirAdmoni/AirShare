@@ -5,6 +5,18 @@ import 'package:geolocator/geolocator.dart';
 
 import 'package:air_share/wlan_link_manager.dart';
 
+final _kPrimaryButtonStyle = FilledButton.styleFrom(
+  backgroundColor: const Color(0xFF2563EB),
+  foregroundColor: Colors.white,
+  shape: const RoundedRectangleBorder(
+    borderRadius: BorderRadius.all(Radius.circular(12)),
+  ),
+);
+
+final _kSecondaryButtonStyle = TextButton.styleFrom(
+  foregroundColor: const Color(0xFF0A2463),
+);
+
 /// Location + native checks required for offline Tier 2 (hotspot) / Tier 3 (P2P).
 class WifiTierPrerequisites {
   WifiTierPrerequisites._();
@@ -34,10 +46,12 @@ class WifiTierPrerequisites {
             ),
             actions: [
               TextButton(
+                style: _kSecondaryButtonStyle,
                 onPressed: () => Navigator.of(ctx).pop(),
                 child: const Text('Cancel'),
               ),
               FilledButton(
+                style: _kPrimaryButtonStyle,
                 onPressed: () async {
                   Navigator.of(ctx).pop();
                   await Geolocator.openAppSettings();
@@ -79,10 +93,12 @@ class WifiTierPrerequisites {
           ),
           actions: [
             TextButton(
+              style: _kSecondaryButtonStyle,
               onPressed: () => Navigator.of(ctx).pop(),
               child: const Text('Cancel'),
             ),
             FilledButton(
+              style: _kPrimaryButtonStyle,
               onPressed: () async {
                 Navigator.of(ctx).pop();
                 await Geolocator.openLocationSettings();

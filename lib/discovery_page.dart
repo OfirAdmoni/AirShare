@@ -531,11 +531,18 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                 ),
                 actions: [
                   TextButton(
+                    style: TextButton.styleFrom(
+                      foregroundColor:
+                          const Color(0xFF0A2463).withValues(alpha: 0.55),
+                    ),
                     onPressed: () =>
                         _returnToMainMenuFromManualHotspot(context),
                     child: const Text('Cancel and Try Again'),
                   ),
                   TextButton(
+                    style: TextButton.styleFrom(
+                      foregroundColor: const Color(0xFF0A2463),
+                    ),
                     onPressed: retrying
                         ? null
                         : () async {
@@ -546,12 +553,16 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                             ScaffoldMessenger.of(context).showSnackBar(
                               const SnackBar(
                                 content: Text('Hotspot password copied'),
+                                duration: Duration(seconds: 2),
                               ),
                             );
                           },
                     child: const Text('Copy Password'),
                   ),
                   TextButton(
+                    style: TextButton.styleFrom(
+                      foregroundColor: const Color(0xFF0A2463),
+                    ),
                     onPressed: retrying
                         ? null
                         : () async {
@@ -572,6 +583,13 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                     child: const Text('Open Wi‑Fi Settings'),
                   ),
                   FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF2563EB),
+                      foregroundColor: Colors.white,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
                     onPressed: retrying ? null : retry,
                     child: retrying
                         ? const SizedBox(
@@ -862,10 +880,20 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         ),
         actions: [
           TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: const Color(0xFF0A2463).withValues(alpha: 0.55),
+            ),
             onPressed: () => Navigator.of(ctx).pop(),
             child: const Text('Continue anyway'),
           ),
           FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFF2563EB),
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+            ),
             onPressed: () async {
               Navigator.of(ctx).pop();
               await Geolocator.openLocationSettings();
@@ -941,9 +969,13 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     } catch (e) {
       if (!mounted) return;
       debugPrint('[Discovery] start failed: $e');
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Peer discovery error: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Peer discovery error: $e'),
+          backgroundColor: const Color(0xFFDC2626),
+          duration: const Duration(seconds: 3),
+        ),
+      );
     }
   }
 
@@ -1056,9 +1088,12 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       );
       GuestConnectionGuard.exit();
       await widget.onEndpointReady(effectiveEndpoint);
-      // Gap 5 fix: reset to scanning so the user is not stuck on the
-      // connecting overlay after backing out of FileListScreen.
-      if (mounted) {
+      // Gap 5 fix: reset to scanning when the user manually backs out of
+      // FileListScreen. Guard with isCurrent so we do NOT restart scanning if
+      // FileListScreen used popUntil() to pop this page too (e.g. host decline
+      // sends the guest all the way back to home), which would otherwise cause
+      // a brief ghost BLE scan and a potential reconnect loop.
+      if (mounted && (ModalRoute.of(context)?.isCurrent ?? false)) {
         _setPhase(_GuestDiscoveryPhase.scanning, 'Peer Discovery via BLE');
         await _startDiscovery();
       }
