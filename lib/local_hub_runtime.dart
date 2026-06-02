@@ -211,16 +211,11 @@ class LocalHubRuntime {
       return p.join(docs.path, 'AirShare');
     }
 
-    // Windows/Linux/macOS: prefer Downloads/AirShare for desktop workflows.
-    if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
-      final downloads = await getDownloadsDirectory();
-      if (downloads != null) {
-        return p.join(downloads.path, 'AirShare');
-      }
-    }
-
-    final fallback = await getApplicationDocumentsDirectory();
-    return p.join(fallback.path, 'AirShare');
+    // Windows/Linux/macOS: use a hidden temp directory so the host staging area
+    // never collides with Downloads/AirShare, which is the guest's persistent
+    // download destination. The teardown sequence clears this directory on exit.
+    final temp = await getTemporaryDirectory();
+    return p.join(temp.path, 'AirShare_Session');
   }
 
   /// Single path segment only; normalizes mixed slashes before validation.

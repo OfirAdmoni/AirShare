@@ -2,11 +2,14 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import 'package:air_share/connection_logger.dart';
 import 'package:air_share/file_zone_session.dart';
@@ -99,12 +102,24 @@ class _FileListScreenState extends State<FileListScreen> {
   String? _localPeerId;
   String _localDisplayName = 'You';
   List<_StagedFile> _selectedFiles = [];
+
+  // Download state
   bool isDownloading = false;
   double downloadProgress = 0;
   String? downloadingFileName;
+  bool _downloadCompleted = false;
+  int _batchDownloadTotal = 0;
+  int _batchDownloadCompleted = 0;
+
+  // Upload state
   bool isUploading = false;
   double uploadProgress = 0;
   String? uploadingFileName;
+
+  // Selection state
+  final Set<String> _selectedForDownload = {};
+  bool _selectionMode = false;
+
   StreamSubscription<String>? _ingressSubscription;
   StreamSubscription<void>? _guestConnectedSub;
   StreamSubscription<String>? _guestJoinedSub;
@@ -123,7 +138,6 @@ class _FileListScreenState extends State<FileListScreen> {
   bool _screenTeardownRan = false;
   int _consecutiveHostErrors = 0;
   bool _hostDisconnectShown = false;
-  bool _downloadCompleted = false;
 
   bool get _isTransferActive => isDownloading || isUploading;
 
@@ -159,7 +173,6 @@ class _FileListScreenState extends State<FileListScreen> {
           }
         }
         if (!mounted) return;
-        // Guest-side change detection: compare against previous snapshot.
         if (!silent && _initialFetchDone && !widget.isHubMode) {
           _notifyFileListChanges(_previousFiles, parsed);
         }
@@ -323,34 +336,74 @@ class _FileListScreenState extends State<FileListScreen> {
     }
   }
 
-  // ── Download ──────────────────────────────────────────────────────────────
+  // ── Download directory resolution ─────────────────────────────────────────
 
-  Future<Directory> _resolveDownloadDirectory() async {
-    if (Platform.isAndroid) {
-      final appDir = await getExternalStorageDirectory();
-      final base = appDir ?? await getApplicationDocumentsDirectory();
-      final receivedDir = Directory(p.join(base.path, 'AirShare', 'Received'));
-      if (!await receivedDir.exists()) {
-        await receivedDir.create(recursive: true);
+  Future<void> _requestAndroidStoragePermission() async {
+    if (!Platform.isAndroid) return;
+    try {
+      final info = await DeviceInfoPlugin().androidInfo;
+      // WRITE_EXTERNAL_STORAGE is only meaningful on API ≤ 32 (Android 12)
+      if (info.version.sdkInt <= 32) {
+        final status = await Permission.storage.status;
+        if (status.isDenied) await Permission.storage.request();
       }
-      return receivedDir;
+    } catch (_) {
+      // Graceful fallback — proceed and let file write fail if needed
     }
-    // Sandbox-safe: never write directly to ~/Downloads on macOS/Windows without entitlement.
-    final docs = await getApplicationDocumentsDirectory();
-    final receivedDir = Directory(p.join(docs.path, 'AirShare', 'Received'));
-    if (!await receivedDir.exists()) {
-      await receivedDir.create(recursive: true);
-    }
-    return receivedDir;
   }
 
-  Future<void> downloadFile(String fileName) async {
-    setState(() {
-      isDownloading = true;
-      downloadProgress = 0;
-      downloadingFileName = fileName;
-    });
+  // Returns (directory to save into, user-friendly path label for snackbar).
+  Future<(Directory, String)> _resolveDownloadDirectory() async {
+    if (Platform.isAndroid) {
+      await _requestAndroidStoragePermission();
+      try {
+        final ext = await getExternalStorageDirectory();
+        if (ext != null) {
+          // path_provider returns .../Android/data/<pkg>/files — walk up 4 levels
+          // to reach the device's primary external storage root (/storage/emulated/0)
+          Directory root = ext;
+          for (int i = 0; i < 4; i++) {
+            root = root.parent;
+          }
+          final dir = Directory(p.join(root.path, 'Download', 'AirShare'));
+          await dir.create(recursive: true);
+          // Smoke-test write access before committing to this path
+          final probe = File(p.join(dir.path, '.airshare_probe'));
+          await probe.writeAsString('ok');
+          await probe.delete();
+          return (dir, 'Downloads/AirShare');
+        }
+      } catch (_) {
+        // Android 11+ scoped storage may block direct access; fall through
+      }
+      // Fallback: app-specific external storage (always writable, visible in Files app)
+      final fallback = (await getExternalStorageDirectory()) ??
+          (await getApplicationDocumentsDirectory());
+      final dir = Directory(p.join(fallback.path, 'AirShare'));
+      await dir.create(recursive: true);
+      return (dir, 'AirShare (Phone Storage)');
 
+    } else if (Platform.isWindows) {
+      final dl = await getDownloadsDirectory();
+      final base = dl ?? await getApplicationDocumentsDirectory();
+      final dir = Directory(p.join(base.path, 'AirShare'));
+      await dir.create(recursive: true);
+      return (dir, 'Downloads\\AirShare');
+
+    } else {
+      // iOS / macOS / Linux
+      final docs = await getApplicationDocumentsDirectory();
+      final dir = Directory(p.join(docs.path, 'AirShare'));
+      await dir.create(recursive: true);
+      return (dir, 'Documents/AirShare');
+    }
+  }
+
+  // ── Download: core HTTP fetch + file write ────────────────────────────────
+
+  // Returns the absolute path of the saved file, or null on error.
+  // Caller is responsible for managing isDownloading / UI state around this.
+  Future<String?> _fetchAndSave(String fileName, Directory targetDir) async {
     final client = http.Client();
     _activeDownloadClient = client;
     IOSink? sink;
@@ -363,6 +416,7 @@ class _FileListScreenState extends State<FileListScreen> {
         'Download start',
         details: 'url=$uri platform=${Platform.operatingSystem}',
       );
+
       final request = http.Request('GET', uri);
       final response = await client
           .send(request)
@@ -371,8 +425,7 @@ class _FileListScreenState extends State<FileListScreen> {
       await ConnectionLogger.instance.log(
         'Download response',
         details:
-            'status=${response.statusCode} content_length=${response.contentLength} '
-            'content_type=${response.headers['content-type']}',
+            'status=${response.statusCode} content_length=${response.contentLength}',
       );
 
       if (response.statusCode != HttpStatus.ok) {
@@ -384,7 +437,6 @@ class _FileListScreenState extends State<FileListScreen> {
         );
       }
 
-      final targetDir = await _resolveDownloadDirectory();
       final outputFile = File(p.join(targetDir.path, fileName));
       _activeDownloadPath = outputFile.path;
       sink = outputFile.openWrite();
@@ -397,12 +449,17 @@ class _FileListScreenState extends State<FileListScreen> {
       )) {
         sink.add(chunk);
         receivedBytes += chunk.length;
-        if (mounted) {
-          if (totalBytes != null && totalBytes > 0) {
-            setState(() => downloadProgress = receivedBytes / totalBytes);
-          } else if (receivedBytes > 0) {
-            setState(() => downloadProgress = 0.5);
-          }
+        if (mounted && totalBytes != null && totalBytes > 0) {
+          final fileProgress = receivedBytes / totalBytes;
+          setState(() {
+            if (_batchDownloadTotal > 1) {
+              // Smooth overall batch progress blending file-level byte progress
+              downloadProgress =
+                  (_batchDownloadCompleted + fileProgress) / _batchDownloadTotal;
+            } else {
+              downloadProgress = fileProgress;
+            }
+          });
         }
       }
 
@@ -412,32 +469,23 @@ class _FileListScreenState extends State<FileListScreen> {
 
       await ConnectionLogger.instance.log(
         'Download success',
-        details:
-            'name=$fileName bytes=$receivedBytes path=${outputFile.path}',
+        details: 'name=$fileName bytes=$receivedBytes path=${outputFile.path}',
       );
 
-      if (mounted) {
-        setState(() {
-          downloadProgress = 1.0;
-          _downloadCompleted = true;
-        });
-        await Future.delayed(const Duration(milliseconds: 1500));
-      }
+      return outputFile.path;
 
-      if (!mounted) return;
-      _showEventSnackBar('Saved to: ${outputFile.path}');
     } on TimeoutException {
-      if (!mounted) return;
-      _showEventSnackBar(
-        'Download timed out. Check Wi‑Fi and try again.',
-      );
+      if (mounted) {
+        _showEventSnackBar('Download timed out. Check Wi‑Fi and try again.');
+      }
+      return null;
     } catch (e) {
       await ConnectionLogger.instance.log(
         'Download error',
         details: 'name=$fileName err=$e',
       );
-      if (!mounted) return;
-      _showEventSnackBar('Download error: $e');
+      if (mounted) _showEventSnackBar('Download error: $e');
+      return null;
     } finally {
       if (sink != null) {
         try {
@@ -459,16 +507,189 @@ class _FileListScreenState extends State<FileListScreen> {
       } else {
         _activeDownloadPath = null;
       }
+    }
+  }
 
+  // ── Download: single file (called from card "Save" button) ────────────────
+
+  Future<void> downloadFile(String fileName) async {
+    Directory targetDir;
+    String pathLabel;
+    try {
+      (targetDir, pathLabel) = await _resolveDownloadDirectory();
+    } catch (e) {
+      _showEventSnackBar('Cannot access storage: $e');
+      return;
+    }
+
+    setState(() {
+      isDownloading = true;
+      downloadProgress = 0;
+      downloadingFileName = fileName;
+      _batchDownloadTotal = 1;
+      _batchDownloadCompleted = 0;
+      _downloadCompleted = false;
+    });
+
+    final savedPath = await _fetchAndSave(fileName, targetDir);
+
+    if (mounted) {
+      if (savedPath != null) {
+        setState(() {
+          _downloadCompleted = true;
+          downloadProgress = 1.0;
+        });
+        await Future.delayed(const Duration(milliseconds: 1200));
+        if (mounted) _showDownloadSuccessSnackbar(fileName, savedPath, pathLabel);
+      }
+      setState(() {
+        isDownloading = false;
+        downloadProgress = 0;
+        downloadingFileName = null;
+        _batchDownloadTotal = 0;
+        _batchDownloadCompleted = 0;
+        _downloadCompleted = false;
+      });
+    }
+  }
+
+  // ── Download: batch (called from selection-mode "Download N files" button) ──
+
+  Future<void> _downloadSelected() async {
+    final toDownload = List<String>.from(_selectedForDownload);
+    _exitSelectionMode();
+    if (toDownload.isEmpty) return;
+
+    Directory targetDir;
+    String pathLabel;
+    try {
+      (targetDir, pathLabel) = await _resolveDownloadDirectory();
+    } catch (e) {
+      _showEventSnackBar('Cannot access storage: $e');
+      return;
+    }
+
+    setState(() {
+      isDownloading = true;
+      _batchDownloadTotal = toDownload.length;
+      _batchDownloadCompleted = 0;
+      downloadProgress = 0;
+      downloadingFileName = toDownload.first;
+      _downloadCompleted = false;
+    });
+
+    int successCount = 0;
+    for (int i = 0; i < toDownload.length; i++) {
+      if (!mounted || _teardownConfirmed) break;
+      setState(() {
+        downloadingFileName = toDownload[i];
+        _batchDownloadCompleted = i;
+      });
+      final savedPath = await _fetchAndSave(toDownload[i], targetDir);
+      if (savedPath != null) successCount++;
+      if (mounted) setState(() => _batchDownloadCompleted = i + 1);
+    }
+
+    if (mounted) {
+      setState(() {
+        _downloadCompleted = true;
+        downloadProgress = 1.0;
+      });
+      await Future.delayed(const Duration(milliseconds: 1200));
+      if (mounted) {
+        _showBatchSuccessSnackbar(successCount, toDownload.length, pathLabel);
+      }
       if (mounted) {
         setState(() {
           isDownloading = false;
           downloadProgress = 0;
           downloadingFileName = null;
+          _batchDownloadTotal = 0;
+          _batchDownloadCompleted = 0;
           _downloadCompleted = false;
         });
       }
     }
+  }
+
+  // ── Download: success snackbars ───────────────────────────────────────────
+
+  void _showDownloadSuccessSnackbar(
+    String fileName,
+    String savedPath,
+    String pathLabel,
+  ) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Completed! Saved to $pathLabel',
+          style: const TextStyle(color: Colors.white),
+        ),
+        backgroundColor: Colors.green.shade600,
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 8),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        action: SnackBarAction(
+          label: 'Open',
+          textColor: Colors.white,
+          onPressed: () => OpenFilex.open(savedPath),
+        ),
+      ),
+    );
+  }
+
+  void _showBatchSuccessSnackbar(int success, int total, String pathLabel) {
+    if (!mounted) return;
+    final label = success == total
+        ? 'Downloaded $total file${total == 1 ? "" : "s"} to $pathLabel'
+        : '$success of $total files downloaded to $pathLabel';
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(label, style: const TextStyle(color: Colors.white)),
+        backgroundColor: success == total
+            ? Colors.green.shade600
+            : Colors.orange.shade700,
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 6),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    );
+  }
+
+  // ── Selection mode helpers ────────────────────────────────────────────────
+
+  void _enterSelectionMode([String? firstFile]) {
+    setState(() {
+      _selectionMode = true;
+      _selectedForDownload.clear();
+      if (firstFile != null) _selectedForDownload.add(firstFile);
+    });
+  }
+
+  void _exitSelectionMode() {
+    setState(() {
+      _selectionMode = false;
+      _selectedForDownload.clear();
+    });
+  }
+
+  void _toggleSelection(String fileName) {
+    setState(() {
+      if (_selectedForDownload.contains(fileName)) {
+        _selectedForDownload.remove(fileName);
+      } else {
+        _selectedForDownload.add(fileName);
+      }
+    });
+  }
+
+  void _selectAll() {
+    setState(() {
+      _selectedForDownload
+        ..clear()
+        ..addAll(files.map((f) => f.name));
+    });
   }
 
   // ── Upload ────────────────────────────────────────────────────────────────
@@ -704,9 +925,7 @@ class _FileListScreenState extends State<FileListScreen> {
             final fileName = event['fileName'] as String? ?? 'a file';
             _showEventSnackBar('"$fileName" was removed from the session');
           }
-        } catch (_) {
-          // Legacy plain-string event — ignore, UI still refreshed above.
-        }
+        } catch (_) {}
       });
 
       _guestConnectedSub =
@@ -990,6 +1209,27 @@ class _FileListScreenState extends State<FileListScreen> {
   // ── Download overlay ──────────────────────────────────────────────────────
 
   Widget _buildDownloadOverlay() {
+    final isBatch = _batchDownloadTotal > 1;
+    final String topLabel;
+    final String fileNameLabel;
+    final String percentLabel;
+
+    if (_downloadCompleted) {
+      topLabel = isBatch
+          ? 'Completed! ✓  $_batchDownloadCompleted of $_batchDownloadTotal'
+          : 'Completed! ✓';
+      fileNameLabel = isBatch ? '$_batchDownloadCompleted files saved' : (downloadingFileName ?? 'file');
+      percentLabel = '100%';
+    } else if (isBatch) {
+      topLabel = 'Downloading ${_batchDownloadCompleted + 1} of $_batchDownloadTotal';
+      fileNameLabel = downloadingFileName ?? 'file';
+      percentLabel = '${(downloadProgress * 100).toInt()}%';
+    } else {
+      topLabel = 'Downloading';
+      fileNameLabel = downloadingFileName ?? 'file';
+      percentLabel = '${(downloadProgress * 100).toInt()}%';
+    }
+
     return Material(
       elevation: 10,
       borderRadius: BorderRadius.circular(20),
@@ -1020,7 +1260,7 @@ class _FileListScreenState extends State<FileListScreen> {
                   child: Icon(
                     _downloadCompleted
                         ? Icons.check_circle_outline
-                        : Icons.download_outlined,
+                        : (isBatch ? Icons.download_for_offline_outlined : Icons.download_outlined),
                     size: 20,
                     color: Colors.white,
                   ),
@@ -1031,7 +1271,7 @@ class _FileListScreenState extends State<FileListScreen> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        _downloadCompleted ? 'Completed! ✓' : 'Downloading',
+                        topLabel,
                         style: TextStyle(
                           color: _downloadCompleted
                               ? const Color(0xFF86EFAC)
@@ -1041,7 +1281,7 @@ class _FileListScreenState extends State<FileListScreen> {
                         ),
                       ),
                       Text(
-                        downloadingFileName ?? 'file',
+                        fileNameLabel,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -1054,7 +1294,7 @@ class _FileListScreenState extends State<FileListScreen> {
                   ),
                 ),
                 Text(
-                  '${_downloadCompleted ? 100 : (downloadProgress * 100).toInt()}%',
+                  percentLabel,
                   style: const TextStyle(
                     color: Colors.white,
                     fontWeight: FontWeight.w700,
@@ -1134,14 +1374,19 @@ class _FileListScreenState extends State<FileListScreen> {
           itemCount: files.length,
           itemBuilder: (context, index) {
             final entry = files[index];
+            final isSelected = _selectedForDownload.contains(entry.name);
             return _FileCard(
               entry: entry,
-              canDelete: _canDelete(entry),
+              canDelete: _canDelete(entry) && !_selectionMode,
               senderLabel: _senderLabel(entry),
               sizeLabel: _formatFileSize(entry.sizeBytes),
               timeLabel: _formatTime(entry.sharedAt),
+              isSelected: isSelected,
+              isSelectionMode: _selectionMode,
               onDownload: () => downloadFile(entry.name),
               onDelete: () => _confirmAndDelete(entry),
+              onToggleSelect: () => _toggleSelection(entry.name),
+              onEnterSelectionMode: () => _enterSelectionMode(entry.name),
             );
           },
         );
@@ -1156,33 +1401,115 @@ class _FileListScreenState extends State<FileListScreen> {
     final cs = Theme.of(context).colorScheme;
     final tt = Theme.of(context).textTheme;
 
+    final appBar = _selectionMode
+        ? AppBar(
+            backgroundColor: const Color(0xFFDBEAFE),
+            foregroundColor: const Color(0xFF0A2463),
+            elevation: 0,
+            leading: IconButton(
+              icon: const Icon(Icons.close),
+              onPressed: _exitSelectionMode,
+              tooltip: 'Cancel selection',
+            ),
+            title: Text(
+              '${_selectedForDownload.length} Selected',
+              style: const TextStyle(
+                color: Color(0xFF0A2463),
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: _selectAll,
+                child: const Text(
+                  'Select All',
+                  style: TextStyle(
+                    color: Color(0xFF2563EB),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          )
+        : AppBar(
+            title: Text(
+              widget.modeTitle,
+              style: tt.titleLarge?.copyWith(fontWeight: FontWeight.w700),
+            ),
+            actions: [
+              if (files.isNotEmpty)
+                IconButton(
+                  icon: const Icon(Icons.checklist_outlined),
+                  tooltip: 'Select files',
+                  onPressed: _enterSelectionMode,
+                ),
+            ],
+            bottom: PreferredSize(
+              preferredSize: const Size.fromHeight(1),
+              child: Divider(height: 1, color: cs.outlineVariant),
+            ),
+          );
+
+    final selectionBottomBar = (_selectionMode && _selectedForDownload.isNotEmpty)
+        ? Container(
+            padding: EdgeInsets.fromLTRB(
+              16,
+              12,
+              16,
+              12 + MediaQuery.of(context).padding.bottom,
+            ),
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [Color(0xFF1E3A8A), Color(0xFF2563EB)],
+              ),
+            ),
+            child: FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.white,
+                foregroundColor: const Color(0xFF1E3A8A),
+                minimumSize: const Size.fromHeight(48),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              onPressed: isDownloading ? null : _downloadSelected,
+              icon: const Icon(Icons.download_outlined),
+              label: Text(
+                'Download ${_selectedForDownload.length} '
+                'file${_selectedForDownload.length == 1 ? "" : "s"}',
+                style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15),
+              ),
+            ),
+          )
+        : null;
+
     return PopScope(
-      canPop: !_isTransferActive,
+      canPop: !_isTransferActive && !_selectionMode,
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop) {
-          _showCancelDialog();
+          if (_selectionMode) {
+            _exitSelectionMode();
+          } else {
+            _showCancelDialog();
+          }
         } else {
           _screenTeardownRan = true;
         }
       },
       child: Scaffold(
-        appBar: AppBar(
-          title: Text(
-            widget.modeTitle,
-            style: tt.titleLarge?.copyWith(fontWeight: FontWeight.w700),
-          ),
-          bottom: PreferredSize(
-            preferredSize: const Size.fromHeight(1),
-            child: Divider(height: 1, color: cs.outlineVariant),
-          ),
-        ),
-        floatingActionButton: FloatingActionButton.extended(
-          onPressed: isUploading ? null : pickAndUploadFile,
-          backgroundColor: const Color(0xFF1E40AF),
-          foregroundColor: Colors.white,
-          icon: const Icon(Icons.upload_file),
-          label: const Text('Upload'),
-        ),
+        appBar: appBar,
+        bottomNavigationBar: selectionBottomBar,
+        floatingActionButton: _selectionMode
+            ? null
+            : FloatingActionButton.extended(
+                onPressed: isUploading ? null : pickAndUploadFile,
+                backgroundColor: const Color(0xFF1E40AF),
+                foregroundColor: Colors.white,
+                icon: const Icon(Icons.upload_file),
+                label: const Text('Upload'),
+              ),
         body: Column(
           children: [
             // Staged files preview
@@ -1347,11 +1674,34 @@ class _FileListScreenState extends State<FileListScreen> {
                 },
               ),
 
-            // Download progress
+            // Download progress overlay
             if (isDownloading)
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
                 child: _buildDownloadOverlay(),
+              ),
+
+            // Selection mode hint
+            if (_selectionMode && _selectedForDownload.isEmpty)
+              Material(
+                color: const Color(0xFFEFF6FF),
+                child: Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.info_outline,
+                          size: 16, color: Color(0xFF2563EB)),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Tap files to select them for download',
+                        style: tt.bodySmall?.copyWith(
+                          color: const Color(0xFF0A2463),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ),
 
             // File grid
@@ -1374,6 +1724,10 @@ class _FileCard extends StatelessWidget {
     required this.timeLabel,
     required this.onDownload,
     required this.onDelete,
+    required this.onToggleSelect,
+    required this.onEnterSelectionMode,
+    this.isSelected = false,
+    this.isSelectionMode = false,
   });
 
   final SharedFileEntry entry;
@@ -1383,6 +1737,10 @@ class _FileCard extends StatelessWidget {
   final String timeLabel;
   final VoidCallback onDownload;
   final VoidCallback onDelete;
+  final VoidCallback onToggleSelect;
+  final VoidCallback onEnterSelectionMode;
+  final bool isSelected;
+  final bool isSelectionMode;
 
   @override
   Widget build(BuildContext context) {
@@ -1391,113 +1749,191 @@ class _FileCard extends StatelessWidget {
     final accent = _fileTypeColor(entry.name);
     final icon = _fileTypeIcon(entry.name);
 
-    return Card(
-      elevation: 1,
-      shadowColor: accent.withValues(alpha: 0.25),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+    Widget card = Card(
+      elevation: isSelected ? 3 : 1,
+      shadowColor: isSelected
+          ? const Color(0xFF2563EB).withValues(alpha: 0.4)
+          : accent.withValues(alpha: 0.25),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: isSelected
+            ? const BorderSide(color: Color(0xFF2563EB), width: 2)
+            : BorderSide.none,
+      ),
       clipBehavior: Clip.antiAlias,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
+      child: Stack(
         children: [
-          // Coloured icon header
-          Container(
-            height: 88,
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-                colors: [
-                  accent.withValues(alpha: 0.15),
-                  accent.withValues(alpha: 0.08),
-                ],
-              ),
-            ),
-            child: Center(
-              child: Container(
-                width: 52,
-                height: 52,
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Coloured icon header
+              Container(
+                height: 88,
                 decoration: BoxDecoration(
-                  color: accent.withValues(alpha: 0.18),
-                  borderRadius: BorderRadius.circular(14),
-                ),
-                child: Icon(icon, size: 28, color: accent),
-              ),
-            ),
-          ),
-
-          // Metadata
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(10, 8, 10, 0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    entry.name,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: tt.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.w600,
-                      height: 1.3,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    senderLabel,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: tt.labelSmall?.copyWith(
-                      color: cs.onSurfaceVariant,
-                    ),
-                  ),
-                  const Spacer(),
-                  Text(
-                    '$sizeLabel · $timeLabel',
-                    style: tt.labelSmall?.copyWith(
-                      color: cs.outline,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                ],
-              ),
-            ),
-          ),
-
-          // Action row
-          Padding(
-            padding: const EdgeInsets.fromLTRB(6, 0, 6, 6),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextButton.icon(
-                    style: TextButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 4),
-                      foregroundColor: accent,
-                    ),
-                    onPressed: onDownload,
-                    icon: const Icon(Icons.download_outlined, size: 16),
-                    label: const Text('Save'),
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      accent.withValues(alpha: 0.15),
+                      accent.withValues(alpha: 0.08),
+                    ],
                   ),
                 ),
-                if (canDelete) ...[
-                  const SizedBox(width: 2),
-                  IconButton(
-                    tooltip: 'Delete',
-                    icon: Icon(
-                      Icons.delete_outline,
-                      size: 18,
-                      color: cs.error,
+                child: Center(
+                  child: Container(
+                    width: 52,
+                    height: 52,
+                    decoration: BoxDecoration(
+                      color: accent.withValues(alpha: 0.18),
+                      borderRadius: BorderRadius.circular(14),
                     ),
-                    padding: const EdgeInsets.all(6),
-                    constraints: const BoxConstraints(),
-                    onPressed: onDelete,
+                    child: Icon(icon, size: 28, color: accent),
                   ),
-                ],
-              ],
-            ),
+                ),
+              ),
+
+              // Metadata
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(10, 8, 10, 0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        entry.name,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: tt.bodyMedium?.copyWith(
+                          fontWeight: FontWeight.w600,
+                          height: 1.3,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        senderLabel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: tt.labelSmall?.copyWith(
+                          color: cs.onSurfaceVariant,
+                        ),
+                      ),
+                      const Spacer(),
+                      Text(
+                        '$sizeLabel · $timeLabel',
+                        style: tt.labelSmall?.copyWith(
+                          color: cs.outline,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                    ],
+                  ),
+                ),
+              ),
+
+              // Action row (hidden in selection mode)
+              if (!isSelectionMode)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(6, 0, 6, 6),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: TextButton.icon(
+                          style: TextButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(vertical: 4),
+                            foregroundColor: accent,
+                          ),
+                          onPressed: onDownload,
+                          icon: const Icon(Icons.download_outlined, size: 16),
+                          label: const Text('Save'),
+                        ),
+                      ),
+                      if (canDelete) ...[
+                        const SizedBox(width: 2),
+                        IconButton(
+                          tooltip: 'Delete',
+                          icon: Icon(
+                            Icons.delete_outline,
+                            size: 18,
+                            color: cs.error,
+                          ),
+                          padding: const EdgeInsets.all(6),
+                          constraints: const BoxConstraints(),
+                          onPressed: onDelete,
+                        ),
+                      ],
+                    ],
+                  ),
+                )
+              else
+                // In selection mode: show a small hint row at the bottom
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(10, 4, 10, 8),
+                  child: Text(
+                    isSelected ? 'Selected' : 'Tap to select',
+                    style: tt.labelSmall?.copyWith(
+                      color: isSelected
+                          ? const Color(0xFF2563EB)
+                          : cs.onSurfaceVariant,
+                      fontWeight: isSelected
+                          ? FontWeight.w600
+                          : FontWeight.normal,
+                    ),
+                  ),
+                ),
+            ],
           ),
+
+          // Blue tint overlay when selected
+          if (isSelected)
+            Positioned.fill(
+              child: Container(
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(16),
+                  color: const Color(0xFF2563EB).withValues(alpha: 0.07),
+                ),
+              ),
+            ),
+
+          // Selection indicator circle (top-right)
+          if (isSelectionMode)
+            Positioned(
+              top: 8,
+              right: 8,
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 180),
+                width: 24,
+                height: 24,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: isSelected
+                      ? const Color(0xFF2563EB)
+                      : Colors.white.withValues(alpha: 0.9),
+                  border: Border.all(
+                    color: isSelected
+                        ? const Color(0xFF2563EB)
+                        : Colors.grey.shade400,
+                    width: 2,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.12),
+                      blurRadius: 4,
+                    ),
+                  ],
+                ),
+                child: isSelected
+                    ? const Icon(Icons.check, size: 14, color: Colors.white)
+                    : null,
+              ),
+            ),
         ],
       ),
+    );
+
+    return GestureDetector(
+      onTap: isSelectionMode ? onToggleSelect : null,
+      onLongPress: isSelectionMode ? null : onEnterSelectionMode,
+      child: card,
     );
   }
 }
