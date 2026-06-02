@@ -1462,12 +1462,6 @@ class _FileListScreenState extends State<FileListScreen> {
 
   // ── Grid content ──────────────────────────────────────────────────────────
 
-  int _columnCount(double width) {
-    if (width >= 900) return 4;
-    if (width >= 600) return 3;
-    return 2;
-  }
-
   Widget _buildGrid() {
     if (files.isEmpty) {
       return Center(
@@ -1499,35 +1493,30 @@ class _FileListScreenState extends State<FileListScreen> {
       );
     }
 
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final cols = _columnCount(constraints.maxWidth);
-        return GridView.builder(
-          padding: const EdgeInsets.all(12),
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: cols,
-            crossAxisSpacing: 10,
-            mainAxisSpacing: 10,
-            childAspectRatio: 0.78,
-          ),
-          itemCount: files.length,
-          itemBuilder: (context, index) {
-            final entry = files[index];
-            final isSelected = _selectedForDownload.contains(entry.name);
-            return _FileCard(
-              entry: entry,
-              canDelete: _canDelete(entry) && !_selectionMode,
-              senderLabel: _senderLabel(entry),
-              sizeLabel: _formatFileSize(entry.sizeBytes),
-              timeLabel: _formatTime(entry.sharedAt),
-              isSelected: isSelected,
-              isSelectionMode: _selectionMode,
-              onDownload: () => downloadFile(entry.name),
-              onDelete: () => _confirmAndDelete(entry),
-              onToggleSelect: () => _toggleSelection(entry.name),
-              onEnterSelectionMode: () => _enterSelectionMode(entry.name),
-            );
-          },
+    return GridView.builder(
+      padding: const EdgeInsets.all(10),
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 220,
+        crossAxisSpacing: 8,
+        mainAxisSpacing: 8,
+        childAspectRatio: 1.4,
+      ),
+      itemCount: files.length,
+      itemBuilder: (context, index) {
+        final entry = files[index];
+        final isSelected = _selectedForDownload.contains(entry.name);
+        return _FileCard(
+          entry: entry,
+          canDelete: _canDelete(entry) && !_selectionMode,
+          senderLabel: _senderLabel(entry),
+          sizeLabel: _formatFileSize(entry.sizeBytes),
+          timeLabel: _formatTime(entry.sharedAt),
+          isSelected: isSelected,
+          isSelectionMode: _selectionMode,
+          onDownload: () => downloadFile(entry.name),
+          onDelete: () => _confirmAndDelete(entry),
+          onToggleSelect: () => _toggleSelection(entry.name),
+          onEnterSelectionMode: () => _enterSelectionMode(entry.name),
         );
       },
     );
@@ -1883,7 +1872,6 @@ class _FileCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final tt = Theme.of(context).textTheme;
     final cs = Theme.of(context).colorScheme;
     final accent = _fileTypeColor(entry.name);
     final icon = _fileTypeIcon(entry.name);
@@ -1894,7 +1882,7 @@ class _FileCard extends StatelessWidget {
           ? const Color(0xFF2563EB).withValues(alpha: 0.4)
           : accent.withValues(alpha: 0.25),
       shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(14),
         side: isSelected
             ? const BorderSide(color: Color(0xFF2563EB), width: 2)
             : BorderSide.none,
@@ -1902,123 +1890,131 @@ class _FileCard extends StatelessWidget {
       clipBehavior: Clip.antiAlias,
       child: Stack(
         children: [
-          Column(
+          // ── Horizontal layout: left icon panel + right content ──────────
+          Row(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // Coloured icon header
+              // Left: accent-tinted icon strip (full card height)
               Container(
-                height: 88,
+                width: 54,
                 decoration: BoxDecoration(
                   gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
                     colors: [
-                      accent.withValues(alpha: 0.15),
-                      accent.withValues(alpha: 0.08),
+                      accent.withValues(alpha: 0.18),
+                      accent.withValues(alpha: 0.10),
                     ],
                   ),
                 ),
                 child: Center(
                   child: Container(
-                    width: 52,
-                    height: 52,
+                    width: 36,
+                    height: 36,
                     decoration: BoxDecoration(
-                      color: accent.withValues(alpha: 0.18),
-                      borderRadius: BorderRadius.circular(14),
+                      color: accent.withValues(alpha: 0.22),
+                      borderRadius: BorderRadius.circular(10),
                     ),
-                    child: Icon(icon, size: 28, color: accent),
+                    child: Icon(icon, size: 20, color: accent),
                   ),
                 ),
               ),
 
-              // Metadata
+              // Right: filename, meta, action — centered vertically,
+              // no Spacer/Expanded so height is driven by the grid ratio alone.
               Expanded(
                 child: Padding(
-                  padding: const EdgeInsets.fromLTRB(10, 8, 10, 0),
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 8),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Text(
                         entry.name,
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
-                        style: tt.bodyMedium?.copyWith(
+                        style: const TextStyle(
+                          fontSize: 13,
                           fontWeight: FontWeight.w600,
-                          height: 1.3,
+                          height: 1.2,
                         ),
                       ),
-                      const SizedBox(height: 4),
+                      const SizedBox(height: 2),
                       Text(
                         senderLabel,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: tt.labelSmall?.copyWith(
+                        style: TextStyle(
+                          fontSize: 11,
                           color: cs.onSurfaceVariant,
                         ),
                       ),
-                      const Spacer(),
+                      const SizedBox(height: 1),
                       Text(
                         '$sizeLabel · $timeLabel',
-                        style: tt.labelSmall?.copyWith(
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 10,
                           color: cs.outline,
                         ),
                       ),
-                      const SizedBox(height: 2),
+                      const SizedBox(height: 5),
+                      if (!isSelectionMode)
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextButton.icon(
+                                style: TextButton.styleFrom(
+                                  padding: EdgeInsets.zero,
+                                  minimumSize: Size.zero,
+                                  tapTargetSize:
+                                      MaterialTapTargetSize.shrinkWrap,
+                                  foregroundColor: accent,
+                                ),
+                                onPressed: onDownload,
+                                icon: const Icon(
+                                    Icons.download_outlined,
+                                    size: 13),
+                                label: const Text(
+                                  'Save',
+                                  style: TextStyle(fontSize: 11),
+                                ),
+                              ),
+                            ),
+                            if (canDelete)
+                              InkWell(
+                                onTap: onDelete,
+                                borderRadius: BorderRadius.circular(4),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(3),
+                                  child: Icon(
+                                    Icons.delete_outline,
+                                    size: 15,
+                                    color: cs.error,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        )
+                      else
+                        Text(
+                          isSelected ? 'Selected' : 'Tap to select',
+                          style: TextStyle(
+                            fontSize: 10,
+                            color: isSelected
+                                ? const Color(0xFF2563EB)
+                                : cs.onSurfaceVariant,
+                            fontWeight: isSelected
+                                ? FontWeight.w600
+                                : FontWeight.normal,
+                          ),
+                        ),
                     ],
                   ),
                 ),
               ),
-
-              // Action row (hidden in selection mode)
-              if (!isSelectionMode)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(6, 0, 6, 6),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: TextButton.icon(
-                          style: TextButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(vertical: 4),
-                            foregroundColor: accent,
-                          ),
-                          onPressed: onDownload,
-                          icon: const Icon(Icons.download_outlined, size: 16),
-                          label: const Text('Save'),
-                        ),
-                      ),
-                      if (canDelete) ...[
-                        const SizedBox(width: 2),
-                        IconButton(
-                          tooltip: 'Delete',
-                          icon: Icon(
-                            Icons.delete_outline,
-                            size: 18,
-                            color: cs.error,
-                          ),
-                          padding: const EdgeInsets.all(6),
-                          constraints: const BoxConstraints(),
-                          onPressed: onDelete,
-                        ),
-                      ],
-                    ],
-                  ),
-                )
-              else
-                // In selection mode: show a small hint row at the bottom
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(10, 4, 10, 8),
-                  child: Text(
-                    isSelected ? 'Selected' : 'Tap to select',
-                    style: tt.labelSmall?.copyWith(
-                      color: isSelected
-                          ? const Color(0xFF2563EB)
-                          : cs.onSurfaceVariant,
-                      fontWeight: isSelected
-                          ? FontWeight.w600
-                          : FontWeight.normal,
-                    ),
-                  ),
-                ),
             ],
           ),
 
@@ -2027,21 +2023,21 @@ class _FileCard extends StatelessWidget {
             Positioned.fill(
               child: Container(
                 decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(16),
+                  borderRadius: BorderRadius.circular(14),
                   color: const Color(0xFF2563EB).withValues(alpha: 0.07),
                 ),
               ),
             ),
 
-          // Selection indicator circle (top-right)
+          // Selection indicator circle (top-right corner)
           if (isSelectionMode)
             Positioned(
-              top: 8,
-              right: 8,
+              top: 6,
+              right: 6,
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 180),
-                width: 24,
-                height: 24,
+                width: 22,
+                height: 22,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
                   color: isSelected
@@ -2061,7 +2057,7 @@ class _FileCard extends StatelessWidget {
                   ],
                 ),
                 child: isSelected
-                    ? const Icon(Icons.check, size: 14, color: Colors.white)
+                    ? const Icon(Icons.check, size: 13, color: Colors.white)
                     : null,
               ),
             ),
