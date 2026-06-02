@@ -1009,6 +1009,92 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
     }
   }
 
+  // ── AP-Isolation help dialog ─────────────────────────────────────────────
+
+  void _showApIsolationHelp() {
+    if (!mounted) return;
+    final isMobile = Platform.isAndroid || Platform.isIOS;
+
+    // Inline bullet builder — avoids a separate private widget class.
+    Widget bullet(String text) => Padding(
+          padding: const EdgeInsets.only(bottom: 4),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('• ',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFF0A2463))),
+              Expanded(child: Text(text)),
+            ],
+          ),
+        );
+
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Trouble Connecting?'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Public Wi-Fi networks (campus, café, hotel) often block '
+              'direct connections between devices — this is called '
+              'AP Isolation.',
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'How to fix it:',
+              style: TextStyle(
+                  fontWeight: FontWeight.w600,
+                  color: Color(0xFF0A2463)),
+            ),
+            const SizedBox(height: 8),
+            if (isMobile) ...[
+              bullet(
+                  'Ask the Host to enable their Mobile Hotspot in Settings.'),
+              bullet('Connect this device to that hotspot.'),
+              bullet('Return to AirShare and try joining again.'),
+            ] else ...[
+              bullet(
+                  'Ask the Host (or any nearby phone) to enable their Mobile Hotspot.'),
+              bullet(
+                  'Connect this computer to that hotspot via Wi-Fi settings.'),
+              bullet('Return to AirShare and try joining again.'),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor:
+                  const Color(0xFF0A2463).withValues(alpha: 0.55),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Got it'),
+          ),
+          if (isMobile)
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFF2563EB),
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: () async {
+                Navigator.of(ctx).pop();
+                try {
+                  await WlanLinkManager.instance.openWirelessSettings();
+                } catch (_) {}
+              },
+              child: const Text('Open Wi-Fi Settings'),
+            ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _lockUiForConnection() async {
     _pauseDiscoverySideEffects();
     _setPhase(
@@ -1124,19 +1210,23 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
         );
       }
       if (!mounted) return;
-      final message = e is PlatformException
-          ? '${e.code}: ${e.message ?? e.details ?? "unknown"}'
-          : e.toString();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            wasHandshaking
-                ? 'Secure handshake failed: $message'
-                : 'Connection failed: $message',
+      if (!wasHandshaking) {
+        // BLE handshake succeeded but TCP failed — a successful handshake
+        // proves the Host exists, so a TCP failure almost always means AP
+        // Isolation. Show the targeted help dialog instead of a raw error.
+        _showApIsolationHelp();
+      } else {
+        final message = e is PlatformException
+            ? '${e.code}: ${e.message ?? e.details ?? "unknown"}'
+            : e.toString();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Secure handshake failed: $message'),
+            backgroundColor: const Color(0xFFDC2626),
+            duration: const Duration(seconds: 8),
           ),
-          duration: const Duration(seconds: 8),
-        ),
-      );
+        );
+      }
     } finally {
       if (!_leavingForMainMenu &&
           mounted &&
@@ -1253,6 +1343,20 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
                         );
                       },
                     ),
+            ),
+            // Proactive help footer — always visible, zero false positives.
+            const SizedBox(height: 4),
+            Center(
+              child: TextButton.icon(
+                onPressed: _showApIsolationHelp,
+                icon: const Icon(Icons.wifi_off_outlined, size: 15),
+                label: const Text('On public Wi-Fi? Tap for help'),
+                style: TextButton.styleFrom(
+                  foregroundColor:
+                      const Color(0xFF0A2463).withValues(alpha: 0.55),
+                  textStyle: const TextStyle(fontSize: 12),
+                ),
+              ),
             ),
           ],
         ),

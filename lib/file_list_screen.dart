@@ -18,6 +18,7 @@ import 'package:air_share/local_hub_runtime.dart';
 import 'package:air_share/local_peer_identity.dart';
 import 'package:air_share/session_teardown.dart';
 import 'package:air_share/shared_file_entry.dart';
+import 'package:air_share/wlan_link_manager.dart';
 
 // ── File-type helpers ────────────────────────────────────────────────────────
 
@@ -1237,6 +1238,91 @@ class _FileListScreenState extends State<FileListScreen> {
     if (mounted) Navigator.of(context).pop();
   }
 
+  // ── AP-Isolation help dialog (Host side) ─────────────────────────────────
+
+  void _showHostApIsolationHelp() {
+    if (!mounted) return;
+    final isMobile = Platform.isAndroid || Platform.isIOS;
+
+    Widget bullet(String text) => Padding(
+          padding: const EdgeInsets.only(bottom: 4),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('• ',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFF0A2463))),
+              Expanded(child: Text(text)),
+            ],
+          ),
+        );
+
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Guests Can\'t Connect?'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'If a Guest is on public Wi-Fi (campus, café, hotel), '
+              'AP Isolation may be blocking their connection to this Hub.',
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'How to fix it:',
+              style: TextStyle(
+                  fontWeight: FontWeight.w600,
+                  color: Color(0xFF0A2463)),
+            ),
+            const SizedBox(height: 8),
+            if (isMobile) ...[
+              bullet('Enable this device\'s Mobile Hotspot in Settings.'),
+              bullet('Ask the Guest to connect to that hotspot.'),
+              bullet(
+                  'The Guest should then open AirShare and Join again.'),
+            ] else ...[
+              bullet(
+                  'Ask the Guest to enable their phone\'s Mobile Hotspot.'),
+              bullet(
+                  'Connect this computer to that hotspot via Wi-Fi settings.'),
+              bullet(
+                  'Both devices will then be on a private network without AP Isolation.'),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor:
+                  const Color(0xFF0A2463).withValues(alpha: 0.55),
+            ),
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Got it'),
+          ),
+          if (isMobile)
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFF2563EB),
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: () async {
+                Navigator.of(ctx).pop();
+                try {
+                  await WlanLinkManager.instance.openWirelessSettings();
+                } catch (_) {}
+              },
+              child: const Text('Open Wi-Fi Settings'),
+            ),
+        ],
+      ),
+    );
+  }
+
   Future<void> _postJoinNotification() async {
     try {
       // The hub blocks on /join until the host approves or declines (max 30 s).
@@ -1725,15 +1811,28 @@ class _FileListScreenState extends State<FileListScreen> {
                           color: Color(0xFFDC2626),
                         ),
                       const SizedBox(width: 12),
-                      Text(
-                        _guestConnectionTimedOut
-                            ? 'No participant connected after 2 min — still waiting'
-                            : 'Waiting for participants to connect…',
-                        style: tt.bodyMedium?.copyWith(
-                          color: _guestConnectionTimedOut
-                              ? const Color(0xFFDC2626)
-                              : const Color(0xFF0A2463),
+                      Expanded(
+                        child: Text(
+                          _guestConnectionTimedOut
+                              ? 'No participant connected after 2 min — still waiting'
+                              : 'Waiting for participants to connect…',
+                          style: tt.bodyMedium?.copyWith(
+                            color: _guestConnectionTimedOut
+                                ? const Color(0xFFDC2626)
+                                : const Color(0xFF0A2463),
+                          ),
                         ),
+                      ),
+                      IconButton(
+                        icon: const Icon(
+                          Icons.help_outline,
+                          size: 17,
+                          color: Color(0xFF2563EB),
+                        ),
+                        tooltip: 'Guests can\'t connect?',
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                        onPressed: _showHostApIsolationHelp,
                       ),
                     ],
                   ),
