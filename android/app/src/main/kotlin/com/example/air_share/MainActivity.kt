@@ -245,6 +245,12 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     "AirShareNative",
                     "Android | GATT | Sending Response:  (Length: 0)",
                 )
+                Log.i(
+                    "AirShareNative",
+                    "Approval | Ignored duplicate approval event | source=BLE " +
+                        "device=${device.address} pending=${pendingReadDevice?.address} " +
+                        "reason=handshake_read_while_pending",
+                )
                 if (!sent) {
                     Log.w("AirShareNative", "Android | GATT | sendResponse failed for empty pending payload")
                 }
@@ -261,12 +267,19 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             )
 
             val friendlyName = device.name ?: "Unknown Peer"
+            val attemptId = "ble-${System.currentTimeMillis()}"
+            Log.i(
+                "AirShareNative",
+                "Approval | Created new approval | source=BLE " +
+                    "key=ble:${device.address}|$attemptId name=$friendlyName",
+            )
             runOnUiThread {
                 bleUiChannel?.invokeMethod(
                     "notifyConnectionRequest",
                     mapOf(
                         "friendlyName" to friendlyName,
                         "deviceAddress" to device.address,
+                        "connectionAttemptId" to attemptId,
                     ),
                 )
             }

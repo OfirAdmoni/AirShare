@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:air_share/ble_transport.dart';
 import 'package:air_share/connection_logger.dart';
+import 'package:air_share/guest_approval_registry.dart';
 import 'package:air_share/onboarding_page.dart';
 import 'package:air_share/settings_page.dart';
 import 'package:air_share/discovery_page.dart';
@@ -63,13 +64,50 @@ class _AirShareAppState extends State<AirShareApp> {
       final args = call.arguments as Map<dynamic, dynamic>? ?? {};
       final friendlyName = (args['friendlyName'] ?? 'Unknown Device')
           .toString();
+      final deviceAddress = (args['deviceAddress'] ?? args['centralId'] ?? '')
+          .toString()
+          .trim();
+      final connectionAttemptId =
+          (args['connectionAttemptId'] ?? args['sessionId'] ?? '')
+              .toString()
+              .trim();
+
+      final begin = LocalHubRuntime.instance.beginBleGuestApproval(
+        bleDeviceId: deviceAddress.isEmpty ? friendlyName : deviceAddress,
+        displayName: friendlyName,
+        connectionAttemptId:
+            connectionAttemptId.isEmpty ? null : connectionAttemptId,
+      );
+
       await ConnectionLogger.instance.log(
         'Connection Request Prompted',
-        details: 'peer=$friendlyName',
+        details:
+            'peer=$friendlyName key=${begin.entry.key.value} kind=${begin.kind.name}',
       );
+
+      if (!begin.emitUiEvent) {
+        await ConnectionLogger.instance.log(
+          'BLE | Approval dialog suppressed (deduped)',
+          details:
+              'peer=$friendlyName key=${begin.entry.key.value} kind=${begin.kind.name}',
+        );
+        if (begin.kind == GuestApprovalOutcomeKind.alreadyApproved) {
+          LocalHubRuntime.instance.grantGuestHttpAccess(
+            reason: 'ble_already_approved key=${begin.entry.key.value}',
+          );
+          await BleTransport.instance.approveConnection(
+            approved: true,
+            lanIp: HubEndpointState.instance.rememberedLanIp.isNotEmpty
+                ? HubEndpointState.instance.rememberedLanIp
+                : (HubEndpointState.instance.pendingIp ?? ''),
+          );
+        }
+        return null;
+      }
+
       await ConnectionLogger.instance.log(
         'BLE | Approval dialog shown',
-        details: 'peer=$friendlyName',
+        details: 'peer=$friendlyName key=${begin.entry.key.value}',
       );
       if (!mounted) return null;
       final ctx = _navigatorKey.currentContext;
@@ -104,10 +142,15 @@ class _AirShareAppState extends State<AirShareApp> {
         ),
       );
       var lanForBle = '';
-      if (approved == true) {
-        LocalHubRuntime.instance.grantGuestHttpAccess(
-          reason: 'ble_approved peer=$friendlyName',
-        );
+      final didApprove = approved == true;
+      LocalHubRuntime.instance.resolveGuestApproval(
+        entry: begin.entry,
+        approved: didApprove,
+        reason: didApprove
+            ? 'ble_approved peer=$friendlyName'
+            : 'ble_declined peer=$friendlyName',
+      );
+      if (didApprove) {
         final hubState = HubEndpointState.instance;
         final pendingIp = hubState.pendingIp;
         final pendingPort = hubState.pendingPort;
@@ -117,7 +160,7 @@ class _AirShareAppState extends State<AirShareApp> {
         await ConnectionLogger.instance.log(
           'HS | Host | Approve tapped',
           details:
-              'pendingIp=${pendingIp ?? "(null)"} lan_ip=$lanForBle pendingPort=$pendingPort',
+              'pendingIp=${pendingIp ?? "(null)"} lan_ip=$lanForBle pendingPort=$pendingPort key=${begin.entry.key.value}',
         );
         if (lanForBle.isNotEmpty) {
           await BleTransport.instance.updateHubEndpoint(
@@ -143,18 +186,16 @@ class _AirShareAppState extends State<AirShareApp> {
             details: 'no LAN IP — handshake JSON may lack lan_ip',
           );
         }
-      } else {
-        LocalHubRuntime.instance.revokeGuestHttpAccess(
-          reason: 'ble_declined peer=$friendlyName',
-        );
       }
       await BleTransport.instance.approveConnection(
-        approved: approved == true,
+        approved: didApprove,
         lanIp: lanForBle,
       );
       await ConnectionLogger.instance.log(
         'Connection Request Decision',
-        details: approved == true ? 'approved' : 'declined',
+        details: didApprove
+            ? 'approved key=${begin.entry.key.value}'
+            : 'declined key=${begin.entry.key.value}',
       );
       return null;
     });
