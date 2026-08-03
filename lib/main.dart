@@ -51,6 +51,9 @@ class _AirShareAppState extends State<AirShareApp> {
   /// null = still loading; false = show onboarding; true = show home.
   bool? _onboardingDone;
 
+  /// Prevents stacking multiple BLE Connection Request dialogs.
+  bool _connectionRequestDialogOpen = false;
+
   @override
   void initState() {
     super.initState();
@@ -105,6 +108,15 @@ class _AirShareAppState extends State<AirShareApp> {
         return null;
       }
 
+      if (_connectionRequestDialogOpen) {
+        await ConnectionLogger.instance.log(
+          'Approval | Ignored duplicate approval event',
+          details:
+              'source=BLE reason=dialog_already_open key=${begin.entry.key.value}',
+        );
+        return null;
+      }
+
       await ConnectionLogger.instance.log(
         'BLE | Approval dialog shown',
         details: 'peer=$friendlyName key=${begin.entry.key.value}',
@@ -112,6 +124,7 @@ class _AirShareAppState extends State<AirShareApp> {
       if (!mounted) return null;
       final ctx = _navigatorKey.currentContext;
       if (ctx == null || !ctx.mounted) return null;
+      _connectionRequestDialogOpen = true;
       final approved = await showDialog<bool>(
         context: ctx,
         barrierDismissible: false,
@@ -141,6 +154,7 @@ class _AirShareAppState extends State<AirShareApp> {
           ],
         ),
       );
+      _connectionRequestDialogOpen = false;
       var lanForBle = '';
       final didApprove = approved == true;
       LocalHubRuntime.instance.resolveGuestApproval(

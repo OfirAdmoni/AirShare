@@ -155,6 +155,9 @@ class GuestApprovalRegistry {
   int get activeSessionCount =>
       _byKey.values.where((e) => e.sessionActive && e.isApproved).length;
 
+  /// True when any guest approval is still waiting on the host.
+  bool get hasPendingApproval => pendingCount > 0;
+
   int get entryCount => _byKey.length;
 
   Iterable<GuestApprovalEntry> get entries => _byKey.values;
@@ -239,28 +242,35 @@ class GuestApprovalRegistry {
       }
     }
 
-    // Cross-source bridge: HTTP/registration after BLE for the *same* attempt.
+    // Cross-source bridge: HTTP ↔ BLE for the same logical connection attempt.
     if (source == GuestApprovalSource.http ||
         source == GuestApprovalSource.registration ||
         source == GuestApprovalSource.polling) {
       final bridged = _findBleBridgeCandidate(displayName: displayName);
       if (bridged != null) {
-        _bindAlias(guestPeerId, bridged);
-        _bindAlias(key.value, bridged);
-        _bindAlias(_peerAttemptAlias(guestPeerId, connectionAttemptId), bridged);
-        bridged.httpJoined = true;
-        if (bridged.displayName.trim().isEmpty ||
-            bridged.displayName == 'Unknown Peer' ||
-            bridged.displayName == 'Unknown Device') {
-          bridged.displayName = displayName;
-        }
-        _log(
-          'Approval | Bridged HTTP to BLE entry',
-          details:
-              'key=${bridged.key.value} httpKey=${key.value} '
-              'source=${source.label} state=${bridged.state.name}',
+        return _attachAndReuse(
+          bridged,
+          guestPeerId: guestPeerId,
+          connectionAttemptId: connectionAttemptId,
+          displayName: displayName,
+          source: source,
+          httpKey: key.value,
         );
-        return _reuse(bridged, source: source, displayName: displayName);
+      }
+    }
+
+    // Reverse bridge: BLE notify after /join already opened a pending approval.
+    if (source == GuestApprovalSource.ble) {
+      final bridged = _findHttpBridgeCandidate(displayName: displayName);
+      if (bridged != null) {
+        return _attachAndReuse(
+          bridged,
+          guestPeerId: guestPeerId,
+          connectionAttemptId: connectionAttemptId,
+          displayName: displayName,
+          source: source,
+          httpKey: key.value,
+        );
       }
     }
 
@@ -626,38 +636,116 @@ class GuestApprovalRegistry {
   }
 
   /// Prefer a recent BLE entry in this room that HTTP can attach to.
+  ///
+  /// Never attach a *different* guest's registration onto an unrelated pending
+  /// approval — only bridge when names match or there is a single open BLE
+  /// handshake waiting for its HTTP /join.
   GuestApprovalEntry? _findBleBridgeCandidate({required String displayName}) {
-    final bleEntries = _byKey.values
+    final openEntries = _byKey.values
         .where((e) => e.source == GuestApprovalSource.ble)
         .where((e) => !e.httpJoined)
         .where((e) => e.isPending || (e.isApproved && e.sessionActive))
         .toList()
       ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
 
-    if (bleEntries.isEmpty) return null;
+    if (openEntries.isEmpty) return null;
 
     final normalized = displayName.trim().toLowerCase();
-    for (final entry in bleEntries) {
+    for (final entry in openEntries) {
       final bleName = entry.displayName.trim().toLowerCase();
       if (normalized.isNotEmpty &&
           bleName.isNotEmpty &&
-          bleName != 'unknown peer' &&
-          bleName != 'unknown device' &&
+          !_isPlaceholderName(bleName) &&
           bleName == normalized) {
         return entry;
       }
     }
 
-    if (bleEntries.length == 1) {
-      return bleEntries.first;
+    // Platform hosts often send placeholder BLE names ("Unknown Peer" / "BLE Peer").
+    // If exactly one BLE handshake is open, that is this guest's connection attempt.
+    if (openEntries.length == 1) {
+      return openEntries.first;
     }
 
     final approvedOpen =
-        bleEntries.where((e) => e.isApproved && e.sessionActive).toList();
+        openEntries.where((e) => e.isApproved && e.sessionActive).toList();
     if (approvedOpen.length == 1) return approvedOpen.first;
 
     return null;
   }
+
+  /// Prefer a pending HTTP/registration entry that BLE can attach to.
+  ///
+  /// Only used when BLE notify arrives after /join for the *same* guest.
+  GuestApprovalEntry? _findHttpBridgeCandidate({required String displayName}) {
+    final openEntries = _byKey.values
+        .where(
+          (e) =>
+              e.source == GuestApprovalSource.http ||
+              e.source == GuestApprovalSource.registration ||
+              e.source == GuestApprovalSource.polling,
+        )
+        .where((e) => e.isPending)
+        .toList()
+      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+
+    if (openEntries.isEmpty) return null;
+
+    final normalized = displayName.trim().toLowerCase();
+    for (final entry in openEntries) {
+      final name = entry.displayName.trim().toLowerCase();
+      if (normalized.isNotEmpty &&
+          name.isNotEmpty &&
+          !_isPlaceholderName(name) &&
+          !_isPlaceholderName(normalized) &&
+          name == normalized) {
+        return entry;
+      }
+    }
+
+    // Placeholder BLE name + exactly one pending HTTP join → same attempt.
+    if (openEntries.length == 1 && _isPlaceholderName(normalized)) {
+      return openEntries.first;
+    }
+
+    return null;
+  }
+
+  GuestApprovalBeginResult _attachAndReuse(
+    GuestApprovalEntry bridged, {
+    required String guestPeerId,
+    required String connectionAttemptId,
+    required String displayName,
+    required GuestApprovalSource source,
+    required String httpKey,
+  }) {
+    _bindAlias(guestPeerId, bridged);
+    _bindAlias(httpKey, bridged);
+    _bindAlias(_peerAttemptAlias(guestPeerId, connectionAttemptId), bridged);
+    if (source == GuestApprovalSource.http ||
+        source == GuestApprovalSource.registration ||
+        source == GuestApprovalSource.polling) {
+      bridged.httpJoined = true;
+    }
+    if (bridged.displayName.trim().isEmpty ||
+        _isPlaceholderName(bridged.displayName.trim().toLowerCase())) {
+      bridged.displayName = displayName;
+    }
+    _log(
+      'Approval | Bridged cross-source approval',
+      details:
+          'key=${bridged.key.value} aliasKey=$httpKey '
+          'source=${source.label} state=${bridged.state.name} name=$displayName',
+    );
+    return _reuse(bridged, source: source, displayName: displayName);
+  }
+
+  static bool _isPlaceholderName(String lower) =>
+      lower.isEmpty ||
+      lower == 'unknown peer' ||
+      lower == 'unknown device' ||
+      lower == 'ble peer' ||
+      lower == 'someone';
 
   bool _entryAcceptsAttempt(GuestApprovalEntry entry, String attemptId) {
     if (entry.key.connectionAttemptId == attemptId) return true;

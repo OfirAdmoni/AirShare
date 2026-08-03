@@ -66,6 +66,9 @@ class LocalHubRuntime {
   final StreamController<String> _joinRequestController =
       StreamController<String>.broadcast();
 
+  /// Ensures at most one host approval dialog is emitted for a room at a time.
+  String? _hostApprovalUiKey;
+
   /// Room-scoped guest approval dedupe (BLE + HTTP /join share one logical gate).
   late final GuestApprovalRegistry _guestApprovals = GuestApprovalRegistry(
     log: (message, {details}) {
@@ -129,6 +132,7 @@ class LocalHubRuntime {
 
   void resetGuestHttpSession({required String reason}) {
     _guestApprovals.clearAll(reason: reason);
+    _hostApprovalUiKey = null;
     unawaited(
       ConnectionLogger.instance.log(
         'HTTP | Guest session reset',
@@ -252,6 +256,7 @@ class LocalHubRuntime {
   Future<void> stop() async {
     resetGuestHttpSession(reason: 'hub_stop');
     _guestApprovals.clearAll(reason: 'room_closed');
+    _hostApprovalUiKey = null;
     _approvalTimeoutTimer?.cancel();
     _approvalTimeoutTimer = null;
     if (_decisionCompleter != null && !_decisionCompleter!.isCompleted) {
@@ -311,12 +316,13 @@ class LocalHubRuntime {
             connectionAttemptId.trim().isNotEmpty)
         ? connectionAttemptId.trim()
         : 'ble-${DateTime.now().millisecondsSinceEpoch}';
-    return _guestApprovals.begin(
+    final begin = _guestApprovals.begin(
       guestPeerId: peerId,
       connectionAttemptId: attemptId,
       displayName: displayName,
       source: GuestApprovalSource.ble,
     );
+    return _withHostUiClaim(begin);
   }
 
   /// Resolve a BLE (or bridged) approval after the host taps Approve/Decline.
@@ -330,12 +336,49 @@ class LocalHubRuntime {
       approved: approved,
       reason: reason,
     );
+    _releaseHostApprovalUi(entry.key.value);
     if (approved) {
       grantGuestHttpAccess(reason: reason);
     } else {
       revokeGuestHttpAccess(reason: reason);
     }
     return grant;
+  }
+
+  /// Claim the single host approval UI slot for [key]. Returns false if another
+  /// dialog is already showing for a different key.
+  bool claimHostApprovalUi(String key) {
+    if (_hostApprovalUiKey != null && _hostApprovalUiKey != key) {
+      unawaited(
+        ConnectionLogger.instance.log(
+          'Approval | Ignored duplicate approval event',
+          details:
+              'reason=host_ui_busy activeKey=$_hostApprovalUiKey newKey=$key',
+        ),
+      );
+      return false;
+    }
+    if (_hostApprovalUiKey == key) {
+      return false;
+    }
+    _hostApprovalUiKey = key;
+    return true;
+  }
+
+  void _releaseHostApprovalUi(String key) {
+    if (_hostApprovalUiKey == key) {
+      _hostApprovalUiKey = null;
+    }
+  }
+
+  GuestApprovalBeginResult _withHostUiClaim(GuestApprovalBeginResult begin) {
+    if (!begin.emitUiEvent) return begin;
+    if (claimHostApprovalUi(begin.entry.key.value)) return begin;
+    return GuestApprovalBeginResult(
+      kind: GuestApprovalOutcomeKind.ignoredDuplicate,
+      entry: begin.entry,
+      emitUiEvent: false,
+    );
   }
 
   Future<String> _resolveSharedDirectoryPath() async {
@@ -1020,11 +1063,13 @@ class LocalHubRuntime {
       );
     }
 
-    final begin = _guestApprovals.begin(
-      guestPeerId: guestPeerId,
-      connectionAttemptId: connectionAttemptId,
-      displayName: guestName,
-      source: GuestApprovalSource.registration,
+    final begin = _withHostUiClaim(
+      _guestApprovals.begin(
+        guestPeerId: guestPeerId,
+        connectionAttemptId: connectionAttemptId,
+        displayName: guestName,
+        source: GuestApprovalSource.registration,
+      ),
     );
 
     _guestApprovals.bindHttpIdentity(
@@ -1145,6 +1190,7 @@ class LocalHubRuntime {
           reason: 'join_timeout_auto_approve',
         );
       }
+      _releaseHostApprovalUi(begin.entry.key.value);
     });
 
     // Prefer registry decision (BLE may resolve first); also watch UI completer.
@@ -1294,6 +1340,7 @@ class LocalHubRuntime {
       }
       revokeGuestHttpAccess(reason: 'host_declined_join_$guestName');
     }
+    _releaseHostApprovalUi(entry.key.value);
 
     await _writeJoinResponse(
       request,

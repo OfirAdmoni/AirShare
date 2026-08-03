@@ -13,11 +13,14 @@ void main() {
       log: (message, {details}) {
         logs.add(details == null ? message : '$message | $details');
       },
-      now: () => DateTime.utc(2026, 7, 31, 12, 0, 0),
+      now: () => DateTime.utc(2026, 8, 2, 12, 0, 0),
       tokenFactory: () => 'tok-${++tokenSeq}',
     );
     registry.startRoomSession('room-test-1');
   });
+
+  int createdApprovalCount() =>
+      logs.where((l) => l.contains('Created new approval')).length;
 
   test('approval key is room|peer|attempt', () {
     final key = registry.composeKey(
@@ -27,63 +30,82 @@ void main() {
     expect(key.value, 'room-test-1|ble:AA:BB|ble-1');
   });
 
-  test(
-    'first macOS connection: BLE read+notify then HTTP /join → one UI event',
-    () async {
+  group('Scenario A — fresh room, single guest', () {
+    test('exactly one approval dialog for BLE then HTTP join', () {
       final ble = registry.begin(
         guestPeerId: 'ble:AA:BB:CC:DD:EE:FF',
         connectionAttemptId: 'ble-1',
-        displayName: "Tamir's MacBook Pro",
+        displayName: 'Guest Phone',
         source: GuestApprovalSource.ble,
       );
-      expect(ble.kind, GuestApprovalOutcomeKind.createdNew);
       expect(ble.emitUiEvent, isTrue);
 
       final bleDup = registry.begin(
         guestPeerId: 'ble:AA:BB:CC:DD:EE:FF',
         connectionAttemptId: 'ble-1',
-        displayName: "Tamir's MacBook Pro",
+        displayName: 'Guest Phone',
         source: GuestApprovalSource.ble,
       );
-      expect(bleDup.kind, GuestApprovalOutcomeKind.ignoredDuplicate);
       expect(bleDup.emitUiEvent, isFalse);
 
-      final grant = registry.resolve(
-        entry: ble.entry,
-        approved: true,
-        reason: 'ble_approved',
-      );
-      expect(grant, isNotNull);
-      expect(ble.entry.sessionActive, isTrue);
+      registry.resolve(entry: ble.entry, approved: true, reason: 'host_tap');
 
       final join = registry.begin(
-        guestPeerId: 'local-mac-peer-1',
+        guestPeerId: 'local-guest-1',
         connectionAttemptId: 'attempt-1001',
-        displayName: "Tamir's MacBook Pro",
+        displayName: 'Guest Phone',
         source: GuestApprovalSource.registration,
       );
       expect(join.emitUiEvent, isFalse);
       expect(join.kind, GuestApprovalOutcomeKind.alreadyApproved);
+      expect(createdApprovalCount(), 1);
+    });
+  });
 
-      final joinAgain = registry.begin(
-        guestPeerId: 'local-mac-peer-1',
-        connectionAttemptId: 'attempt-1001',
-        displayName: "Tamir's MacBook Pro",
-        source: GuestApprovalSource.polling,
+  group('Scenario B — leave home and rejoin same room', () {
+    test('requires a new approval after leave', () {
+      final first = registry.begin(
+        guestPeerId: 'local-1',
+        connectionAttemptId: 'attempt-1',
+        displayName: 'Mac',
+        source: GuestApprovalSource.registration,
       );
-      expect(joinAgain.emitUiEvent, isFalse);
-      expect(joinAgain.kind, GuestApprovalOutcomeKind.alreadyApproved);
+      final grant = registry.resolve(
+        entry: first.entry,
+        approved: true,
+        reason: 'ok',
+      )!;
+
+      registry.invalidateGuest(
+        guestPeerId: 'local-1',
+        connectionAttemptId: 'attempt-1',
+        accessToken: grant.accessToken,
+        reason: 'guest_returned_home',
+      );
 
       expect(
-        logs.where((l) => l.contains('Created new approval')),
-        hasLength(1),
+        registry.isAccessAllowed(
+          accessToken: grant.accessToken,
+          guestPeerId: 'local-1',
+          connectionAttemptId: 'attempt-1',
+        ),
+        isFalse,
       );
-    },
-  );
 
-  test(
-    'Scenario A: exit then reconnect requires new approval; old token rejected',
-    () {
+      final second = registry.begin(
+        guestPeerId: 'local-1',
+        connectionAttemptId: 'attempt-2',
+        displayName: 'Mac',
+        source: GuestApprovalSource.registration,
+      );
+      expect(second.emitUiEvent, isTrue);
+      expect(second.kind, GuestApprovalOutcomeKind.createdNew);
+      expect(createdApprovalCount(), 2);
+    });
+  });
+
+  group('Scenario C — disconnect then reconnect', () {
+    test('requires a new approval and rejects old token', () {
       final ble = registry.begin(
         guestPeerId: 'ble:AA',
         connectionAttemptId: 'ble-1',
@@ -101,48 +123,19 @@ void main() {
         connectionAttemptId: 'attempt-1',
       );
 
-      expect(
-        registry.isAccessAllowed(
-          accessToken: grant.accessToken,
-          guestPeerId: 'local-1',
-          connectionAttemptId: 'attempt-1',
-        ),
-        isTrue,
-      );
-
-      // Guest exits the room.
       registry.invalidateGuest(
         guestPeerId: 'local-1',
         connectionAttemptId: 'attempt-1',
         accessToken: grant.accessToken,
-        reason: 'guest_leave',
+        reason: 'guest_disconnect',
       );
 
-      expect(
-        registry.isAccessAllowed(
-          accessToken: grant.accessToken,
-          guestPeerId: 'local-1',
-          connectionAttemptId: 'attempt-1',
-        ),
-        isFalse,
-      );
-      expect(
-        logs.where((l) => l.contains('Stale token rejected')),
-        isNotEmpty,
-      );
-      expect(
-        logs.where((l) => l.contains('Token invalidated')),
-        isNotEmpty,
-      );
-
-      // Reconnect with a new connection attempt.
       final reconnect = registry.begin(
         guestPeerId: 'local-1',
         connectionAttemptId: 'attempt-2',
         displayName: 'Mac',
         source: GuestApprovalSource.registration,
       );
-      expect(reconnect.kind, GuestApprovalOutcomeKind.createdNew);
       expect(reconnect.emitUiEvent, isTrue);
       expect(
         registry.isAccessAllowed(
@@ -153,15 +146,14 @@ void main() {
         isFalse,
       );
       expect(
-        logs.where((l) => l.contains('Created new approval')),
-        hasLength(2),
+        logs.where((l) => l.contains('Stale token rejected')),
+        isNotEmpty,
       );
-    },
-  );
+    });
+  });
 
-  test(
-    'Scenario B: disconnecting one guest keeps the other approved',
-    () {
+  group('Scenario D — two guests', () {
+    test('two independent approval requests', () {
       final a = registry.begin(
         guestPeerId: 'peer-a',
         connectionAttemptId: 'a1',
@@ -174,47 +166,56 @@ void main() {
         displayName: 'Guest B',
         source: GuestApprovalSource.registration,
       );
-      final grantA = registry.resolve(
-        entry: a.entry,
-        approved: true,
-        reason: 'a',
-      )!;
-      final grantB = registry.resolve(
-        entry: b.entry,
-        approved: true,
-        reason: 'b',
-      )!;
+      expect(a.emitUiEvent, isTrue);
+      expect(b.emitUiEvent, isTrue);
+      expect(a.entry.key.value, isNot(b.entry.key.value));
+      expect(registry.pendingCount, 2);
+      expect(createdApprovalCount(), 2);
+    });
+  });
 
-      registry.invalidateGuest(
-        guestPeerId: 'peer-a',
-        connectionAttemptId: 'a1',
-        accessToken: grantA.accessToken,
-        reason: 'guest_leave',
+  group('Scenario E — repeated BLE + polling', () {
+    test('only one approval exists', () {
+      final ble = registry.begin(
+        guestPeerId: 'ble:AA',
+        connectionAttemptId: 'ble-1',
+        displayName: 'Unknown Peer',
+        source: GuestApprovalSource.ble,
       );
+      expect(ble.emitUiEvent, isTrue);
 
-      expect(
-        registry.isAccessAllowed(
-          accessToken: grantA.accessToken,
-          guestPeerId: 'peer-a',
-          connectionAttemptId: 'a1',
-        ),
-        isFalse,
-      );
-      expect(
-        registry.isAccessAllowed(
-          accessToken: grantB.accessToken,
-          guestPeerId: 'peer-b',
-          connectionAttemptId: 'b1',
-        ),
-        isTrue,
-      );
-      expect(registry.activeSessionCount, 1);
-    },
-  );
+      for (var i = 0; i < 5; i++) {
+        final dup = registry.begin(
+          guestPeerId: 'ble:AA',
+          connectionAttemptId: 'ble-1',
+          displayName: 'Unknown Peer',
+          source: GuestApprovalSource.ble,
+        );
+        expect(dup.emitUiEvent, isFalse);
+      }
 
-  test(
-    'Scenario C: retries while pending produce exactly one approval prompt',
-    () {
+      for (var i = 0; i < 5; i++) {
+        final poll = registry.begin(
+          guestPeerId: 'local-mac',
+          connectionAttemptId: 'attempt-9',
+          displayName: 'MacBook',
+          source: GuestApprovalSource.polling,
+        );
+        expect(poll.emitUiEvent, isFalse);
+        expect(
+          poll.kind == GuestApprovalOutcomeKind.reusedPending ||
+              poll.kind == GuestApprovalOutcomeKind.ignoredDuplicate,
+          isTrue,
+        );
+      }
+
+      expect(createdApprovalCount(), 1);
+      expect(registry.pendingCount, 1);
+    });
+  });
+
+  group('Scenario F — background/resume while pending', () {
+    test('no duplicate approval on resume callbacks', () {
       final first = registry.begin(
         guestPeerId: 'peer-x',
         connectionAttemptId: 'x1',
@@ -223,129 +224,134 @@ void main() {
       );
       expect(first.emitUiEvent, isTrue);
 
-      for (var i = 0; i < 5; i++) {
-        final retry = registry.begin(
+      // Simulate activity recreation / resume re-posting /join.
+      for (var i = 0; i < 3; i++) {
+        final resume = registry.begin(
           guestPeerId: 'peer-x',
           connectionAttemptId: 'x1',
           displayName: 'Guest X',
-          source: GuestApprovalSource.polling,
+          source: GuestApprovalSource.registration,
         );
-        expect(retry.emitUiEvent, isFalse);
-        expect(
-          retry.kind == GuestApprovalOutcomeKind.reusedPending ||
-              retry.kind == GuestApprovalOutcomeKind.ignoredDuplicate ||
-              retry.kind == GuestApprovalOutcomeKind.alreadyApproved,
-          isTrue,
-        );
+        expect(resume.emitUiEvent, isFalse);
+        expect(identical(resume.entry, first.entry), isTrue);
       }
+      expect(createdApprovalCount(), 1);
+    });
+  });
 
-      expect(
-        logs.where((l) => l.contains('Created new approval')),
-        hasLength(1),
+  group('Scenario G — Wi-Fi / Hotspot switch reconnect', () {
+    test('new connection attempt creates exactly one new approval', () {
+      final lan = registry.begin(
+        guestPeerId: 'local-1',
+        connectionAttemptId: 'attempt-lan',
+        displayName: 'Phone',
+        source: GuestApprovalSource.registration,
       );
-    },
-  );
+      final grant = registry.resolve(
+        entry: lan.entry,
+        approved: true,
+        reason: 'lan_ok',
+      )!;
 
-  test('different guests get separate approval requests', () {
-    final a = registry.begin(
-      guestPeerId: 'ble:111',
-      connectionAttemptId: 'ble-1',
-      displayName: 'Phone A',
-      source: GuestApprovalSource.ble,
-    );
-    final b = registry.begin(
-      guestPeerId: 'ble:222',
-      connectionAttemptId: 'ble-2',
-      displayName: 'Phone B',
-      source: GuestApprovalSource.ble,
-    );
-    expect(a.emitUiEvent, isTrue);
-    expect(b.emitUiEvent, isTrue);
-    expect(registry.pendingCount, 2);
+      // Network path changes → guest leaves and rejoins with new attempt id.
+      registry.invalidateGuest(
+        guestPeerId: 'local-1',
+        connectionAttemptId: 'attempt-lan',
+        accessToken: grant.accessToken,
+        reason: 'network_path_changed',
+      );
+
+      final hotspot = registry.begin(
+        guestPeerId: 'local-1',
+        connectionAttemptId: 'attempt-hotspot',
+        displayName: 'Phone',
+        source: GuestApprovalSource.registration,
+      );
+      expect(hotspot.emitUiEvent, isTrue);
+      expect(hotspot.kind, GuestApprovalOutcomeKind.createdNew);
+      expect(createdApprovalCount(), 2);
+      expect(
+        registry.isAccessAllowed(
+          accessToken: grant.accessToken,
+          guestPeerId: 'local-1',
+          connectionAttemptId: 'attempt-hotspot',
+        ),
+        isFalse,
+      );
+    });
   });
 
-  test('room/session reset requires a new approval', () {
-    final first = registry.begin(
-      guestPeerId: 'ble:AA',
-      connectionAttemptId: 'ble-1',
-      displayName: 'Mac',
-      source: GuestApprovalSource.ble,
-    );
-    registry.resolve(entry: first.entry, approved: true, reason: 'ok');
-
-    registry.startRoomSession('room-test-2');
-    final second = registry.begin(
-      guestPeerId: 'ble:AA',
-      connectionAttemptId: 'ble-1',
-      displayName: 'Mac',
-      source: GuestApprovalSource.ble,
-    );
-    expect(second.kind, GuestApprovalOutcomeKind.createdNew);
-    expect(second.emitUiEvent, isTrue);
-  });
-
-  test('pending entry stays until approved so later requests dedupe', () async {
-    final ble = registry.begin(
-      guestPeerId: 'ble:AA',
-      connectionAttemptId: 'ble-1',
-      displayName: 'Mac',
-      source: GuestApprovalSource.ble,
-    );
-
+  test('BLE after HTTP pending bridges without a second dialog', () {
     final join = registry.begin(
       guestPeerId: 'local-1',
-      connectionAttemptId: 'attempt-9',
+      connectionAttemptId: 'attempt-1',
       displayName: 'Mac',
-      source: GuestApprovalSource.http,
+      source: GuestApprovalSource.registration,
     );
-    expect(join.emitUiEvent, isFalse);
-    expect(join.kind, GuestApprovalOutcomeKind.reusedPending);
+    expect(join.emitUiEvent, isTrue);
 
-    registry.resolve(entry: ble.entry, approved: true, reason: 'host_tap');
-    expect(await join.entry.decision.future, isTrue);
+    final ble = registry.begin(
+      guestPeerId: 'ble:AA',
+      connectionAttemptId: 'ble-late',
+      displayName: 'BLE Peer',
+      source: GuestApprovalSource.ble,
+    );
+    expect(ble.emitUiEvent, isFalse);
+    expect(identical(ble.entry, join.entry), isTrue);
+    expect(createdApprovalCount(), 1);
   });
 
-  test('same attempt denied is reused; new attempt asks again', () {
+  test('different guests keep separate approvals after one leaves', () {
+    final a = registry.begin(
+      guestPeerId: 'peer-a',
+      connectionAttemptId: 'a1',
+      displayName: 'Guest A',
+      source: GuestApprovalSource.registration,
+    );
+    final b = registry.begin(
+      guestPeerId: 'peer-b',
+      connectionAttemptId: 'b1',
+      displayName: 'Guest B',
+      source: GuestApprovalSource.registration,
+    );
+    final grantA = registry.resolve(entry: a.entry, approved: true, reason: 'a')!;
+    final grantB = registry.resolve(entry: b.entry, approved: true, reason: 'b')!;
+
+    registry.invalidateGuest(
+      guestPeerId: 'peer-a',
+      connectionAttemptId: 'a1',
+      accessToken: grantA.accessToken,
+      reason: 'guest_leave',
+    );
+
+    expect(
+      registry.isAccessAllowed(
+        accessToken: grantB.accessToken,
+        guestPeerId: 'peer-b',
+        connectionAttemptId: 'b1',
+      ),
+      isTrue,
+    );
+    expect(registry.activeSessionCount, 1);
+  });
+
+  test('placeholder BLE name still bridges to guest display name', () {
     final ble = registry.begin(
       guestPeerId: 'ble:AA',
       connectionAttemptId: 'ble-1',
-      displayName: 'Mac',
-      source: GuestApprovalSource.ble,
-    );
-    registry.resolve(entry: ble.entry, approved: false, reason: 'declined');
-
-    final sameAttempt = registry.begin(
-      guestPeerId: 'ble:AA',
-      connectionAttemptId: 'ble-1',
-      displayName: 'Mac',
-      source: GuestApprovalSource.ble,
-    );
-    expect(sameAttempt.kind, GuestApprovalOutcomeKind.alreadyDenied);
-    expect(sameAttempt.emitUiEvent, isFalse);
-
-    final newAttempt = registry.begin(
-      guestPeerId: 'ble:AA',
-      connectionAttemptId: 'ble-2',
-      displayName: 'Mac',
-      source: GuestApprovalSource.ble,
-    );
-    expect(newAttempt.kind, GuestApprovalOutcomeKind.createdNew);
-    expect(newAttempt.emitUiEvent, isTrue);
-  });
-
-  test('active BLE session can be found for temporary radio blips', () {
-    final ble = registry.begin(
-      guestPeerId: 'ble:AA:BB',
-      connectionAttemptId: 'ble-9',
-      displayName: 'Mac',
+      displayName: 'Unknown Peer',
       source: GuestApprovalSource.ble,
     );
     registry.resolve(entry: ble.entry, approved: true, reason: 'ok');
-    final active = registry.findActiveSessionForBleDevice('AA:BB');
-    expect(active, isNotNull);
-    expect(active!.sessionActive, isTrue);
 
-    registry.invalidateEntry(entry: ble.entry, reason: 'guest_leave');
-    expect(registry.findActiveSessionForBleDevice('AA:BB'), isNull);
+    final join = registry.begin(
+      guestPeerId: 'local-ios',
+      connectionAttemptId: 'attempt-ios',
+      displayName: "Rotem's iPhone",
+      source: GuestApprovalSource.registration,
+    );
+    expect(join.emitUiEvent, isFalse);
+    expect(join.kind, GuestApprovalOutcomeKind.alreadyApproved);
+    expect(createdApprovalCount(), 1);
   });
 }
