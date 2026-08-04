@@ -13,6 +13,7 @@ import 'package:air_share/discovery_page.dart';
 import 'package:air_share/file_list_screen.dart';
 import 'package:air_share/file_zone_session.dart';
 import 'package:air_share/hub_endpoint_state.dart';
+import 'package:air_share/session_context.dart';
 import 'package:air_share/hub_status.dart';
 import 'package:air_share/local_hub_runtime.dart';
 import 'package:air_share/sender_staging_page.dart';
@@ -63,6 +64,9 @@ class _AirShareAppState extends State<AirShareApp> {
       final args = call.arguments as Map<dynamic, dynamic>? ?? {};
       final friendlyName = (args['friendlyName'] ?? 'Unknown Device')
           .toString();
+      final peerId = (args['deviceAddress'] ?? args['sessionId'] ?? '')
+          .toString()
+          .trim();
       await ConnectionLogger.instance.log(
         'Connection Request Prompted',
         details: 'peer=$friendlyName',
@@ -106,7 +110,10 @@ class _AirShareAppState extends State<AirShareApp> {
       var lanForBle = '';
       if (approved == true) {
         LocalHubRuntime.instance.grantGuestHttpAccess(
-          reason: 'ble_approved peer=$friendlyName',
+          reason: 'ble_approved peer=$friendlyName id=$peerId',
+          peerId: peerId.isEmpty ? null : peerId,
+          displayName: friendlyName,
+          hubPort: HubEndpointState.instance.pendingPort,
         );
         final hubState = HubEndpointState.instance;
         final pendingIp = hubState.pendingIp;
@@ -132,6 +139,8 @@ class _AirShareAppState extends State<AirShareApp> {
             hotspotPass: hubState.rememberedHotspotPass,
             hotspotHubIp: hubState.rememberedHotspotHubIp,
             hubPort: pendingPort,
+            tlsCertSha256:
+                LocalHubRuntime.instance.tlsCertSha256Pin ?? '',
           );
           await ConnectionLogger.instance.log(
             'HS | Host | BLE handshake refreshed for Approve',
@@ -256,6 +265,7 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
   }
 
   Future<void> _openJoin() async {
+    await SessionContext.beginNewSession(reason: 'flow_join_opened');
     final btReady =
         await UxPrompts.promptBluetoothRequiredForTransfer(context);
     if (!btReady) return;
@@ -295,6 +305,7 @@ class _ModeSelectionPageState extends State<ModeSelectionPage> {
   }
 
   Future<void> _openHost() async {
+    await SessionContext.beginNewSession(reason: 'flow_host_opened');
     final btReady =
         await UxPrompts.promptBluetoothRequiredForTransfer(context);
     if (!btReady) return;

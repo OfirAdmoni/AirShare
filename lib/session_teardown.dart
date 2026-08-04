@@ -2,9 +2,9 @@ import 'dart:io';
 
 import 'package:air_share/ble_transport.dart';
 import 'package:air_share/connection_logger.dart';
-import 'package:air_share/guest_connection_guard.dart';
 import 'package:air_share/hub_endpoint_state.dart';
 import 'package:air_share/local_hub_runtime.dart';
+import 'package:air_share/session_context.dart';
 import 'package:air_share/wlan_link_manager.dart';
 
 /// Unified teardown sequences for sender and receiver flows.
@@ -87,6 +87,8 @@ class SessionTeardown {
 
     try {
       HubEndpointState.instance.clear();
+      await SessionContext.wipeHostAuthState(reason: 'sender_teardown');
+      await SessionContext.wipeGuestSide(reason: 'sender_teardown');
       await ConnectionLogger.instance.log('Teardown | State reset complete');
     } catch (e) {
       await ConnectionLogger.instance.log(
@@ -120,7 +122,7 @@ class SessionTeardown {
     );
   }
 
-  /// Receiver-side teardown: BLE scanner → connection guard.
+  /// Receiver-side teardown: BLE scanner → connection guard → guest crypto state.
   static Future<void> runReceiverTeardown() async {
     try {
       await BleTransport.instance.stopScanning();
@@ -133,7 +135,7 @@ class SessionTeardown {
     }
 
     try {
-      GuestConnectionGuard.reset();
+      await SessionContext.wipeGuestSide(reason: 'receiver_teardown');
       await ConnectionLogger.instance.log('Teardown | State reset complete');
     } catch (e) {
       await ConnectionLogger.instance.log(

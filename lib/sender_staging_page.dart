@@ -209,7 +209,10 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
       );
       await _logAllNetworkInterfaces(interfaces);
 
-      final networkPlan = await HostNetworkTier.planSenderStartup();
+      final networkPlan =
+          await LocalHubRuntime.instance.requireSenderNetworkPlan(
+        reason: 'sender_staging_prepare',
+      );
       await ConnectionLogger.instance.log(
         'Network | Sender tier plan',
         details: networkPlan.useTier1Only
@@ -418,6 +421,7 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
         hotspotPass: hotspotPass,
         hotspotHubIp: hotspotHubIp,
         hubPort: port,
+        tlsCertSha256: LocalHubRuntime.instance.tlsCertSha256Pin ?? '',
       );
 
       HubEndpointState.instance.rememberBleEndpoints(

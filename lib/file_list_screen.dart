@@ -11,6 +11,8 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import 'package:air_share/hub_guest_session.dart';
+import 'package:air_share/hub_http_client.dart';
 import 'package:air_share/connection_logger.dart';
 import 'package:air_share/file_zone_session.dart';
 import 'package:air_share/hub_status.dart';
@@ -142,10 +144,11 @@ class _FileListScreenState extends State<FileListScreen> {
 
   StreamSubscription<String>? _joinRequestSub;
   bool _joinDialogShowing = false;
+  late final http.Client _httpClient;
 
   bool get _isTransferActive => isDownloading || isUploading;
 
-  String get baseUrl => 'http://${widget.hubHost}:${widget.hubPort}';
+  String get baseUrl => 'https://${widget.hubHost}:${widget.hubPort}';
   HubStatus get _hubStatus => HubStatusScope.of(context);
 
   Map<String, String> _roomRequestHeaders() => {
@@ -153,6 +156,11 @@ class _FileListScreenState extends State<FileListScreen> {
         if (_localPeerId != null)
           'x-airshare-requester-peer-id': _localPeerId!,
         'x-airshare-requester-role': widget.isHubMode ? 'host' : 'guest',
+        ...HubHttpClient.authHeaders(
+          authToken: widget.isHubMode
+              ? null
+              : HubGuestSession.instance.authToken,
+        ),
       };
 
   Map<String, String> _uploadSenderHeaders() => {
@@ -160,13 +168,46 @@ class _FileListScreenState extends State<FileListScreen> {
         if (_localPeerId != null) 'x-airshare-sender-id': _localPeerId!,
         'x-airshare-sender-name': _localDisplayName,
         'x-airshare-requester-role': widget.isHubMode ? 'host' : 'guest',
+        ...HubHttpClient.authHeaders(
+          authToken: widget.isHubMode
+              ? null
+              : HubGuestSession.instance.authToken,
+        ),
       };
 
   // ── File list ─────────────────────────────────────────────────────────────
 
+  SharedFileEntry _entryFromStaged(_StagedFile staged) {
+    return SharedFileEntry(
+      name: staged.name,
+      senderId: _localPeerId ?? '',
+      senderName: _localDisplayName,
+      sharedAt: DateTime.now().toUtc(),
+      sizeBytes: staged.sizeBytes,
+    );
+  }
+
+  /// Instantly reflect a file in the grid (host solo or before peers join).
+  void _upsertFileInList(SharedFileEntry entry) {
+    if (!mounted) return;
+    setState(() {
+      final idx = files.indexWhere((f) => f.name == entry.name);
+      if (idx >= 0) {
+        files = List.of(files)..[idx] = entry;
+      } else {
+        files = [...files, entry]
+          ..sort((a, b) => b.sharedAt.compareTo(a.sharedAt));
+      }
+      _initialFetchDone = true;
+    });
+  }
+
   Future<void> fetchFiles({bool silent = false}) async {
     try {
-      final response = await http.get(Uri.parse('$baseUrl/files'));
+      final response = await _httpClient.get(
+        Uri.parse('$baseUrl/files'),
+        headers: _roomRequestHeaders(),
+      );
       if (response.statusCode == 200) {
         _consecutiveHostErrors = 0;
         final decoded = json.decode(response.body);
@@ -348,7 +389,7 @@ class _FileListScreenState extends State<FileListScreen> {
       );
       final request = http.Request('DELETE', uri)
         ..headers.addAll(_roomRequestHeaders());
-      final response = await request.send();
+      final response = await _httpClient.send(request);
       if (response.statusCode != HttpStatus.ok) {
         final body = await response.stream.bytesToString();
         throw Exception(
@@ -432,7 +473,7 @@ class _FileListScreenState extends State<FileListScreen> {
   // Returns the absolute path of the saved file, or null on error.
   // Caller is responsible for managing isDownloading / UI state around this.
   Future<String?> _fetchAndSave(String fileName, Directory targetDir) async {
-    final client = http.Client();
+    final client = _httpClient;
     _activeDownloadClient = client;
     IOSink? sink;
 
@@ -445,7 +486,8 @@ class _FileListScreenState extends State<FileListScreen> {
         details: 'url=$uri platform=${Platform.operatingSystem}',
       );
 
-      final request = http.Request('GET', uri);
+      final request = http.Request('GET', uri)
+        ..headers.addAll(_roomRequestHeaders());
       final response = await client
           .send(request)
           .timeout(const Duration(minutes: 10));
@@ -521,7 +563,6 @@ class _FileListScreenState extends State<FileListScreen> {
         } catch (_) {}
       }
       _activeDownloadClient = null;
-      client.close();
 
       if (_teardownConfirmed) {
         final pathToDelete = _activeDownloadPath;
@@ -666,7 +707,7 @@ class _FileListScreenState extends State<FileListScreen> {
         ),
         backgroundColor: const Color(0xFF16A34A),
         behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 8),
+        duration: const Duration(seconds: 3),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         action: SnackBarAction(
           label: 'Open',
@@ -803,9 +844,7 @@ class _FileListScreenState extends State<FileListScreen> {
       ),
     );
 
-    final streamedResponse = await request.send().timeout(
-      const Duration(minutes: 30),
-    );
+    final streamedResponse = await _httpClient.send(request);
     if (streamedResponse.statusCode != 201) {
       final body = await streamedResponse.stream.bytesToString();
       throw Exception(
@@ -843,12 +882,16 @@ class _FileListScreenState extends State<FileListScreen> {
       if (!mounted) return;
 
       setState(() => _selectedFiles = staged);
+      for (final file in staged) {
+        _upsertFileInList(_entryFromStaged(file));
+      }
 
       var uploadedCount = 0;
       for (final file in staged) {
         try {
           await _uploadStagedFile(file);
-          await fetchFiles(silent: true);
+          _upsertFileInList(_entryFromStaged(file));
+          unawaited(fetchFiles(silent: true));
           uploadedCount++;
         } catch (e, st) {
           await ConnectionLogger.instance.log(
@@ -857,6 +900,9 @@ class _FileListScreenState extends State<FileListScreen> {
           );
           debugPrint('[FileList] Upload failed for ${file.name}:\n$st');
           if (mounted) {
+            setState(() {
+              files = files.where((f) => f.name != file.name).toList();
+            });
             _showErrorSnackBar('Upload failed for ${file.name}: $e');
           }
         }
@@ -904,6 +950,13 @@ class _FileListScreenState extends State<FileListScreen> {
   @override
   void initState() {
     super.initState();
+    _httpClient = HubHttpClient.create(
+      tlsCertSha256Pin: widget.isHubMode
+          ? LocalHubRuntime.instance.tlsCertSha256Pin
+          : HubGuestSession.instance.tlsCertSha256Pin,
+      authToken:
+          widget.isHubMode ? null : HubGuestSession.instance.authToken,
+    );
     _refreshTimer = Timer.periodic(const Duration(seconds: 3), (_) {
       if (mounted) fetchFiles();
     });
@@ -927,11 +980,12 @@ class _FileListScreenState extends State<FileListScreen> {
     final notifier = FileZoneSessionScope.of(context);
     if (notifier.value == null) return;
 
+    LocalPeerIdentity? identity;
     try {
-      final identity = await LocalPeerIdentity.resolve();
+      identity = await LocalPeerIdentity.resolve();
       if (mounted) {
         setState(() {
-          _localPeerId = identity.peerId;
+          _localPeerId = identity!.peerId;
           _localDisplayName = identity.displayName;
         });
       }
@@ -943,7 +997,10 @@ class _FileListScreenState extends State<FileListScreen> {
       _approvalPollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
         if (mounted && !_approvalDialogShowing) _checkForPendingTransfer();
       });
-      _postJoinNotification();
+      _postJoinNotification(
+        guestName: identity?.displayName,
+        guestPeerId: identity?.peerId,
+      );
     }
 
     if (widget.isHubMode) {
@@ -1011,6 +1068,7 @@ class _FileListScreenState extends State<FileListScreen> {
     _guestJoinedSub?.cancel();
     _guestConnectionTimer?.cancel();
     _joinRequestSub?.cancel();
+    _httpClient.close();
     if (!_screenTeardownRan) {
       _screenTeardownRan = true;
       if (widget.isHubMode) {
@@ -1026,7 +1084,10 @@ class _FileListScreenState extends State<FileListScreen> {
 
   Future<void> _checkForPendingTransfer() async {
     try {
-      final response = await http.get(Uri.parse('$baseUrl/pending-transfer'));
+      final response = await _httpClient.get(
+        Uri.parse('$baseUrl/pending-transfer'),
+        headers: _roomRequestHeaders(),
+      );
       if (!mounted || _approvalDialogShowing) return;
       if (response.statusCode == 200 && response.body.trim() != 'null') {
         final data = json.decode(response.body) as Map<String, dynamic>;
@@ -1150,9 +1211,12 @@ class _FileListScreenState extends State<FileListScreen> {
     _approvalDialogShowing = false;
 
     try {
-      await http.post(
+      await _httpClient.post(
         Uri.parse('$baseUrl/transfer-response'),
-        headers: {'Content-Type': 'application/json'},
+        headers: {
+          'Content-Type': 'application/json',
+          ..._roomRequestHeaders(),
+        },
         body: jsonEncode({'approved': approved ?? false}),
       );
     } catch (_) {}
@@ -1168,7 +1232,7 @@ class _FileListScreenState extends State<FileListScreen> {
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
         title: const Text('Join Request'),
-        content: Text('$guestName wants to join this session.'),
+        content: Text('$guestName wants to join the party. Approve?'),
         actions: [
           TextButton(
             style: TextButton.styleFrom(
@@ -1323,15 +1387,26 @@ class _FileListScreenState extends State<FileListScreen> {
     );
   }
 
-  Future<void> _postJoinNotification() async {
+  Future<void> _postJoinNotification({
+    String? guestName,
+    String? guestPeerId,
+  }) async {
     try {
+      final name = (guestName ?? _localDisplayName).trim();
+      final peerId = (guestPeerId ?? _localPeerId ?? '').trim();
       // The hub blocks on /join until the host approves or declines (max 30 s).
       // We allow up to 35 s so the server's auto-approve has time to fire first.
-      final response = await http
+      final response = await _httpClient
           .post(
             Uri.parse('$baseUrl/join'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'guestName': _localDisplayName}),
+            headers: {
+              'Content-Type': 'application/json',
+              ..._roomRequestHeaders(),
+            },
+            body: jsonEncode({
+              'guestName': name.isEmpty ? 'Someone' : name,
+              if (peerId.isNotEmpty) 'guestPeerId': peerId,
+            }),
           )
           .timeout(const Duration(seconds: 35));
 
@@ -1339,6 +1414,10 @@ class _FileListScreenState extends State<FileListScreen> {
 
       final body = json.decode(response.body) as Map<String, dynamic>?;
       final status = (body?['status'] as String?)?.trim() ?? 'approved';
+      final token = (body?['authToken'] as String?)?.trim();
+      if (token != null && token.isNotEmpty) {
+        HubGuestSession.instance.applyJoinToken(token);
+      }
 
       if (status == 'declined') {
         // Stop all hub-polling timers immediately — no further requests should
