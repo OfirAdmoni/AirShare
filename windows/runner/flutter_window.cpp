@@ -11,6 +11,7 @@
 #include <winrt/Windows.Storage.Streams.h>
 
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
@@ -1282,13 +1283,22 @@ void FlutterWindow::NotifyFlutterConnectionRequest(
     const std::string& session_id) {
   DispatchToPlatformThread([this, friendly_name, session_id]() {
     if (!ble_ui_channel_) return;
+    const auto attempt_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    const std::string attempt_id = "ble-" + std::to_string(attempt_ms);
     ble_ui_channel_->InvokeMethod(
         "notifyConnectionRequest",
         std::make_unique<flutter::EncodableValue>(flutter::EncodableMap{
             {flutter::EncodableValue("friendlyName"),
              flutter::EncodableValue(friendly_name)},
+            {flutter::EncodableValue("deviceAddress"),
+             flutter::EncodableValue(session_id)},
             {flutter::EncodableValue("sessionId"),
              flutter::EncodableValue(session_id)},
+            {flutter::EncodableValue("connectionAttemptId"),
+             flutter::EncodableValue(attempt_id)},
         }));
   });
 }

@@ -669,7 +669,11 @@ final class BleTransportPlugin: NSObject {
   }
 
   private func notifyConnectionRequest(centralId: String, friendlyName: String) {
-    logBle("approval requested central=\(centralId) friendlyName=\(friendlyName)")
+    let attemptId = "ble-\(Int(Date().timeIntervalSince1970 * 1000))"
+    logBle(
+      "approval requested central=\(centralId) friendlyName=\(friendlyName) "
+        + "connectionAttemptId=\(attemptId)"
+    )
     DispatchQueue.main.async { [weak self] in
       self?.logBle("approval dialog invoke notifyConnectionRequest central=\(centralId)")
       self?.uiChannel.invokeMethod(
@@ -677,6 +681,7 @@ final class BleTransportPlugin: NSObject {
         arguments: [
           "friendlyName": friendlyName,
           "deviceAddress": centralId,
+          "connectionAttemptId": attemptId,
         ]
       )
     }

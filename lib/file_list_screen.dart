@@ -71,6 +71,7 @@ class FileListScreen extends StatefulWidget {
     required this.hubPort,
     required this.modeTitle,
     this.isHubMode = false,
+    this.connectionAttemptId,
     super.key,
   });
 
@@ -78,6 +79,9 @@ class FileListScreen extends StatefulWidget {
   final int hubPort;
   final String modeTitle;
   final bool isHubMode;
+
+  /// Guest-side nonce for this connection attempt (dedupes host approval).
+  final String? connectionAttemptId;
 
   @override
   State<FileListScreen> createState() => _FileListScreenState();
@@ -104,6 +108,10 @@ class _FileListScreenState extends State<FileListScreen> {
 
   String? _localPeerId;
   String _localDisplayName = 'You';
+  late final String _connectionAttemptId =
+      widget.connectionAttemptId?.trim().isNotEmpty == true
+          ? widget.connectionAttemptId!.trim()
+          : 'attempt-${DateTime.now().millisecondsSinceEpoch}';
   List<_StagedFile> _selectedFiles = [];
 
   // Download state
@@ -156,6 +164,7 @@ class _FileListScreenState extends State<FileListScreen> {
         if (_localPeerId != null)
           'x-airshare-requester-peer-id': _localPeerId!,
         'x-airshare-requester-role': widget.isHubMode ? 'host' : 'guest',
+        'x-airshare-connection-attempt-id': _connectionAttemptId,
         ...HubHttpClient.authHeaders(
           authToken: widget.isHubMode
               ? null
@@ -168,6 +177,7 @@ class _FileListScreenState extends State<FileListScreen> {
         if (_localPeerId != null) 'x-airshare-sender-id': _localPeerId!,
         'x-airshare-sender-name': _localDisplayName,
         'x-airshare-requester-role': widget.isHubMode ? 'host' : 'guest',
+        'x-airshare-connection-attempt-id': _connectionAttemptId,
         ...HubHttpClient.authHeaders(
           authToken: widget.isHubMode
               ? null
@@ -1068,16 +1078,57 @@ class _FileListScreenState extends State<FileListScreen> {
     _guestJoinedSub?.cancel();
     _guestConnectionTimer?.cancel();
     _joinRequestSub?.cancel();
-    _httpClient.close();
     if (!_screenTeardownRan) {
       _screenTeardownRan = true;
       if (widget.isHubMode) {
+        _httpClient.close();
         unawaited(SessionTeardown.runSenderTeardown());
       } else {
-        unawaited(SessionTeardown.runReceiverTeardown());
+        unawaited(_leaveRoomAndTeardown());
       }
+    } else {
+      _httpClient.close();
     }
     super.dispose();
+  }
+
+  Future<void> _leaveRoomAndTeardown() async {
+    await _postLeaveNotification();
+    _httpClient.close();
+    await SessionTeardown.runReceiverTeardown();
+  }
+
+  Future<void> _postLeaveNotification() async {
+    if (widget.isHubMode) return;
+    try {
+      await _httpClient
+          .post(
+            Uri.parse('$baseUrl/leave'),
+            headers: {
+              'Content-Type': 'application/json',
+              ..._roomRequestHeaders(),
+            },
+            body: jsonEncode({
+              'guestName': _localDisplayName,
+              'guestPeerId': _localPeerId ?? '',
+              'peerId': _localPeerId ?? '',
+              'connectionAttemptId': _connectionAttemptId,
+              'authToken': HubGuestSession.instance.authToken ?? '',
+              'accessToken': HubGuestSession.instance.authToken ?? '',
+            }),
+          )
+          .timeout(const Duration(seconds: 3));
+      await ConnectionLogger.instance.log(
+        'HTTP | Guest leave notified',
+        details:
+            'peer=${_localPeerId ?? "?"} attempt=$_connectionAttemptId',
+      );
+    } catch (e) {
+      await ConnectionLogger.instance.log(
+        'HTTP | Guest leave notify failed',
+        details: '$e',
+      );
+    }
   }
 
   // ── Transfer approval (receiver-side polling) ─────────────────────────────
@@ -1406,6 +1457,7 @@ class _FileListScreenState extends State<FileListScreen> {
             body: jsonEncode({
               'guestName': name.isEmpty ? 'Someone' : name,
               if (peerId.isNotEmpty) 'guestPeerId': peerId,
+              'connectionAttemptId': _connectionAttemptId,
             }),
           )
           .timeout(const Duration(seconds: 35));
@@ -1414,7 +1466,8 @@ class _FileListScreenState extends State<FileListScreen> {
 
       final body = json.decode(response.body) as Map<String, dynamic>?;
       final status = (body?['status'] as String?)?.trim() ?? 'approved';
-      final token = (body?['authToken'] as String?)?.trim();
+      final token = (body?['authToken'] as String?)?.trim() ??
+          (body?['accessToken'] as String?)?.trim();
       if (token != null && token.isNotEmpty) {
         HubGuestSession.instance.applyJoinToken(token);
       }

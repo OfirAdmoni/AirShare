@@ -338,12 +338,14 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             )
 
             val friendlyName = resolveGuestDisplayName(device)
+            val attemptId = "ble-${System.currentTimeMillis()}"
             runOnUiThread {
                 bleUiChannel?.invokeMethod(
                     "notifyConnectionRequest",
                     mapOf(
                         "friendlyName" to friendlyName,
                         "deviceAddress" to device.address,
+                        "connectionAttemptId" to attemptId,
                     ),
                 )
             }

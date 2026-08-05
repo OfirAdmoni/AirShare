@@ -4,7 +4,6 @@ import 'package:air_share/host_network_tier.dart';
 import 'package:air_share/hub_auth.dart';
 import 'package:air_share/hub_endpoint_state.dart';
 import 'package:air_share/hub_guest_session.dart';
-import 'package:air_share/hub_pre_approval.dart';
 
 /// Monotonic session generation — bumps on every full wipe so stale tokens die.
 class SessionContext {
@@ -43,11 +42,11 @@ class SessionContext {
     );
   }
 
-  /// Host-side auth/pre-approval memory (does not stop the HTTP server).
+  /// Host-side auth memory (does not stop the HTTP server).
+  /// Attempt-scoped approvals are cleared by [LocalHubRuntime.resetGuestHttpSession].
   static Future<void> wipeHostAuthState({required String reason}) async {
     HubAuth.bindToSessionEpoch(_epoch);
     HubAuth.revokeAll();
-    HubPreApproval.clear();
     await ConnectionLogger.instance.log(
       'Session | Host auth state wiped',
       details: 'epoch=$_epoch reason=$reason',
@@ -61,7 +60,6 @@ class SessionContext {
     GuestConnectionGuard.reset();
     HubAuth.bindToSessionEpoch(_epoch);
     HubAuth.revokeAll();
-    HubPreApproval.clear();
     await ConnectionLogger.instance.log(
       'Session | New session epoch',
       details: 'epoch=$_epoch reason=$reason',
