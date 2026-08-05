@@ -10,6 +10,8 @@ import 'package:air_share/ble_transport.dart';
 import 'package:air_share/connection_logger.dart';
 import 'package:air_share/connection_tier.dart';
 import 'package:air_share/guest_connection_guard.dart';
+import 'package:air_share/hub_guest_session.dart';
+import 'package:air_share/hub_http_client.dart';
 import 'package:air_share/handshake_trace.dart';
 import 'package:air_share/wlan_link_manager.dart';
 import 'package:air_share/wifi_tier_prerequisites.dart';
@@ -204,19 +206,16 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
 
   Future<PeerEndpoint?> _probeHttpHealth(String ip, int port) async {
     if (_leavingForMainMenu) return null;
-    final uri = Uri(scheme: 'http', host: ip, port: port, path: '/health');
-    final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+    final uri = Uri(scheme: 'https', host: ip, port: port, path: '/health');
+    final pin = HubGuestSession.instance.tlsCertSha256Pin;
+    final ioClient = HubHttpClient.create(tlsCertSha256Pin: pin);
     try {
       await HandshakeTrace.run<void>(
-        'HTTP health probe (guest → hub)',
+        'HTTPS health probe (guest → hub)',
         () async {
-          final request = await client
-              .getUrl(uri)
-              .timeout(const Duration(seconds: 6));
-          final response = await request.close().timeout(
-            const Duration(seconds: 8),
-          );
-          await response.drain<void>().timeout(const Duration(seconds: 3));
+          final response = await ioClient
+              .get(uri)
+              .timeout(const Duration(seconds: 10));
           if (response.statusCode != HttpStatus.ok) {
             throw HttpException(
               'Health endpoint returned HTTP ${response.statusCode}',
@@ -225,34 +224,34 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
           }
         },
         extra: uri.toString(),
-        hardTimeout: const Duration(seconds: 10),
+        hardTimeout: const Duration(seconds: 12),
       );
       if (_leavingForMainMenu) return null;
       await ConnectionLogger.instance.log(
-        'HTTP Health Success',
+        'HTTPS Health Success',
         details: uri.toString(),
       );
       return PeerEndpoint(ip: ip, port: port);
     } on TimeoutException catch (e) {
       await ConnectionLogger.instance.log(
-        'HTTP Health Timeout',
+        'HTTPS Health Timeout',
         details: '$uri $e',
       );
     } on SocketException catch (e) {
       await ConnectionLogger.instance.log(
         _looksLikeTcpTimeout(e)
-            ? 'HTTP Health Timeout (socket)'
-            : 'HTTP Health Failed',
+            ? 'HTTPS Health Timeout (socket)'
+            : 'HTTPS Health Failed',
         details: '$uri $e',
       );
     } catch (e, st) {
       await ConnectionLogger.instance.log(
-        'HTTP Health Failed',
+        'HTTPS Health Failed',
         details: '$uri ${e.runtimeType}: $e',
       );
-      debugPrint('[Discovery] HTTP health probe exception:\n$st');
+      debugPrint('[Discovery] HTTPS health probe exception:\n$st');
     } finally {
-      client.close(force: true);
+      ioClient.close();
     }
     return null;
   }
@@ -1136,6 +1135,9 @@ class _DiscoveryPageState extends State<DiscoveryPage> {
       await ConnectionLogger.instance.log(
         'HS | ServerHello payload (BLE JSON, log-safe)',
         details: handshakePayload.describeForLog(),
+      );
+      HubGuestSession.instance.applyHandshakePin(
+        handshakePayload.tlsCertSha256,
       );
       // If the GATT payload carries a better name (full custom name from
       // Settings), update both the overlay label and the peer list entry.

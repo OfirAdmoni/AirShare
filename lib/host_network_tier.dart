@@ -189,12 +189,18 @@ class HostNetworkTier {
       }
     }
 
+    // Only trust plugin Wi‑Fi IP when it matches a live pre-connected interface.
     if (wifiIp != null &&
         wifiIp.isNotEmpty &&
         isRealAdvertisablePrivateIp(wifiIp)) {
-      final onPreConnected = scored.any((c) => c.ip == wifiIp);
-      if (!onPreConnected) {
-        scored.add((name: 'network_info_plus', ip: wifiIp, score: 25));
+      for (var i = 0; i < scored.length; i++) {
+        if (scored[i].ip == wifiIp) {
+          scored[i] = (
+            name: scored[i].name,
+            ip: wifiIp,
+            score: scored[i].score + 15,
+          );
+        }
       }
     }
 

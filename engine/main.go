@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -278,7 +279,7 @@ func downloadFile(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileName))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s", url.QueryEscape(fileName)))
 	// ServeContent handles Range requests and sets Content-Length; logs copy errors via http.Server.
 	http.ServeContent(w, r, fileName, info.ModTime(), f)
 }
@@ -490,7 +491,37 @@ func main() {
 		log.Fatalf("[airshare] mkdir %q: %v", sharedRootRel, err)
 	}
 
-	http.HandleFunc("/files", func(w http.ResponseWriter, r *http.Request) {
+	localIP, ipErr := getLocalIPv4()
+	var certIPs []net.IP
+	if ipErr == nil {
+		certIPs = append(certIPs, localIP)
+	}
+	tlsPair, tlsPin, err := generateSelfSignedCert(certIPs)
+	if err != nil {
+		log.Fatalf("[airshare] TLS cert generation failed: %v", err)
+	}
+	log.Printf("[airshare] HTTPS hub TLS pin (SHA-256 DER): %s", certPinPreview(tlsPin))
+
+	sessions := newSessionAuth()
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":          "ok",
+			"tls":             true,
+			"tls_cert_sha256": tlsPin,
+		})
+	})
+
+	mux.HandleFunc("/join", handleJoin(sessions))
+	mux.HandleFunc("/host/join-respond", handleJoinRespond(sessions))
+	mux.HandleFunc("/host/pre-approve", handlePreApprove(sessions))
+
+	mux.HandleFunc("/files", sessions.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			getFiles(w, r)
@@ -499,22 +530,30 @@ func main() {
 		default:
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
-	})
-	http.HandleFunc("/download", downloadFile)
-	http.HandleFunc("/upload", uploadFile)
+	}))
+	mux.HandleFunc("/download", sessions.authMiddleware(downloadFile))
+	mux.HandleFunc("/upload", sessions.authMiddleware(uploadFile))
 
-	mdnsServer, localIP, err := startMDNSServer(8080)
+	const port = 8080
+	mdnsServer, advertisedIP, err := startMDNSServer(port)
 	if err != nil {
 		fmt.Printf("ERROR: Failed to start mDNS server: %v\n", err)
 	} else {
 		defer mdnsServer.Shutdown()
-		fmt.Printf("REAL Wi-Fi IP detected: %s\n", localIP.String())
-		fmt.Printf("mDNS is broadcasting on IP: %s\n", localIP.String())
+		fmt.Printf("REAL Wi-Fi IP detected: %s\n", advertisedIP.String())
+		fmt.Printf("mDNS is broadcasting on IP: %s\n", advertisedIP.String())
 		fmt.Println("mDNS service started: _airshare._tcp on port 8080")
 	}
 
-	fmt.Printf("AirShare Engine is scanning %q (%q) on port 8080...\n", sharedRootRel, sharedRootAbs)
-	if err := http.ListenAndServe("0.0.0.0:8080", nil); err != nil {
-		fmt.Printf("ERROR: HTTP server failed on 0.0.0.0:8080: %v\n", err)
+	server := &http.Server{
+		Addr:      fmt.Sprintf("0.0.0.0:%d", port),
+		Handler:   mux,
+		TLSConfig: tlsConfigFromCert(tlsPair),
+	}
+
+	fmt.Printf("AirShare Engine HTTPS listening on 0.0.0.0:%d (shared %q)\n", port, sharedRootAbs)
+	fmt.Printf("Advertise BLE tls_cert_sha256=%s for guest pin\n", tlsPin)
+	if err := server.ListenAndServeTLS("", ""); err != nil {
+		fmt.Printf("ERROR: HTTPS server failed on 0.0.0.0:%d: %v\n", port, err)
 	}
 }

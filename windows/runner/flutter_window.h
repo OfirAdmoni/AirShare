@@ -95,6 +95,7 @@ class FlutterWindow : public Win32Window {
   void ClearPendingReadState();
   winrt::Windows::Storage::Streams::IBuffer BuildHandshakeBuffer() const;
   winrt::Windows::Storage::Streams::IBuffer BuildEndpointBuffer() const;
+  std::string ResolveGuestDisplayName(const std::string& session_id);
 
   // The project to run.
   flutter::DartProject project_;
@@ -124,6 +125,7 @@ class FlutterWindow : public Win32Window {
   winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattLocalCharacteristic
       gatt_endpoint_{nullptr};
   std::optional<winrt::event_token> handshake_read_token_;
+  std::optional<winrt::event_token> handshake_write_token_;
   std::optional<winrt::event_token> endpoint_read_token_;
   bool is_advertising_ = false;
 
@@ -133,6 +135,8 @@ class FlutterWindow : public Win32Window {
   winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattSession
       pending_gatt_session_{nullptr};
   std::string pending_session_id_;
+  std::unordered_map<std::string, std::pair<std::string, std::string>>
+      client_hello_by_session_;
   std::mutex approval_mutex_;
   std::atomic<uint64_t> approval_timeout_generation_{0};
 

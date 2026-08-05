@@ -100,6 +100,34 @@ flutter::EncodableMap HandshakeJsonToEncodableMap(const std::string& json) {
   };
 }
 
+std::string BuildClientHelloJson(const std::string& peer_id,
+                                 const std::string& display_name) {
+  std::string name = display_name.empty() ? "Guest" : display_name;
+  std::ostringstream oss;
+  oss << "{\"type\":\"client_hello\",\"peer_id\":\"" << peer_id
+      << "\",\"display_name\":\"" << name << "\"}";
+  return oss.str();
+}
+
+bool TryParseClientHello(const std::string& json,
+                         std::string* peer_id,
+                         std::string* display_name) {
+  if (ExtractJsonStringField("type", json) != "client_hello") {
+    return false;
+  }
+  const std::string name = ExtractJsonStringField("display_name", json);
+  if (name.empty()) {
+    return false;
+  }
+  if (peer_id) {
+    *peer_id = ExtractJsonStringField("peer_id", json);
+  }
+  if (display_name) {
+    *display_name = name;
+  }
+  return true;
+}
+
 std::string GetHostComputerNameUtf8() {
   wchar_t buf[MAX_COMPUTERNAME_LENGTH + 1] = {};
   DWORD n = static_cast<DWORD>(MAX_COMPUTERNAME_LENGTH + 1);
@@ -613,13 +641,62 @@ void FlutterWindow::EstablishSecureHandshake(
       return;
     }
 
+    auto handshake_char = chars_result.Characteristics().GetAt(0);
+    std::string guest_peer_id = peer_id;
+    if (const auto guest_peer_it =
+            args_copy.find(flutter::EncodableValue("guestPeerId"));
+        guest_peer_it != args_copy.end()) {
+      try {
+        const auto parsed = std::get<std::string>(guest_peer_it->second);
+        if (!parsed.empty()) {
+          guest_peer_id = parsed;
+        }
+      } catch (...) {
+      }
+    }
+    std::string guest_display_name;
+    if (const auto guest_name_it =
+            args_copy.find(flutter::EncodableValue("guestDisplayName"));
+        guest_name_it != args_copy.end()) {
+      try {
+        guest_display_name = std::get<std::string>(guest_name_it->second);
+      } catch (...) {
+      }
+    }
+    std::string client_hello_json;
+    if (const auto hello_it =
+            args_copy.find(flutter::EncodableValue("clientHelloJson"));
+        hello_it != args_copy.end()) {
+      try {
+        client_hello_json = std::get<std::string>(hello_it->second);
+      } catch (...) {
+      }
+    }
+    if (client_hello_json.empty()) {
+      client_hello_json =
+          BuildClientHelloJson(guest_peer_id, guest_display_name);
+    }
+    try {
+      winrt::Windows::Storage::Streams::DataWriter hello_writer;
+      hello_writer.WriteString(winrt::to_hstring(client_hello_json));
+      const auto hello_buffer = hello_writer.DetachBuffer();
+      const auto write_result =
+          handshake_char.WriteValueWithResultAsync(hello_buffer).get();
+      if (write_result.Status() == GattCommunicationStatus::Success) {
+        OutputDebugStringW(L"[AirShareNative] ClientHello write succeeded\n");
+      } else {
+        OutputDebugStringW(L"[AirShareNative] ClientHello write failed; continuing\n");
+      }
+    } catch (...) {
+      OutputDebugStringW(L"[AirShareNative] ClientHello write exception; continuing\n");
+    }
+
     std::vector<uint8_t> bytes;
     bool handshake_ready = false;
     for (int attempt = 1; attempt <= 15; ++attempt) {
       GattReadResult read_result{nullptr};
       try {
-        read_result = chars_result.Characteristics()
-                          .GetAt(0)
+        read_result = handshake_char
                           .ReadValueAsync(BluetoothCacheMode::Uncached)
                           .get();
       } catch (const winrt::hresult_error& e) {
@@ -896,7 +973,8 @@ void FlutterWindow::StartHubAdvertising(
 
     GattLocalCharacteristicParameters params;
     params.CharacteristicProperties(GattCharacteristicProperties::Read |
-                                    GattCharacteristicProperties::Notify);
+                                    GattCharacteristicProperties::Notify |
+                                    GattCharacteristicProperties::Write);
     params.UserDescription(L"Secure handshake payload");
 
     auto char_result =
@@ -909,6 +987,43 @@ void FlutterWindow::StartHubAdvertising(
       return;
     }
     gatt_handshake_ = char_result.Characteristic();
+
+    handshake_write_token_ = gatt_handshake_.WriteRequested(
+        [this](GattLocalCharacteristic const&,
+               GattWriteRequestedEventArgs args) {
+          auto deferral = args.GetDeferral();
+          try {
+            auto request = args.GetRequestAsync().get();
+            const auto session_id =
+                WinrtStringToUtf8(args.Session().DeviceId().Id());
+            const auto buffer = request.Value();
+            winrt::Windows::Storage::Streams::DataReader reader =
+                winrt::Windows::Storage::Streams::DataReader::FromBuffer(buffer);
+            const uint32_t len = reader.UnconsumedBufferLength();
+            std::string json(len, '\0');
+            if (len > 0) {
+              reader.ReadBytes(
+                  winrt::array_view<uint8_t>(
+                      reinterpret_cast<uint8_t*>(json.data()), len));
+            }
+            std::string peer_id;
+            std::string display_name;
+            if (TryParseClientHello(json, &peer_id, &display_name)) {
+              std::lock_guard<std::mutex> lock(approval_mutex_);
+              client_hello_by_session_[session_id] = {peer_id, display_name};
+              OutputDebugStringW(
+                  (L"[AirShareNative] ClientHello session=" +
+                   std::wstring(session_id.begin(), session_id.end()) +
+                   L" name=" +
+                   std::wstring(display_name.begin(), display_name.end()) +
+                   L"\n")
+                      .c_str());
+            }
+            request.Respond();
+          } catch (...) {
+          }
+          deferral.Complete();
+        });
 
     GattLocalCharacteristicParameters endpoint_params;
     endpoint_params.CharacteristicProperties(GattCharacteristicProperties::Read |
@@ -963,7 +1078,8 @@ void FlutterWindow::StartHubAdvertising(
             }
             OutputDebugStringW(
                 L"[AirShareNative] Peer Handshake Blocked - Waiting for UI Approval\n");
-            NotifyFlutterConnectionRequest("BLE Peer", session_id);
+            NotifyFlutterConnectionRequest(
+                ResolveGuestDisplayName(session_id), session_id);
             ScheduleApprovalTimeout();
             return;
           } catch (...) {
@@ -1063,7 +1179,15 @@ void FlutterWindow::StopHubAdvertisingInternal() {
     gatt_endpoint_.ReadRequested(*endpoint_read_token_);
   }
   handshake_read_token_.reset();
+  if (gatt_handshake_ && handshake_write_token_) {
+    gatt_handshake_.WriteRequested(*handshake_write_token_);
+  }
+  handshake_write_token_.reset();
   endpoint_read_token_.reset();
+  {
+    std::lock_guard<std::mutex> lock(approval_mutex_);
+    client_hello_by_session_.clear();
+  }
   gatt_handshake_ = nullptr;
   gatt_endpoint_ = nullptr;
   if (gatt_provider_) {
@@ -1218,6 +1342,16 @@ void FlutterWindow::ClearPendingReadState() {
   }
   pending_gatt_session_ = nullptr;
   pending_session_id_.clear();
+}
+
+std::string FlutterWindow::ResolveGuestDisplayName(
+    const std::string& session_id) {
+  std::lock_guard<std::mutex> lock(approval_mutex_);
+  const auto it = client_hello_by_session_.find(session_id);
+  if (it != client_hello_by_session_.end() && !it->second.second.empty()) {
+    return it->second.second;
+  }
+  return "Unknown Peer";
 }
 
 winrt::Windows::Storage::Streams::IBuffer FlutterWindow::BuildHandshakeBuffer() const {

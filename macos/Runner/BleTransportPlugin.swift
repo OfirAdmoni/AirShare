@@ -33,6 +33,7 @@ final class BleTransportPlugin: NSObject {
   private var handshakeDelivered = false
   private var handshakeWaitWorkItem: DispatchWorkItem?
   private var guestHandshakeCharacteristic: CBCharacteristic?
+  private var pendingGuestClientHelloData: Data?
 
   private static var retained: BleTransportPlugin?
 
@@ -172,6 +173,27 @@ final class BleTransportPlugin: NSObject {
 
   // MARK: - Guest handshake
 
+  private func buildClientHelloData(peerId: String, displayName: String) -> Data {
+    let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+    let resolved = name.isEmpty ? "Guest" : name
+    let payload: [String: String] = [
+      "type": "client_hello",
+      "peer_id": peerId.trimmingCharacters(in: .whitespacesAndNewlines),
+      "display_name": resolved,
+    ]
+    return (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+  }
+
+  private func beginGuestHandshakeNotify(
+    peripheral: CBPeripheral,
+    handshakeChar: CBCharacteristic
+  ) {
+    guestHandshakeCharacteristic = handshakeChar
+    logBle("ClientHello: subscribe notify + initial read on handshake characteristic")
+    peripheral.setNotifyValue(true, for: handshakeChar)
+    peripheral.readValue(for: handshakeChar)
+  }
+
   private func establishSecureHandshake(call: FlutterMethodCall, result: @escaping FlutterResult) {
     guard let args = call.arguments as? [String: Any],
           let peerId = (args["peerId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -181,6 +203,19 @@ final class BleTransportPlugin: NSObject {
       logBle("handshake start failed: peer_not_found")
       result(FlutterError(code: "peer_not_found", message: "Unable to resolve peer device.", details: nil))
       return
+    }
+
+    let guestPeerId = (args["guestPeerId"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines).flatMap { $0.isEmpty ? nil : $0 } ?? peerId
+    let guestDisplayName = (args["guestDisplayName"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if let json = (args["clientHelloJson"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines),
+       !json.isEmpty,
+       let data = json.data(using: .utf8) {
+      pendingGuestClientHelloData = data
+    } else {
+      pendingGuestClientHelloData = buildClientHelloData(peerId: guestPeerId, displayName: guestDisplayName)
     }
 
     logBle(
@@ -556,13 +591,29 @@ extension BleTransportPlugin: CBPeripheralDelegate {
     }
 
     guestHandshakeCharacteristic = handshakeChar
-    logBle(
-      "handshake characteristic discovered uuid=\(handshakeChar.uuid.uuidString) "
-        + "properties=\(handshakeChar.properties.rawValue)"
-    )
-    logBle("ClientHello: subscribe notify + initial read on handshake characteristic")
-    peripheral.setNotifyValue(true, for: handshakeChar)
-    peripheral.readValue(for: handshakeChar)
+    if let helloData = pendingGuestClientHelloData, !helloData.isEmpty {
+      pendingGuestClientHelloData = nil
+      logBle("ClientHello: writing \(helloData.count) bytes before ServerHello read")
+      peripheral.writeValue(helloData, for: handshakeChar, type: .withResponse)
+    } else {
+      beginGuestHandshakeNotify(peripheral: peripheral, handshakeChar: handshakeChar)
+    }
+  }
+
+  func peripheral(
+    _ peripheral: CBPeripheral,
+    didWriteValueFor characteristic: CBCharacteristic,
+    error: Error?
+  ) {
+    guard peripheral === activeGuestPeripheral,
+          characteristic.uuid == Self.handshakeCharacteristicUuid
+    else { return }
+    if let error {
+      logBle("ClientHello write failed: \(error.localizedDescription); continuing")
+    } else {
+      logBle("ClientHello write succeeded")
+    }
+    beginGuestHandshakeNotify(peripheral: peripheral, handshakeChar: characteristic)
   }
 
   func peripheral(

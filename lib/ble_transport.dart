@@ -2,7 +2,9 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:air_share/air_share_constants.dart';
+import 'package:air_share/client_hello.dart';
 import 'package:air_share/handshake_trace.dart';
+import 'package:air_share/local_peer_identity.dart';
 import 'package:flutter/services.dart';
 
 class BlePeer {
@@ -44,6 +46,7 @@ class HandshakePayload {
     this.legacyHubIp = '',
     this.hubPort = 8080,
     this.friendlyName = '',
+    this.tlsCertSha256 = '',
   });
 
   final String lanIp;
@@ -60,6 +63,9 @@ class HandshakePayload {
 
   /// Sender's display name from Settings, embedded in the GATT handshake.
   final String friendlyName;
+
+  /// SHA-256 (hex) of hub TLS cert DER — guest pins HTTPS connections.
+  final String tlsCertSha256;
 
   /// Legacy primary hub IP (LAN preferred, then hotspot, then P2P).
   String get hubIp {
@@ -100,6 +106,11 @@ class HandshakePayload {
       legacyHubIp: legacyHub,
       hubPort: port,
       friendlyName: (map['friendly_name'] ?? '').toString(),
+      tlsCertSha256: (map['tls_cert_sha256'] ?? '')
+          .toString()
+          .replaceAll('\n', '')
+          .replaceAll('\r', '')
+          .trim(),
     );
   }
 
@@ -228,6 +239,7 @@ class BleTransport {
     required String hotspotPass,
     required String hotspotHubIp,
     required int hubPort,
+    String tlsCertSha256 = '',
   }) async {
     if (Platform.isWindows) {
       final primary = lanIp.isNotEmpty
@@ -244,24 +256,36 @@ class BleTransport {
       'hotspotPass': hotspotPass,
       'hotspotHubIp': hotspotHubIp,
       'hubPort': hubPort,
+      if (tlsCertSha256.isNotEmpty) 'tlsCertSha256': tlsCertSha256,
     });
   }
 
   /// Waits for host approval via GATT notification (no read polling).
   Future<HandshakePayload> establishSecureHandshake(BlePeer peer) async {
+    final identity = await LocalPeerIdentity.resolve();
     final payload = await HandshakeTrace.run(
       'ClientHello→ServerHello (BLE notify handshake JSON)',
       () async {
         final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
           'establishSecureHandshake',
-          {'peerId': peer.id, 'serviceUuid': peer.serviceUuid},
+          {
+            'peerId': peer.id,
+            'serviceUuid': peer.serviceUuid,
+            'guestPeerId': identity.peerId,
+            'guestDisplayName': identity.displayName,
+            'clientHelloJson': ClientHello.encode(
+              peerId: identity.peerId,
+              displayName: identity.displayName,
+            ),
+          },
         );
         if (raw == null) {
           throw Exception('Secure handshake returned empty payload');
         }
         return HandshakePayload.fromMap(raw);
       },
-      extra: 'peerId=${peer.id} name=${peer.friendlyName}',
+      extra:
+          'peerId=${peer.id} guestPeerId=${identity.peerId} name=${identity.displayName}',
       hardTimeout: const Duration(seconds: 45),
     );
     return payload;

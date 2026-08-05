@@ -9,7 +9,14 @@ import 'package:mime/mime.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'ble_transport.dart';
 import 'connection_logger.dart';
+import 'hub_auth.dart';
+import 'hub_go_pre_approval_sync.dart';
+import 'hub_pre_approval.dart';
+import 'hub_tls.dart';
+import 'host_network_tier.dart';
+import 'session_context.dart';
 import 'hub_status.dart';
 import 'shared_file_entry.dart';
 import 'shared_room_manifest.dart';
@@ -65,8 +72,15 @@ class LocalHubRuntime {
   final StreamController<String> _joinRequestController =
       StreamController<String>.broadcast();
 
-  /// Guest HTTP (/files, /download, /upload, /delete) allowed only after BLE approve.
+  /// Guest HTTP (/files, /download, /upload, /delete) requires [HubAuth] token after /join.
   bool _guestHttpAccessGranted = false;
+
+  /// SHA-256 pin of hub TLS cert (DER) for BLE handshake + guest HttpClient.
+  String? _tlsCertSha256Pin;
+
+  String? get tlsCertSha256Pin =>
+      _tlsCertSha256Pin?.replaceAll('\n', '').replaceAll('\r', '').trim();
+  bool get usesTls => _tlsCertSha256Pin != null && _tlsCertSha256Pin!.isNotEmpty;
 
   TransferApprovalRequest? get pendingTransfer => _pendingTransfer;
 
@@ -112,6 +126,9 @@ class LocalHubRuntime {
 
   void resetGuestHttpSession({required String reason}) {
     _guestHttpAccessGranted = false;
+    HubAuth.bindToSessionEpoch(SessionContext.epoch);
+    HubAuth.revokeAll();
+    HubPreApproval.clear();
     unawaited(
       ConnectionLogger.instance.log(
         'HTTP | Guest session reset',
@@ -120,18 +137,42 @@ class LocalHubRuntime {
     );
   }
 
-  void grantGuestHttpAccess({required String reason}) {
+  void grantGuestHttpAccess({
+    required String reason,
+    String? peerId,
+    String? displayName,
+    int? hubPort,
+  }) {
     _guestHttpAccessGranted = true;
+    HubAuth.bindToSessionEpoch(SessionContext.epoch);
+    final id = peerId?.trim() ?? '';
+    if (id.isNotEmpty || (displayName?.trim().isNotEmpty ?? false)) {
+      HubPreApproval.add(
+        peerId: id.isEmpty ? null : id,
+        displayName: displayName,
+      );
+    }
+    final port = hubPort ?? _activePort;
+    unawaited(
+      HubGoPreApprovalSync.notify(
+        port: port,
+        peerId: id.isEmpty ? null : id,
+        displayName: displayName,
+      ),
+    );
     unawaited(
       ConnectionLogger.instance.log(
-        'HTTP | Guest access token issued',
-        details: reason,
+        'HTTP | Guest BLE pre-approved (peer-id bound)',
+        details: '$reason peerId=$id keys=${HubPreApproval.hasAny()}',
       ),
     );
   }
 
   void revokeGuestHttpAccess({required String reason}) {
     _guestHttpAccessGranted = false;
+    HubAuth.bindToSessionEpoch(SessionContext.epoch);
+    HubAuth.revokeAll();
+    HubPreApproval.clear();
     unawaited(
       ConnectionLogger.instance.log(
         'HTTP | Guest access revoked',
@@ -140,7 +181,47 @@ class LocalHubRuntime {
     );
   }
 
+  /// Clears native BLE tier fields so a prior session's LAN IP cannot skip Tier 2.
+  Future<void> clearStaleConnectionEndpoints({required String reason}) async {
+    try {
+      await BleTransport.instance.updateConnectionEndpoints(
+        lanIp: '',
+        p2pIp: '',
+        p2pMac: '',
+        hotspotSsid: '',
+        hotspotPass: '',
+        hotspotHubIp: '',
+        hubPort: _activePort ?? 8080,
+        tlsCertSha256: _tlsCertSha256Pin ?? '',
+      );
+      unawaited(
+        ConnectionLogger.instance.log(
+          'Session | Native connection endpoints cleared',
+          details: reason,
+        ),
+      );
+    } catch (error) {
+      unawaited(
+        ConnectionLogger.instance.log(
+          'Session | Native endpoint clear failed',
+          details: '$reason — $error',
+        ),
+      );
+    }
+  }
+
+  /// Live sender tier plan for the current session (refreshed at [SessionContext.beginNewSession]).
+  Future<HostSenderNetworkPlan> requireSenderNetworkPlan({
+    required String reason,
+  }) async {
+    final cached = SessionContext.liveNetworkPlan;
+    if (cached != null) return cached;
+    return SessionContext.refreshLiveNetworkPlan(reason: reason);
+  }
+
   Future<void> ensureStarted(HubStatus status) async {
+    await SessionContext.beginNewSession(reason: 'sender_hub_ensureStarted');
+    await clearStaleConnectionEndpoints(reason: 'sender_hub_ensureStarted');
     resetGuestHttpSession(reason: 'sender_hub_ensureStarted');
     if (isRunning) {
       status.setBroadcasting();
@@ -154,38 +235,49 @@ class LocalHubRuntime {
       await _ensureSharedDirectoryExists(_sharedDirPath!);
       final sharedDir = Directory(_sharedDirPath!);
 
-      _server = await _bindWithPortFallback(
+      final tlsCreds = await HubTlsCredentials.generate();
+      _tlsCertSha256Pin = tlsCreds.sha256Pin
+          .replaceAll('\n', '')
+          .replaceAll('\r', '')
+          .trim();
+
+      _server = await _bindSecureWithPortFallback(
         address: _hubListenAllIPv4,
         startingPort: 8080,
         maxAttempts: 10,
+        securityContext: tlsCreds.securityContext,
       );
       _activePort = _server!.port;
       final boundAddr = _server!.address.address;
       await ConnectionLogger.instance.log(
-        'HTTP Server Start',
+        'HTTPS Server Start',
         details:
-            'bind=$boundAddr port=$_activePort shared_dir=${sharedDir.path} '
-            '(expect bind=0.0.0.0 for LAN guests)',
+            'bind=$boundAddr port=$_activePort tls_pin=${_tlsCertSha256Pin!.substring(0, 16)}… '
+            'shared_dir=${sharedDir.path}',
       );
       await _logHubIpv4Interfaces(bindAddress: boundAddr, port: _activePort);
       stdout.writeln(
         '[HubRuntime] shared directory (serve from): ${sharedDir.path}',
       );
-      _server!.listen((request) async {
-        try {
-          await _routeRequest(request, sharedDir.path);
-        } catch (error, stackTrace) {
-          stdout.writeln('[HubRuntime] Request handler error: $error');
-          stdout.writeln(stackTrace);
-          request.response.statusCode = HttpStatus.internalServerError;
-          request.response.write('Internal server error');
-          await request.response.close();
-        }
+      _server!.listen((request) {
+        unawaited(
+          _routeRequest(request, sharedDir.path).catchError(
+            (Object error, StackTrace stackTrace) async {
+              stdout.writeln('[HubRuntime] Request handler error: $error');
+              stdout.writeln(stackTrace);
+              try {
+                request.response.statusCode = HttpStatus.internalServerError;
+                request.response.write('Internal server error');
+                await request.response.close();
+              } catch (_) {}
+            },
+          ),
+        );
       });
 
       status.setBroadcasting();
       stdout.writeln(
-        '[HubRuntime] Sender HTTP server started on port $_activePort',
+        '[HubRuntime] Sender HTTPS server started on port $_activePort',
       );
     } on SocketException catch (error) {
       status.setError('Port binding failed after retries: $error');
@@ -220,6 +312,7 @@ class LocalHubRuntime {
     }
     _joinDecisionCompleter = null;
     _pendingJoinGuestName = null;
+    _tlsCertSha256Pin = null;
     await _server?.close(force: true);
     _server = null;
     _activePort = 8080;
@@ -259,6 +352,36 @@ class LocalHubRuntime {
 
   String _joinSharedPath(String dir, String fileName) {
     return p.join(dir, fileName);
+  }
+
+  Future<HttpServer> _bindSecureWithPortFallback({
+    required InternetAddress address,
+    required int startingPort,
+    required int maxAttempts,
+    required SecurityContext securityContext,
+  }) async {
+    var attempt = 0;
+    var port = startingPort;
+    Object? lastError;
+
+    while (attempt < maxAttempts) {
+      try {
+        return await HttpServer.bindSecure(
+          address,
+          port,
+          securityContext,
+          shared: true,
+        );
+      } catch (error) {
+        lastError = error;
+        stdout.writeln(
+          '[HubRuntime] TLS port $port unavailable, trying ${port + 1}...',
+        );
+        attempt++;
+        port++;
+      }
+    }
+    throw SocketException('Unable to bind TLS server port: $lastError');
   }
 
   Future<HttpServer> _bindWithPortFallback({
@@ -358,16 +481,28 @@ class LocalHubRuntime {
     }
 
     if (path == '/transfer-request' && method == 'POST') {
+      if (!_isGuestHttpRequestAllowed(request)) {
+        await _rejectGuestHttpNotApproved(request, path: 'POST /transfer-request');
+        return;
+      }
       await _handleTransferRequest(request);
       return;
     }
 
     if (path == '/pending-transfer' && method == 'GET') {
+      if (!_isGuestHttpRequestAllowed(request)) {
+        await _rejectGuestHttpNotApproved(request, path: 'GET /pending-transfer');
+        return;
+      }
       await _handlePendingTransfer(request);
       return;
     }
 
     if (path == '/transfer-response' && method == 'POST') {
+      if (!_isGuestHttpRequestAllowed(request)) {
+        await _rejectGuestHttpNotApproved(request, path: 'POST /transfer-response');
+        return;
+      }
       await _handleTransferResponse(request);
       return;
     }
@@ -390,6 +525,8 @@ class LocalHubRuntime {
         'status': 'ok',
         'port': _activePort,
         'bind': _server?.address.address ?? 'unknown',
+        'tls': true,
+        if (_tlsCertSha256Pin != null) 'tls_cert_sha256': _tlsCertSha256Pin,
       }),
     );
     await request.response.close();
@@ -411,7 +548,9 @@ class LocalHubRuntime {
 
   bool _isGuestHttpRequestAllowed(HttpRequest request) {
     if (_isHostHttpRequester(request)) return true;
-    return _guestHttpAccessGranted;
+    if (!_guestHttpAccessGranted) return false;
+    final token = _headerValue(request, HubAuth.headerName);
+    return HubAuth.isValidToken(token);
   }
 
   Future<void> _rejectGuestHttpNotApproved(
@@ -419,17 +558,22 @@ class LocalHubRuntime {
     required String path,
   }) async {
     final remote = request.connectionInfo?.remoteAddress;
+    final tokenPresent =
+        (_headerValue(request, HubAuth.headerName) ?? '').isNotEmpty;
     await ConnectionLogger.instance.log(
-      'HTTP | Guest request rejected (not approved)',
-      details: 'path=$path remote=$remote',
+      'HTTP | Guest request rejected (invalid or missing auth token)',
+      details: 'path=$path remote=$remote token_present=$tokenPresent',
     );
     stdout.writeln(
-      '[HubRuntime] $path rejected — guest HTTP not approved remote=$remote',
+      '[HubRuntime] $path rejected — missing/invalid auth token remote=$remote',
     );
     request.response.statusCode = HttpStatus.forbidden;
     request.response.headers.contentType = ContentType.json;
     request.response.write(
-      jsonEncode({'error': 'not_approved', 'message': 'Host has not approved this guest'}),
+      jsonEncode({
+        'error': 'unauthorized',
+        'message': 'Valid session auth token required — POST /join first',
+      }),
     );
     await request.response.close();
   }
@@ -597,7 +741,7 @@ class LocalHubRuntime {
       final safeName = fileName.replaceAll('"', '');
       request.response.headers.set(
         'content-disposition',
-        'attachment; filename="$safeName"',
+        "attachment; filename*=UTF-8''${Uri.encodeComponent(safeName)}",
       );
       request.response.contentLength = size;
       responseCommitted = true;
@@ -868,26 +1012,75 @@ class LocalHubRuntime {
   Future<void> _handleGuestJoin(HttpRequest request) async {
     final bodyBytes = await _readBody(request);
     String guestName = 'Someone';
+    String guestPeerId = '';
     try {
       final body = json.decode(utf8.decode(bodyBytes)) as Map<String, dynamic>;
       final raw = (body['guestName'] as String?)?.trim() ?? '';
       if (raw.isNotEmpty) guestName = raw;
+      guestPeerId = (body['guestPeerId'] as String?)?.trim() ?? '';
     } catch (_) {}
 
-    // If an approval dialog is already open for another guest, auto-approve
-    // this one immediately so concurrent joiners are never silently dropped.
-    if (_joinDecisionCompleter != null) {
-      grantGuestHttpAccess(reason: 'auto_approve_concurrent_$guestName');
+    final headerPeerId =
+        (_headerValue(request, 'x-airshare-requester-peer-id') ?? '').trim();
+    if (guestPeerId.isEmpty && headerPeerId.isNotEmpty) {
+      guestPeerId = headerPeerId;
+    }
+
+    final preApproved =
+        HubPreApproval.matches(peerId: guestPeerId, displayName: guestName);
+
+    if (preApproved) {
+      HubPreApproval.consume(peerId: guestPeerId, displayName: guestName);
+      final token = HubAuth.issueToken(guestName);
+      _guestHttpAccessGranted = true;
       _guestJoinedController.add(guestName);
       await ConnectionLogger.instance.log(
-        'HTTP | Guest join auto-approved (another approval in progress)',
-        details: 'name=$guestName',
+        'HTTP | Guest join auto-approved (BLE pre-approval)',
+        details:
+            'name=$guestName peerId=$guestPeerId token_issued=true',
       );
       try {
         request.response.headers.contentType =
             ContentType('application', 'json', charset: 'utf-8');
         request.response.write(
-          jsonEncode({'status': 'approved', 'guestName': guestName}),
+          jsonEncode({
+            'status': 'approved',
+            'guestName': guestName,
+            'authToken': token,
+          }),
+        );
+        await request.response.close();
+      } catch (_) {}
+      return;
+    }
+
+    await ConnectionLogger.instance.log(
+      'HTTP | Guest join pre-approval miss',
+      details:
+          'name=$guestName peerId=$guestPeerId headerPeerId=$headerPeerId '
+          'http_granted=$_guestHttpAccessGranted '
+          'pre_keys=${HubPreApproval.hasAny()}',
+    );
+
+    // If an approval dialog is already open for another guest, auto-approve
+    // this one immediately so concurrent joiners are never silently dropped.
+    if (_joinDecisionCompleter != null) {
+      final token = HubAuth.issueToken(guestName);
+      _guestHttpAccessGranted = true;
+      _guestJoinedController.add(guestName);
+      await ConnectionLogger.instance.log(
+        'HTTP | Guest join auto-approved (another approval in progress)',
+        details: 'name=$guestName token_issued=true',
+      );
+      try {
+        request.response.headers.contentType =
+            ContentType('application', 'json', charset: 'utf-8');
+        request.response.write(
+          jsonEncode({
+            'status': 'approved',
+            'guestName': guestName,
+            'authToken': token,
+          }),
         );
         await request.response.close();
       } catch (_) {}
@@ -923,12 +1116,16 @@ class LocalHubRuntime {
       details: 'name=$guestName approved=$approved',
     );
 
+    String? issuedToken;
     if (approved) {
-      grantGuestHttpAccess(reason: 'host_approved_join_$guestName');
+      issuedToken = HubAuth.issueToken(guestName);
+      _guestHttpAccessGranted = true;
       _guestJoinedController.add(guestName);
+      await ConnectionLogger.instance.log(
+        'HTTP | Guest join approved — auth token issued',
+        details: 'name=$guestName',
+      );
     } else {
-      // Revoke any HTTP access that was previously granted at the BLE level
-      // so the guest cannot access files even if the BLE approval already ran.
       revokeGuestHttpAccess(reason: 'host_declined_join_$guestName');
     }
 
@@ -939,6 +1136,7 @@ class LocalHubRuntime {
         jsonEncode({
           'status': approved ? 'approved' : 'declined',
           'guestName': guestName,
+          if (approved && issuedToken != null) 'authToken': issuedToken,
         }),
       );
       await request.response.close();
