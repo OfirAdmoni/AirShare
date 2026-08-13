@@ -97,6 +97,98 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
     private var pendingReadOffset: Int = 0
     private var handshakePayload: ByteArray = ByteArray(0)
 
+    private data class ClientHelloInfo(val peerId: String, val displayName: String)
+    private val clientHelloByDeviceAddress = linkedMapOf<String, ClientHelloInfo>()
+    private var pendingGuestClientHelloPayload: ByteArray? = null
+    private val approvalUiEmittedAddresses = mutableSetOf<String>()
+    private val connectionAttemptIdByAddress = linkedMapOf<String, String>()
+    private val pendingApprovalNotifyRunnables = mutableMapOf<String, Runnable>()
+
+    private fun buildClientHelloBytes(peerId: String, displayName: String): ByteArray {
+        val name = displayName.trim().ifEmpty { "Guest" }
+        val json = JSONObject()
+            .put("type", "client_hello")
+            .put("peer_id", peerId.trim())
+            .put("display_name", name)
+        return json.toString().toByteArray(StandardCharsets.UTF_8)
+    }
+
+    private fun parseClientHello(bytes: ByteArray): ClientHelloInfo? {
+        if (bytes.isEmpty()) return null
+        return try {
+            val json = JSONObject(String(bytes, StandardCharsets.UTF_8))
+            if (json.optString("type") != "client_hello") return null
+            val displayName = json.optString("display_name", "").trim()
+            if (displayName.isEmpty()) return null
+            ClientHelloInfo(
+                peerId = json.optString("peer_id", "").trim(),
+                displayName = displayName,
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun resolveGuestDisplayName(device: BluetoothDevice): String {
+        clientHelloByDeviceAddress[device.address]?.displayName?.takeIf { it.isNotEmpty() }?.let {
+            return it
+        }
+        return device.name?.trim()?.takeIf { it.isNotEmpty() } ?: "Unknown Peer"
+    }
+
+    private fun cancelPendingApprovalNotify(address: String) {
+        pendingApprovalNotifyRunnables.remove(address)?.let {
+            approvalTimeoutHandler.removeCallbacks(it)
+        }
+    }
+
+    private fun emitConnectionRequestOnce(device: BluetoothDevice, friendlyName: String, reason: String) {
+        val address = device.address
+        if (approvalUiEmittedAddresses.contains(address)) {
+            Log.i(
+                "AirShareNative",
+                "Approval | Duplicate approval suppressed | source=BLE reason=$reason "
+                    + "address=$address displayName=$friendlyName",
+            )
+            Log.i(
+                "AirShareNative",
+                "Approval | Approved/pending entry metadata updated without new UI event "
+                    + "address=$address displayName=$friendlyName",
+            )
+            return
+        }
+        approvalUiEmittedAddresses.add(address)
+        Log.i(
+            "AirShareNative",
+            "Approval | Entry created | source=BLE address=$address "
+                + "displayName=$friendlyName reason=$reason",
+        )
+        Log.i(
+            "AirShareNative",
+            "ClientHello | Used for approval UI display_name=$friendlyName "
+                + "peer_id=${clientHelloByDeviceAddress[address]?.peerId ?: ""}",
+        )
+        val attemptId = connectionAttemptIdByAddress.getOrPut(address) {
+            val id = "ble-${System.currentTimeMillis()}"
+            Log.i(
+                "AirShareNative",
+                "Approval | New connectionAttemptId created reason=ble_first_notify "
+                    + "address=$address connectionAttemptId=$id",
+            )
+            id
+        }
+        runOnUiThread {
+            bleUiChannel?.invokeMethod(
+                "notifyConnectionRequest",
+                mapOf(
+                    "friendlyName" to friendlyName,
+                    "deviceAddress" to address,
+                    "connectionAttemptId" to attemptId,
+                ),
+            )
+        }
+    }
+
     private val approvalTimeoutHandler = Handler(Looper.getMainLooper())
     private var approvalTimeoutRunnable: Runnable? = null
 
@@ -260,14 +352,34 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                 "Peer Handshake Blocked - Waiting for UI Approval (${device.address})",
             )
 
-            val friendlyName = device.name ?: "Unknown Peer"
-            runOnUiThread {
-                bleUiChannel?.invokeMethod(
-                    "notifyConnectionRequest",
-                    mapOf(
-                        "friendlyName" to friendlyName,
-                        "deviceAddress" to device.address,
-                    ),
+            // Prefer ClientHello display name; defer UI briefly if identity not yet written.
+            val knownHello = clientHelloByDeviceAddress[device.address]
+            if (knownHello != null) {
+                emitConnectionRequestOnce(
+                    device,
+                    knownHello.displayName,
+                    "empty_read_with_client_hello",
+                )
+            } else {
+                cancelPendingApprovalNotify(device.address)
+                val runnable = Runnable {
+                    pendingApprovalNotifyRunnables.remove(device.address)
+                    // Prefer ClientHello; otherwise emit reliable Unknown Peer once.
+                    val hello = clientHelloByDeviceAddress[device.address]
+                    val name = hello?.displayName?.takeIf { it.isNotEmpty() }
+                        ?: device.name?.trim()?.takeIf { it.isNotEmpty() }
+                        ?: "Unknown Peer"
+                    emitConnectionRequestOnce(
+                        device,
+                        name,
+                        if (hello != null) "empty_read_after_client_hello" else "empty_read_fallback",
+                    )
+                }
+                pendingApprovalNotifyRunnables[device.address] = runnable
+                approvalTimeoutHandler.postDelayed(runnable, 1500)
+                Log.i(
+                    "AirShareNative",
+                    "Approval | Deferring UI until ClientHello address=${device.address}",
                 )
             }
             val emptyPayload = ByteArray(0)
@@ -297,14 +409,33 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             value: ByteArray,
         ) {
             if (characteristic.uuid == handshakeCharacteristicUuid) {
-                Log.w("AirShareNative", "Handshake characteristic write rejected from ${device.address}")
+                val hello = parseClientHello(value)
+                if (hello != null) {
+                    clientHelloByDeviceAddress[device.address] = hello
+                    Log.i(
+                        "AirShareNative",
+                        "ClientHello displayName=${hello.displayName} guestPeerId=${hello.peerId} "
+                            + "from ${device.address}",
+                    )
+                    cancelPendingApprovalNotify(device.address)
+                    emitConnectionRequestOnce(
+                        device,
+                        hello.displayName,
+                        "client_hello_write",
+                    )
+                } else {
+                    Log.w(
+                        "AirShareNative",
+                        "Handshake write ignored (not ClientHello) from ${device.address}",
+                    )
+                }
                 if (responseNeeded) {
                     gattServer?.sendResponse(
                         device,
                         requestId,
-                        BluetoothGatt.GATT_WRITE_NOT_PERMITTED,
+                        BluetoothGatt.GATT_SUCCESS,
                         offset,
-                        null,
+                        value,
                     )
                 }
                 return
@@ -1162,8 +1293,11 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         val service = BluetoothGattService(serviceUuid, BluetoothGattService.SERVICE_TYPE_PRIMARY)
         val characteristic = BluetoothGattCharacteristic(
             handshakeCharacteristicUuid,
-            BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-            BluetoothGattCharacteristic.PERMISSION_READ,
+            BluetoothGattCharacteristic.PROPERTY_READ or
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY or
+                BluetoothGattCharacteristic.PROPERTY_WRITE,
+            BluetoothGattCharacteristic.PERMISSION_READ or
+                BluetoothGattCharacteristic.PERMISSION_WRITE,
         )
         val endpoint = BluetoothGattCharacteristic(
             endpointCharacteristicUuid,
@@ -1237,7 +1371,52 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         handshakeCharacteristic = null
         endpointCharacteristic = null
         handshakePayload = ByteArray(0)
+        clientHelloByDeviceAddress.clear()
+        approvalUiEmittedAddresses.clear()
+        connectionAttemptIdByAddress.clear()
+        for (r in pendingApprovalNotifyRunnables.values) {
+            approvalTimeoutHandler.removeCallbacks(r)
+        }
+        pendingApprovalNotifyRunnables.clear()
         result.success(null)
+    }
+
+
+    private fun beginGuestHandshakeSubscription(
+        gatt: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+    ) {
+        handshakeDeliveryGatt = gatt
+        gatt.setCharacteristicNotification(characteristic, true)
+        val descriptor = characteristic.getDescriptor(clientConfigDescriptorUuid)
+        if (descriptor == null) {
+            if (!gatt.readCharacteristic(characteristic)) {
+                handshakeDeliveryResult?.error(
+                    "handshake_read_failed",
+                    "Failed to start handshake read.",
+                    null,
+                )
+                handshakeDeliveryResult = null
+                gatt.close()
+            } else {
+                scheduleHandshakeWait(gatt)
+            }
+            return
+        }
+        descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        if (!gatt.writeDescriptor(descriptor)) {
+            if (!gatt.readCharacteristic(characteristic)) {
+                handshakeDeliveryResult?.error(
+                    "handshake_notify_failed",
+                    "Failed to enable handshake notifications.",
+                    null,
+                )
+                handshakeDeliveryResult = null
+                gatt.close()
+            } else {
+                scheduleHandshakeWait(gatt)
+            }
+        }
     }
 
     private fun establishSecureHandshake(call: MethodCall, result: MethodChannel.Result) {
@@ -1246,6 +1425,18 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
             result.error("invalid_peer", "Peer id is required.", null)
             return
         }
+        val guestPeerId = call.argument<String>("guestPeerId")?.trim().orEmpty().ifEmpty { peerId }
+        val guestDisplayName = call.argument<String>("guestDisplayName")?.trim().orEmpty()
+        val clientHelloJson = call.argument<String>("clientHelloJson")?.trim().orEmpty()
+        val clientHelloBytes = when {
+            clientHelloJson.isNotEmpty() ->
+                clientHelloJson.toByteArray(StandardCharsets.UTF_8)
+            else -> buildClientHelloBytes(guestPeerId, guestDisplayName)
+        }
+        Log.i(
+            "AirShareNative",
+            "ClientHello guestPeerId=$guestPeerId displayName=$guestDisplayName",
+        )
         val device = bluetoothAdapter?.getRemoteDevice(peerId)
         if (device == null) {
             result.error("peer_not_found", "Unable to resolve peer device.", null)
@@ -1255,6 +1446,7 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
         cancelHandshakeWait()
         handshakeDelivered = false
         handshakeDeliveryResult = result
+        pendingGuestClientHelloPayload = clientHelloBytes
         activeGattClient?.close()
         var handshakeSetupStarted = false
         fun beginHandshakeSetup(gatt: BluetoothGatt) {
@@ -1324,36 +1516,28 @@ class MainActivity : FlutterActivity(), MethodChannel.MethodCallHandler {
                     return
                 }
                 handshakeDeliveryGatt = gatt
-                gatt.setCharacteristicNotification(characteristic, true)
-                val descriptor = characteristic.getDescriptor(clientConfigDescriptorUuid)
-                if (descriptor == null) {
-                    if (!gatt.readCharacteristic(characteristic)) {
-                        handshakeDeliveryResult?.error(
-                            "handshake_read_failed",
-                            "Failed to start handshake read.",
-                            null,
-                        )
-                        handshakeDeliveryResult = null
-                        gatt.close()
-                    } else {
-                        scheduleHandshakeWait(gatt)
-                    }
-                    return
+                characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                characteristic.value = pendingGuestClientHelloPayload
+                pendingGuestClientHelloPayload = null
+                if (!gatt.writeCharacteristic(characteristic)) {
+                    Log.w("AirShareNative", "ClientHello write failed to start; continuing handshake")
+                    beginGuestHandshakeSubscription(gatt, characteristic)
                 }
-                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                if (!gatt.writeDescriptor(descriptor)) {
-                    if (!gatt.readCharacteristic(characteristic)) {
-                        handshakeDeliveryResult?.error(
-                            "handshake_notify_failed",
-                            "Failed to enable handshake notifications.",
-                            null,
-                        )
-                        handshakeDeliveryResult = null
-                        gatt.close()
-                    } else {
-                        scheduleHandshakeWait(gatt)
-                    }
+            }
+
+            override fun onCharacteristicWrite(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                status: Int,
+            ) {
+                if (characteristic.uuid != handshakeCharacteristicUuid) return
+                if (gatt != handshakeDeliveryGatt) return
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Log.w("AirShareNative", "ClientHello write status=$status; continuing handshake")
+                } else {
+                    Log.i("AirShareNative", "ClientHello written (${characteristic.value?.size ?: 0} bytes)")
                 }
+                beginGuestHandshakeSubscription(gatt, characteristic)
             }
 
             override fun onDescriptorWrite(

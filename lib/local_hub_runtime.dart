@@ -10,6 +10,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import 'connection_logger.dart';
+import 'guest_approval_registry.dart';
 import 'hub_status.dart';
 import 'shared_file_entry.dart';
 import 'shared_room_manifest.dart';
@@ -65,8 +66,27 @@ class LocalHubRuntime {
   final StreamController<String> _joinRequestController =
       StreamController<String>.broadcast();
 
-  /// Guest HTTP (/files, /download, /upload, /delete) allowed only after BLE approve.
-  bool _guestHttpAccessGranted = false;
+  /// Ensures at most one host approval dialog is emitted for a room at a time.
+  String? _hostApprovalUiKey;
+
+  /// Room-scoped guest approval dedupe (BLE + HTTP /join share one logical gate).
+  late final GuestApprovalRegistry _guestApprovals = GuestApprovalRegistry(
+    log: (message, {details}) {
+      unawaited(ConnectionLogger.instance.log(message, details: details));
+      if (details != null) {
+        stdout.writeln('[HubRuntime] $message | $details');
+      } else {
+        stdout.writeln('[HubRuntime] $message');
+      }
+    },
+  );
+
+  /// Active room/session id used in approval keys (null when hub is stopped).
+  String? get roomSessionId => _guestApprovals.roomSessionId;
+
+  /// Test/harness access to the approval registry.
+  @visibleForTesting
+  GuestApprovalRegistry get guestApprovalRegistry => _guestApprovals;
 
   TransferApprovalRequest? get pendingTransfer => _pendingTransfer;
 
@@ -111,7 +131,8 @@ class LocalHubRuntime {
   }
 
   void resetGuestHttpSession({required String reason}) {
-    _guestHttpAccessGranted = false;
+    _guestApprovals.clearAll(reason: reason);
+    _hostApprovalUiKey = null;
     unawaited(
       ConnectionLogger.instance.log(
         'HTTP | Guest session reset',
@@ -120,8 +141,9 @@ class LocalHubRuntime {
     );
   }
 
+  /// Legacy helper — prefer [resolveGuestApproval] / registry tokens.
+  /// Kept for call sites that only need a log breadcrumb after BLE approve.
   void grantGuestHttpAccess({required String reason}) {
-    _guestHttpAccessGranted = true;
     unawaited(
       ConnectionLogger.instance.log(
         'HTTP | Guest access token issued',
@@ -131,7 +153,6 @@ class LocalHubRuntime {
   }
 
   void revokeGuestHttpAccess({required String reason}) {
-    _guestHttpAccessGranted = false;
     unawaited(
       ConnectionLogger.instance.log(
         'HTTP | Guest access revoked',
@@ -140,13 +161,37 @@ class LocalHubRuntime {
     );
   }
 
+  /// Invalidate one guest's active connection attempt (leave / disconnect).
+  bool invalidateGuestConnection({
+    String? guestPeerId,
+    String? connectionAttemptId,
+    String? accessToken,
+    required String reason,
+  }) {
+    final ok = _guestApprovals.invalidateGuest(
+      guestPeerId: guestPeerId,
+      connectionAttemptId: connectionAttemptId,
+      accessToken: accessToken,
+      reason: reason,
+    );
+    unawaited(
+      ConnectionLogger.instance.log(
+        'HTTP | Guest connection invalidated',
+        details:
+            'ok=$ok guestPeerId=$guestPeerId '
+            'connectionAttemptId=$connectionAttemptId reason=$reason',
+      ),
+    );
+    return ok;
+  }
+
   Future<void> ensureStarted(HubStatus status) async {
-    resetGuestHttpSession(reason: 'sender_hub_ensureStarted');
     if (isRunning) {
       status.setBroadcasting();
       return;
     }
 
+    resetGuestHttpSession(reason: 'sender_hub_ensureStarted');
     status.setStarting();
 
     try {
@@ -160,6 +205,11 @@ class LocalHubRuntime {
         maxAttempts: 10,
       );
       _activePort = _server!.port;
+      if (_guestApprovals.roomSessionId == null) {
+        _guestApprovals.startRoomSession(
+          'room-${DateTime.now().millisecondsSinceEpoch}-$_activePort',
+        );
+      }
       final boundAddr = _server!.address.address;
       await ConnectionLogger.instance.log(
         'HTTP Server Start',
@@ -205,6 +255,8 @@ class LocalHubRuntime {
 
   Future<void> stop() async {
     resetGuestHttpSession(reason: 'hub_stop');
+    _guestApprovals.clearAll(reason: 'room_closed');
+    _hostApprovalUiKey = null;
     _approvalTimeoutTimer?.cancel();
     _approvalTimeoutTimer = null;
     if (_decisionCompleter != null && !_decisionCompleter!.isCompleted) {
@@ -224,6 +276,119 @@ class LocalHubRuntime {
     _server = null;
     _activePort = 8080;
     _loggedFirstInbound = false;
+  }
+
+  /// BLE host path: register (or reuse) a pending approval before showing UI.
+  GuestApprovalBeginResult beginBleGuestApproval({
+    required String bleDeviceId,
+    required String displayName,
+    String? connectionAttemptId,
+  }) {
+    if (_guestApprovals.roomSessionId == null) {
+      // Hub may not be bound yet — start a transient session so BLE can dedupe.
+      _guestApprovals.startRoomSession(
+        'room-ble-${DateTime.now().millisecondsSinceEpoch}',
+      );
+    }
+    final peerId = bleDeviceId.trim().isEmpty
+        ? 'ble-unknown'
+        : (bleDeviceId.startsWith('ble:') ? bleDeviceId : 'ble:$bleDeviceId');
+
+    // Temporary BLE drop while HTTP session is still active → no new approval.
+    final active = _guestApprovals.findActiveSessionForBleDevice(peerId);
+    if (active != null) {
+      unawaited(
+        ConnectionLogger.instance.log(
+          'Approval | BLE blip ignored (HTTP session still active)',
+          details:
+              'key=${active.key.value} guestPeerId=$peerId '
+              'connectionAttemptId=${active.key.connectionAttemptId}',
+        ),
+      );
+      return GuestApprovalBeginResult(
+        kind: GuestApprovalOutcomeKind.alreadyApproved,
+        entry: active,
+        emitUiEvent: false,
+      );
+    }
+
+    final attemptId = (connectionAttemptId != null &&
+            connectionAttemptId.trim().isNotEmpty)
+        ? connectionAttemptId.trim()
+        : 'ble-${DateTime.now().millisecondsSinceEpoch}';
+    if (connectionAttemptId == null || connectionAttemptId.trim().isEmpty) {
+      unawaited(
+        ConnectionLogger.instance.log(
+          'Approval | New connectionAttemptId created',
+          details:
+              'reason=ble_missing_attempt_id connectionAttemptId=$attemptId '
+              'guestPeerId=$peerId',
+        ),
+      );
+    }
+    final begin = _guestApprovals.begin(
+      guestPeerId: peerId,
+      connectionAttemptId: attemptId,
+      displayName: displayName,
+      source: GuestApprovalSource.ble,
+    );
+    return _withHostUiClaim(begin);
+  }
+
+  /// Resolve a BLE (or bridged) approval after the host taps Approve/Decline.
+  GuestAccessGrant? resolveGuestApproval({
+    required GuestApprovalEntry entry,
+    required bool approved,
+    required String reason,
+  }) {
+    final grant = _guestApprovals.resolve(
+      entry: entry,
+      approved: approved,
+      reason: reason,
+    );
+    _releaseHostApprovalUi(entry.key.value);
+    if (approved) {
+      grantGuestHttpAccess(reason: reason);
+    } else {
+      revokeGuestHttpAccess(reason: reason);
+    }
+    return grant;
+  }
+
+  /// Claim the single host approval UI slot for [key]. Returns false if another
+  /// dialog is already showing for a different key.
+  bool claimHostApprovalUi(String key) {
+    if (_hostApprovalUiKey != null && _hostApprovalUiKey != key) {
+      unawaited(
+        ConnectionLogger.instance.log(
+          'Approval | Ignored duplicate approval event',
+          details:
+              'reason=host_ui_busy activeKey=$_hostApprovalUiKey newKey=$key',
+        ),
+      );
+      return false;
+    }
+    if (_hostApprovalUiKey == key) {
+      return false;
+    }
+    _hostApprovalUiKey = key;
+    return true;
+  }
+
+  void _releaseHostApprovalUi(String key) {
+    if (_hostApprovalUiKey == key) {
+      _hostApprovalUiKey = null;
+    }
+  }
+
+  GuestApprovalBeginResult _withHostUiClaim(GuestApprovalBeginResult begin) {
+    if (!begin.emitUiEvent) return begin;
+    if (claimHostApprovalUi(begin.entry.key.value)) return begin;
+    return GuestApprovalBeginResult(
+      kind: GuestApprovalOutcomeKind.ignoredDuplicate,
+      entry: begin.entry,
+      emitUiEvent: false,
+    );
   }
 
   Future<String> _resolveSharedDirectoryPath() async {
@@ -377,6 +542,11 @@ class LocalHubRuntime {
       return;
     }
 
+    if (path == '/leave' && method == 'POST') {
+      await _handleGuestLeave(request);
+      return;
+    }
+
     request.response.statusCode = HttpStatus.notFound;
     request.response.write('Not found');
     await request.response.close();
@@ -411,7 +581,20 @@ class LocalHubRuntime {
 
   bool _isGuestHttpRequestAllowed(HttpRequest request) {
     if (_isHostHttpRequester(request)) return true;
-    return _guestHttpAccessGranted;
+    final token = _headerValue(request, 'x-airshare-access-token');
+    final peerId = _headerValue(request, 'x-airshare-requester-peer-id');
+    final attemptId =
+        _headerValue(request, 'x-airshare-connection-attempt-id');
+    if (_guestApprovals.isAccessAllowed(
+      accessToken: token,
+      guestPeerId: peerId,
+      connectionAttemptId: attemptId,
+    )) {
+      return true;
+    }
+    // Soft allow: BLE already approved an active session before /join returns
+    // an access token to the guest.
+    return _guestApprovals.activeSessionCount > 0;
   }
 
   Future<void> _rejectGuestHttpNotApproved(
@@ -868,40 +1051,152 @@ class LocalHubRuntime {
   Future<void> _handleGuestJoin(HttpRequest request) async {
     final bodyBytes = await _readBody(request);
     String guestName = 'Someone';
+    String guestPeerId = '';
+    String connectionAttemptId = '';
     try {
       final body = json.decode(utf8.decode(bodyBytes)) as Map<String, dynamic>;
       final raw = (body['guestName'] as String?)?.trim() ?? '';
       if (raw.isNotEmpty) guestName = raw;
+      guestPeerId = (body['guestPeerId'] as String?)?.trim() ??
+          (body['peerId'] as String?)?.trim() ??
+          '';
+      connectionAttemptId =
+          (body['connectionAttemptId'] as String?)?.trim() ?? '';
     } catch (_) {}
 
-    // If an approval dialog is already open for another guest, auto-approve
-    // this one immediately so concurrent joiners are never silently dropped.
+    if (guestPeerId.isEmpty) {
+      guestPeerId = 'name:${guestName.toLowerCase()}';
+    }
+    if (connectionAttemptId.isEmpty) {
+      connectionAttemptId =
+          'join-${DateTime.now().millisecondsSinceEpoch}';
+      await ConnectionLogger.instance.log(
+        'Approval | New connectionAttemptId created',
+        details:
+            'reason=http_join_missing_attempt_id '
+            'connectionAttemptId=$connectionAttemptId guestPeerId=$guestPeerId',
+      );
+    }
+
+    if (_guestApprovals.roomSessionId == null) {
+      _guestApprovals.startRoomSession(
+        'room-${DateTime.now().millisecondsSinceEpoch}-$_activePort',
+      );
+    }
+
+    final begin = _withHostUiClaim(
+      _guestApprovals.begin(
+        guestPeerId: guestPeerId,
+        connectionAttemptId: connectionAttemptId,
+        displayName: guestName,
+        source: GuestApprovalSource.registration,
+      ),
+    );
+
+    _guestApprovals.bindHttpIdentity(
+      entry: begin.entry,
+      guestPeerId: guestPeerId,
+      connectionAttemptId: connectionAttemptId,
+    );
+
+    // Already approved via BLE (same active attempt) — no second dialog.
+    if (begin.kind == GuestApprovalOutcomeKind.alreadyApproved) {
+      final grant = _guestApprovals.grantForEntry(begin.entry) ??
+          _guestApprovals.resolve(
+            entry: begin.entry,
+            approved: true,
+            reason: 'reused_approved_join',
+          );
+      grantGuestHttpAccess(
+        reason:
+            'reused_approved_join key=${begin.entry.key.value} name=$guestName',
+      );
+      _guestJoinedController.add(guestName);
+      await ConnectionLogger.instance.log(
+        'HTTP | Guest join reused approved approval',
+        details: 'key=${begin.entry.key.value} name=$guestName',
+      );
+      await _writeJoinResponse(
+        request,
+        status: 'approved',
+        guestName: guestName,
+        grant: grant,
+      );
+      return;
+    }
+
+    if (begin.kind == GuestApprovalOutcomeKind.alreadyDenied) {
+      await ConnectionLogger.instance.log(
+        'HTTP | Guest join reused denied approval',
+        details: 'key=${begin.entry.key.value} name=$guestName',
+      );
+      await _writeJoinResponse(
+        request,
+        status: 'declined',
+        guestName: guestName,
+        grant: null,
+      );
+      return;
+    }
+
+    // Pending from BLE (or duplicate HTTP): wait on the same decision — no UI.
+    if (begin.kind == GuestApprovalOutcomeKind.reusedPending ||
+        begin.kind == GuestApprovalOutcomeKind.ignoredDuplicate) {
+      await ConnectionLogger.instance.log(
+        'HTTP | Guest join awaiting existing pending approval',
+        details:
+            'key=${begin.entry.key.value} name=$guestName kind=${begin.kind.name}',
+      );
+      final approved = await _awaitApprovalWithTimeout(begin.entry);
+      await _respondToJoinDecision(
+        request,
+        guestName: guestName,
+        guestPeerId: guestPeerId,
+        connectionAttemptId: connectionAttemptId,
+        approved: approved,
+        entry: begin.entry,
+      );
+      return;
+    }
+
+    // Brand-new HTTP join (e.g. BLE payload already released on reconnect).
+    // If another join dialog is already open, auto-approve concurrent guests.
     if (_joinDecisionCompleter != null) {
+      final grant = _guestApprovals.resolve(
+        entry: begin.entry,
+        approved: true,
+        reason: 'auto_approve_concurrent_$guestName',
+      );
       grantGuestHttpAccess(reason: 'auto_approve_concurrent_$guestName');
       _guestJoinedController.add(guestName);
       await ConnectionLogger.instance.log(
         'HTTP | Guest join auto-approved (another approval in progress)',
-        details: 'name=$guestName',
+        details: 'name=$guestName key=${begin.entry.key.value}',
       );
-      try {
-        request.response.headers.contentType =
-            ContentType('application', 'json', charset: 'utf-8');
-        request.response.write(
-          jsonEncode({'status': 'approved', 'guestName': guestName}),
-        );
-        await request.response.close();
-      } catch (_) {}
+      await _writeJoinResponse(
+        request,
+        status: 'approved',
+        guestName: guestName,
+        grant: grant,
+      );
       return;
     }
 
-    // Signal the host UI and wait for their decision (auto-approve after 30 s).
     _pendingJoinGuestName = guestName;
     _joinDecisionCompleter = Completer<bool>();
-    _joinRequestController.add(guestName);
+    if (begin.emitUiEvent) {
+      _joinRequestController.add(guestName);
+      await ConnectionLogger.instance.log(
+        'Approval | New approval requested',
+        details:
+            'key=${begin.entry.key.value} source=registration name=$guestName',
+      );
+    }
     await ConnectionLogger.instance.log(
       'HTTP | Guest join awaiting host approval',
       details:
-          'name=$guestName remote=${request.connectionInfo?.remoteAddress}',
+          'name=$guestName key=${begin.entry.key.value} '
+          'remote=${request.connectionInfo?.remoteAddress} emitUi=${begin.emitUiEvent}',
     );
 
     _joinTimeoutTimer = Timer(const Duration(seconds: 30), () {
@@ -909,41 +1204,193 @@ class LocalHubRuntime {
           !_joinDecisionCompleter!.isCompleted) {
         _joinDecisionCompleter!.complete(true);
       }
+      if (begin.entry.isPending) {
+        _guestApprovals.resolve(
+          entry: begin.entry,
+          approved: true,
+          reason: 'join_timeout_auto_approve',
+        );
+      }
+      _releaseHostApprovalUi(begin.entry.key.value);
     });
 
-    final approved = await _joinDecisionCompleter!.future;
+    // Prefer registry decision (BLE may resolve first); also watch UI completer.
+    final approved = await Future.any<bool>([
+      begin.entry.decision.future,
+      _joinDecisionCompleter!.future,
+    ]);
+
+    if (begin.entry.isPending) {
+      _guestApprovals.resolve(
+        entry: begin.entry,
+        approved: approved,
+        reason: approved ? 'host_approved_join' : 'host_declined_join',
+      );
+    }
+    if (_joinDecisionCompleter != null &&
+        !_joinDecisionCompleter!.isCompleted) {
+      _joinDecisionCompleter!.complete(approved);
+    }
 
     _joinTimeoutTimer?.cancel();
     _joinTimeoutTimer = null;
     _pendingJoinGuestName = null;
     _joinDecisionCompleter = null;
 
-    await ConnectionLogger.instance.log(
-      'HTTP | Guest join decision',
-      details: 'name=$guestName approved=$approved',
+    await _respondToJoinDecision(
+      request,
+      guestName: guestName,
+      guestPeerId: guestPeerId,
+      connectionAttemptId: connectionAttemptId,
+      approved: approved,
+      entry: begin.entry,
+    );
+  }
+
+  Future<void> _handleGuestLeave(HttpRequest request) async {
+    final bodyBytes = await _readBody(request);
+    String guestPeerId = '';
+    String connectionAttemptId = '';
+    String accessToken = '';
+    try {
+      final body = json.decode(utf8.decode(bodyBytes)) as Map<String, dynamic>;
+      guestPeerId = (body['guestPeerId'] as String?)?.trim() ??
+          (body['peerId'] as String?)?.trim() ??
+          '';
+      connectionAttemptId =
+          (body['connectionAttemptId'] as String?)?.trim() ?? '';
+      accessToken = (body['accessToken'] as String?)?.trim() ?? '';
+    } catch (_) {}
+
+    final headerPeer =
+        _headerValue(request, 'x-airshare-requester-peer-id') ?? '';
+    final headerAttempt =
+        _headerValue(request, 'x-airshare-connection-attempt-id') ?? '';
+    final headerToken =
+        _headerValue(request, 'x-airshare-access-token') ?? '';
+    if (guestPeerId.isEmpty) guestPeerId = headerPeer;
+    if (connectionAttemptId.isEmpty) connectionAttemptId = headerAttempt;
+    if (accessToken.isEmpty) accessToken = headerToken;
+
+    final ok = invalidateGuestConnection(
+      guestPeerId: guestPeerId.isEmpty ? null : guestPeerId,
+      connectionAttemptId:
+          connectionAttemptId.isEmpty ? null : connectionAttemptId,
+      accessToken: accessToken.isEmpty ? null : accessToken,
+      reason: 'guest_leave',
     );
 
+    // Authorization for the next entry is forced by session lifecycle:
+    // invalidateGuestConnection + a new connectionAttemptId on reconnect.
+    // No BleTransport API is required — transport stays BLE-only.
+    await ConnectionLogger.instance.log(
+      'HTTP | Guest leave complete',
+      details:
+          'invalidated=$ok activeSessions=${_guestApprovals.activeSessionCount}',
+    );
+
+    request.response.headers.contentType =
+        ContentType('application', 'json', charset: 'utf-8');
+    request.response.write(
+      jsonEncode({'status': ok ? 'left' : 'unknown', 'invalidated': ok}),
+    );
+    await request.response.close();
+  }
+
+  Future<bool> _awaitApprovalWithTimeout(GuestApprovalEntry entry) async {
+    _joinTimeoutTimer?.cancel();
+    final timeout = Completer<bool>();
+    final timer = Timer(const Duration(seconds: 30), () {
+      if (!timeout.isCompleted) timeout.complete(true);
+      if (entry.isPending) {
+        _guestApprovals.resolve(
+          entry: entry,
+          approved: true,
+          reason: 'bridged_join_timeout_auto_approve',
+        );
+      }
+    });
+    try {
+      return await Future.any<bool>([entry.decision.future, timeout.future]);
+    } finally {
+      timer.cancel();
+    }
+  }
+
+  Future<void> _respondToJoinDecision(
+    HttpRequest request, {
+    required String guestName,
+    required String guestPeerId,
+    required String connectionAttemptId,
+    required bool approved,
+    required GuestApprovalEntry entry,
+  }) async {
+    await ConnectionLogger.instance.log(
+      'HTTP | Guest join decision',
+      details:
+          'name=$guestName approved=$approved key=${entry.key.value} '
+          'guestPeerId=$guestPeerId connectionAttemptId=$connectionAttemptId',
+    );
+
+    GuestAccessGrant? grant;
     if (approved) {
+      grant = _guestApprovals.grantForEntry(entry);
+      if (grant == null && entry.isApproved) {
+        // Decision completed elsewhere without token (shouldn't happen).
+        grant = _guestApprovals.resolve(
+          entry: entry,
+          approved: true,
+          reason: 'host_approved_join_$guestName',
+        );
+      } else if (grant == null && entry.isPending) {
+        grant = _guestApprovals.resolve(
+          entry: entry,
+          approved: true,
+          reason: 'host_approved_join_$guestName',
+        );
+      }
       grantGuestHttpAccess(reason: 'host_approved_join_$guestName');
       _guestJoinedController.add(guestName);
     } else {
-      // Revoke any HTTP access that was previously granted at the BLE level
-      // so the guest cannot access files even if the BLE approval already ran.
+      if (entry.isPending) {
+        _guestApprovals.resolve(
+          entry: entry,
+          approved: false,
+          reason: 'host_declined_join_$guestName',
+        );
+      }
       revokeGuestHttpAccess(reason: 'host_declined_join_$guestName');
     }
+    _releaseHostApprovalUi(entry.key.value);
 
+    await _writeJoinResponse(
+      request,
+      status: approved ? 'approved' : 'declined',
+      guestName: guestName,
+      grant: grant,
+    );
+  }
+
+  Future<void> _writeJoinResponse(
+    HttpRequest request, {
+    required String status,
+    required String guestName,
+    required GuestAccessGrant? grant,
+  }) async {
     try {
       request.response.headers.contentType =
           ContentType('application', 'json', charset: 'utf-8');
       request.response.write(
         jsonEncode({
-          'status': approved ? 'approved' : 'declined',
+          'status': status,
           'guestName': guestName,
+          if (grant != null) 'accessToken': grant.accessToken,
+          if (grant != null) 'roomSessionId': grant.roomSessionId,
+          if (grant != null) 'connectionAttemptId': grant.connectionAttemptId,
         }),
       );
       await request.response.close();
     } catch (e) {
-      // Server was closed before the response could be sent (e.g., host left).
       await ConnectionLogger.instance.log(
         'HTTP | Guest join response failed (server closing)',
         details: '$e',

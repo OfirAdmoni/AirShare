@@ -48,7 +48,7 @@ class HostNetworkTier {
           l.contains('ethernet') ||
           l.startsWith('eth');
     }
-    return l.contains('wlan') || l.contains('wifi');
+    return l.contains('wlan') || l.contains('wifi') || l.contains('en');
   }
 
   /// Interfaces that may host Tier 1 when already connected (shared Wi‑Fi or manual hotspot).

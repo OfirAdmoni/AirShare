@@ -2,21 +2,24 @@ import AppKit
 import CoreBluetooth
 import FlutterMacOS
 
-/// macOS BLE transport — mirrors `air_share/ble_transport` + `air_share/ble_scan_events`.
-/// Guest central: scan + secure handshake (notify/read ServerHello JSON).
-/// Host GATT advertising is not implemented on macOS yet.
+/// macOS BLE transport — guest central + host peripheral (LAN-only sender).
+/// Channels: `air_share/ble_transport`, `air_share/ble_scan_events`, `air_share/ble_ui`.
 final class BleTransportPlugin: NSObject {
   private static let methodChannelName = "air_share/ble_transport"
   private static let scanEventChannelName = "air_share/ble_scan_events"
+  private static let uiChannelName = "air_share/ble_ui"
 
   private static let serviceUuid = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
   private static let handshakeCharacteristicUuid = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
   private static let endpointCharacteristicUuid = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
 
   private let methodChannel: FlutterMethodChannel
+  private let uiChannel: FlutterMethodChannel
   private let scanEventChannel: FlutterEventChannel
 
   private var centralManager: CBCentralManager!
+  private var peripheralManager: CBPeripheralManager!
+
   private var scanEventSink: FlutterEventSink?
   private var isScanning = false
   private var discoveredPeers: [String: [String: String]] = [:]
@@ -27,6 +30,31 @@ final class BleTransportPlugin: NSObject {
   private var localAdvertisingName = ""
   private var localHostName = Host.current().localizedName ?? ""
 
+  // Host GATT state (LAN-only sender)
+  private var isAdvertising = false
+  private var gattServicePublished = false
+  private var handshakeCharacteristic: CBMutableCharacteristic?
+  private var endpointCharacteristic: CBMutableCharacteristic?
+  /// Released to GATT only after Flutter [approveConnection]; until then reads stay empty.
+  private var handshakePayload = Data()
+  /// Built when endpoints update; not exposed over BLE until host approves.
+  private var draftHandshakePayload = Data()
+  private var advertisedEndpoint = ""
+  private var pendingLanIp = ""
+  private var pendingHubIp: String?
+  private var pendingHubPort = 8080
+  private var pendingFriendlyName = ""
+  private var clientHelloByCentralId: [String: (peerId: String, displayName: String)] = [:]
+  private var approvalUiEmittedCentrals = Set<String>()
+  private var connectionAttemptIdByCentral: [String: String] = [:]
+  private var pendingApprovalNotifyWorkItems: [String: DispatchWorkItem] = [:]
+  private var pendingGuestClientHelloData: Data?
+  private var pendingApprovalCentralId: String?
+  private var approvalTimeoutWorkItem: DispatchWorkItem?
+  private var pendingAdvertiseResult: FlutterResult?
+  private var pendingAdvertiseFriendlyName: String?
+  private var pendingGattAdvertiseLabel: String?
+
   // Guest handshake state
   private var activeGuestPeripheral: CBPeripheral?
   private var handshakeDeliveryResult: FlutterResult?
@@ -34,16 +62,25 @@ final class BleTransportPlugin: NSObject {
   private var handshakeWaitWorkItem: DispatchWorkItem?
   private var guestHandshakeCharacteristic: CBCharacteristic?
 
+  private var pendingEndpointReadPeripheral: CBPeripheral?
+  private var pendingEndpointReadResult: FlutterResult?
+  private var endpointReadCompleted = false
+
   private static var retained: BleTransportPlugin?
 
   init(messenger: FlutterBinaryMessenger) {
     methodChannel = FlutterMethodChannel(name: Self.methodChannelName, binaryMessenger: messenger)
+    uiChannel = FlutterMethodChannel(name: Self.uiChannelName, binaryMessenger: messenger)
     scanEventChannel = FlutterEventChannel(name: Self.scanEventChannelName, binaryMessenger: messenger)
     super.init()
     centralManager = CBCentralManager(delegate: self, queue: nil)
+    peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
     methodChannel.setMethodCallHandler(handleMethodCall)
     scanEventChannel.setStreamHandler(self)
-    logBle("macOS BLE plugin registered (channels: \(Self.methodChannelName), \(Self.scanEventChannelName))")
+    logBle(
+      "macOS BLE plugin registered (channels: \(Self.methodChannelName), "
+        + "\(Self.scanEventChannelName), \(Self.uiChannelName))"
+    )
   }
 
   static func register(with registrar: FlutterPluginRegistrar) {
@@ -66,14 +103,30 @@ final class BleTransportPlugin: NSObject {
     }
   }
 
+  private func peripheralStateLabel(_ state: CBManagerState) -> String {
+    centralStateLabel(state)
+  }
+
   private func handleMethodCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case "startScanning":
       startScanning(result: result)
     case "stopScanning":
       stopScanning(result: result)
+    case "startHubAdvertising":
+      startHubAdvertising(call: call, result: result)
+    case "stopHubAdvertising":
+      stopHubAdvertising(result: result)
     case "establishSecureHandshake":
       establishSecureHandshake(call: call, result: result)
+    case "readPeerEndpoint":
+      readPeerEndpoint(call: call, result: result)
+    case "updateHubEndpoint":
+      updateHubEndpoint(call: call, result: result)
+    case "updateConnectionEndpoints":
+      updateConnectionEndpoints(call: call, result: result)
+    case "approveConnection":
+      approveConnection(call: call, result: result)
     case "isBluetoothEnabled":
       result(centralManager.state == .poweredOn)
     case "requestEnableBluetooth":
@@ -95,31 +148,13 @@ final class BleTransportPlugin: NSObject {
           details: nil
         )
       )
-    case "startHubAdvertising",
-         "stopHubAdvertising",
-         "readPeerEndpoint",
-         "updateHubEndpoint",
-         "updateConnectionEndpoints",
-         "approveConnection":
-      unsupported(call.method, result: result)
     default:
       logBle("missing/unsupported method: \(call.method)")
       result(FlutterMethodNotImplemented)
     }
   }
 
-  private func unsupported(_ method: String, result: @escaping FlutterResult) {
-    logBle("unsupported method: \(method)")
-    result(
-      FlutterError(
-        code: "unsupported",
-        message: "macOS BLE transport does not implement \(method) yet.",
-        details: method
-      )
-    )
-  }
-
-  // MARK: - Scan
+  // MARK: - Scan (guest)
 
   private func startScanning(result: @escaping FlutterResult) {
     logBle("central manager state=\(centralStateLabel(centralManager.state))")
@@ -170,6 +205,367 @@ final class BleTransportPlugin: NSObject {
     sink(Array(discoveredPeers.values))
   }
 
+  // MARK: - Host advertising / GATT server (LAN-only)
+
+  private func startHubAdvertising(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    let friendlyName = (call.arguments as? [String: Any])?["friendlyName"] as? String
+    let label = (friendlyName?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap {
+      $0.isEmpty ? nil : $0
+    } ?? Host.current().localizedName ?? "AirShare Mac"
+
+    pendingFriendlyName = label
+    logBle(
+      "startHubAdvertising requested localName=\(label) "
+        + "peripheralState=\(peripheralStateLabel(peripheralManager.state))"
+    )
+
+    guard peripheralManager.state == .poweredOn else {
+      if peripheralManager.state == .unknown || peripheralManager.state == .resetting {
+        pendingAdvertiseResult = result
+        pendingAdvertiseFriendlyName = label
+        logBle("startHubAdvertising deferred until peripheral manager is ready")
+        return
+      }
+      result(
+        FlutterError(
+          code: "ble_unavailable",
+          message: "Bluetooth peripheral manager is not powered on.",
+          details: peripheralStateLabel(peripheralManager.state)
+        )
+      )
+      return
+    }
+    if isAdvertising && gattServicePublished {
+      logBle("startHubAdvertising: already advertising with GATT published")
+      result(nil)
+      return
+    }
+
+    if let hubIp = pendingHubIp, !hubIp.isEmpty {
+      advertisedEndpoint = "\(hubIp):\(pendingHubPort)"
+    } else if !pendingLanIp.isEmpty {
+      advertisedEndpoint = "\(pendingLanIp):\(pendingHubPort)"
+    }
+    clearReleasedHandshakePayload(reason: "startHubAdvertising")
+    refreshDraftHandshakePayload(reason: "startHubAdvertising")
+
+    pendingAdvertiseResult = result
+    pendingGattAdvertiseLabel = label
+    publishHostGattService()
+  }
+
+  /// Builds handshake + endpoint characteristics and adds the primary service (iOS/Android parity).
+  private func publishHostGattService() {
+    logBle(
+      "publishHostGattService: service=\(Self.serviceUuid.uuidString) "
+        + "handshake=\(Self.handshakeCharacteristicUuid.uuidString) "
+        + "endpoint=\(Self.endpointCharacteristicUuid.uuidString)"
+    )
+
+    // Do not attach a manual CCCD: CoreBluetooth manages notify subscriptions.
+    let handshakeChar = CBMutableCharacteristic(
+      type: Self.handshakeCharacteristicUuid,
+      properties: [.read, .notify, .write],
+      value: nil,
+      permissions: [.readable, .writeable]
+    )
+    logBle("added handshake characteristic (read+notify+write, value=nil, no manual CCCD)")
+
+    let endpointChar = CBMutableCharacteristic(
+      type: Self.endpointCharacteristicUuid,
+      properties: [.read, .write],
+      value: nil,
+      permissions: [.readable, .writeable]
+    )
+    logBle("added endpoint characteristic (read+write, value=nil)")
+
+    let service = CBMutableService(type: Self.serviceUuid, primary: true)
+    service.characteristics = [handshakeChar, endpointChar]
+
+    handshakeCharacteristic = handshakeChar
+    endpointCharacteristic = endpointChar
+    gattServicePublished = false
+
+    peripheralManager.stopAdvertising()
+    isAdvertising = false
+    peripheralManager.removeAllServices()
+    peripheralManager.add(service)
+    logBle("peripheralManager.add(service) requested — waiting for didAdd before advertise")
+  }
+
+  private func startBleAdvertisingIfReady() {
+    guard peripheralManager.state == .poweredOn, gattServicePublished else { return }
+    guard let label = pendingGattAdvertiseLabel else { return }
+    let advertisement: [String: Any] = [
+      CBAdvertisementDataServiceUUIDsKey: [Self.serviceUuid],
+      CBAdvertisementDataLocalNameKey: String(label.prefix(10)),
+    ]
+    peripheralManager.startAdvertising(advertisement)
+    isAdvertising = true
+    logBle("advertising started localName=\(String(label.prefix(10))) service=\(Self.serviceUuid.uuidString)")
+    if let pending = pendingAdvertiseResult {
+      pendingAdvertiseResult = nil
+      pendingGattAdvertiseLabel = nil
+      pending(nil)
+    }
+  }
+
+  private func stopHubAdvertising(result: @escaping FlutterResult) {
+    logBle("stopHubAdvertising / teardown begin")
+    teardownHostGatt(reason: "stopHubAdvertising")
+    logBle("teardown completed")
+    result(nil)
+  }
+
+  private func teardownHostGatt(reason: String) {
+    if peripheralManager.isAdvertising || isAdvertising {
+      peripheralManager.stopAdvertising()
+      logBle("advertising stopped (\(reason))")
+    }
+    peripheralManager.removeAllServices()
+    isAdvertising = false
+    gattServicePublished = false
+    handshakeCharacteristic = nil
+    endpointCharacteristic = nil
+    pendingAdvertiseResult = nil
+    pendingAdvertiseFriendlyName = nil
+    pendingGattAdvertiseLabel = nil
+    clearReleasedHandshakePayload(reason: reason)
+    draftHandshakePayload = Data()
+    clearPendingApproval()
+    advertisedEndpoint = ""
+    clientHelloByCentralId.removeAll()
+    approvalUiEmittedCentrals.removeAll()
+    connectionAttemptIdByCentral.removeAll()
+    for (_, work) in pendingApprovalNotifyWorkItems { work.cancel() }
+    pendingApprovalNotifyWorkItems.removeAll()
+    pendingGuestClientHelloData = nil
+  }
+
+  private func updateHubEndpoint(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let args = call.arguments as? [String: Any],
+          let ip = (args["ip"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !ip.isEmpty
+    else {
+      result(FlutterError(code: "invalid_endpoint", message: "ip is required", details: nil))
+      return
+    }
+    let port = args["port"] as? Int ?? 8080
+    pendingHubIp = ip
+    pendingLanIp = ip
+    pendingHubPort = port
+    advertisedEndpoint = "\(ip):\(port)"
+    logBle("LAN endpoint updated via updateHubEndpoint lan_ip=\(pendingLanIp) hub_port=\(pendingHubPort)")
+    refreshDraftHandshakePayload(reason: "updateHubEndpoint")
+    clearReleasedHandshakePayload(reason: "updateHubEndpoint")
+    result(nil)
+  }
+
+  private func updateConnectionEndpoints(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let args = call.arguments as? [String: Any] else {
+      result(nil)
+      return
+    }
+    let lanFromDart = (args["lanIp"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !lanFromDart.isEmpty {
+      pendingLanIp = lanFromDart
+      pendingHubIp = lanFromDart
+    }
+    // macOS host is LAN-only — ignore hotspot / P2P fields from Dart.
+    pendingHubPort = args["hubPort"] as? Int ?? pendingHubPort
+    if !pendingLanIp.isEmpty {
+      advertisedEndpoint = "\(pendingLanIp):\(pendingHubPort)"
+    }
+    logBle(
+      "LAN endpoint updated via updateConnectionEndpoints lan_ip=\(pendingLanIp) "
+        + "hub_port=\(pendingHubPort) (hotspot/P2P ignored on macOS host)"
+    )
+    refreshDraftHandshakePayload(reason: "updateConnectionEndpoints")
+    clearReleasedHandshakePayload(reason: "updateConnectionEndpoints")
+    result(nil)
+  }
+
+  private func approveConnection(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    let args = call.arguments as? [String: Any]
+    let approved = args?["approved"] as? Bool ?? false
+    if let lanOverride = (args?["lanIp"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !lanOverride.isEmpty {
+      pendingLanIp = lanOverride
+      pendingHubIp = lanOverride
+      advertisedEndpoint = "\(lanOverride):\(pendingHubPort)"
+      refreshDraftHandshakePayload(reason: "approveConnection_lanOverride")
+    }
+
+    if !approved {
+      logBle("approval denied — ServerHello remains sealed")
+      clearReleasedHandshakePayload(reason: "approveConnection_declined")
+      clearPendingApproval()
+      result(nil)
+      return
+    }
+
+    guard let payload = buildHandshakePayloadData() else {
+      logBle("approval granted but handshake draft not ready (missing lan_ip)")
+      result(
+        FlutterError(
+          code: "handshake_not_ready",
+          message: "LAN endpoint is not available yet.",
+          details: nil
+        )
+      )
+      return
+    }
+
+    handshakePayload = payload
+    draftHandshakePayload = payload
+    if let json = String(data: payload, encoding: .utf8) {
+      logBle("approval granted — ServerHello released \(json.prefix(220))")
+    }
+    if let char = handshakeCharacteristic {
+      let notified = peripheralManager.updateValue(payload, for: char, onSubscribedCentrals: nil)
+      logBle("ServerHello notify sent=\(notified) bytes=\(payload.count)")
+    }
+    clearPendingApproval()
+    result(nil)
+  }
+
+  // MARK: - Host handshake helpers
+
+  private func refreshDraftHandshakePayload(reason: String) {
+    if let data = buildHandshakePayloadData() {
+      draftHandshakePayload = data
+      if let json = String(data: data, encoding: .utf8) {
+        logBle("handshake draft prepared (\(reason)): \(json.prefix(180))")
+      }
+    } else {
+      draftHandshakePayload = Data()
+      logBle("handshake draft cleared (\(reason)) — LAN endpoint not ready")
+    }
+  }
+
+  private func clearReleasedHandshakePayload(reason: String) {
+    handshakePayload = Data()
+    handshakeCharacteristic?.value = nil
+    logBle("handshake released payload cleared (\(reason))")
+  }
+
+  private func buildHandshakePayloadData() -> Data? {
+    var lan = pendingLanIp.trimmingCharacters(in: .whitespacesAndNewlines)
+    if lan.isEmpty,
+       let hubFallback = pendingHubIp?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !hubFallback.isEmpty {
+      lan = hubFallback
+    }
+    if lan.isEmpty {
+      return nil
+    }
+    var json: [String: Any] = [
+      "lan_ip": lan,
+      "hubIp": lan,
+      "hub_port": pendingHubPort,
+      "hubPort": pendingHubPort,
+      "platform": "macos",
+      "hasHotspot": false,
+    ]
+    let name = pendingFriendlyName.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !name.isEmpty {
+      json["friendly_name"] = name
+    }
+    guard let data = try? JSONSerialization.data(withJSONObject: json) else { return nil }
+    return data
+  }
+
+  private func scheduleApprovalTimeout() {
+    cancelApprovalTimeout()
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.logBle("approval timeout — sealing ServerHello")
+      self.clearReleasedHandshakePayload(reason: "approval_timeout")
+      self.clearPendingApproval()
+    }
+    approvalTimeoutWorkItem = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + 45, execute: work)
+  }
+
+  private func cancelApprovalTimeout() {
+    approvalTimeoutWorkItem?.cancel()
+    approvalTimeoutWorkItem = nil
+  }
+
+  private func clearPendingApproval() {
+    pendingApprovalCentralId = nil
+    cancelApprovalTimeout()
+  }
+
+
+  private func parseClientHello(_ data: Data) -> (peerId: String, displayName: String)? {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          (json["type"] as? String) == "client_hello"
+    else { return nil }
+    let displayName = (json["display_name"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !displayName.isEmpty else { return nil }
+    let peerId = (json["peer_id"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return (peerId: peerId, displayName: displayName)
+  }
+
+  private func cancelPendingApprovalNotify(centralId: String) {
+    pendingApprovalNotifyWorkItems.removeValue(forKey: centralId)?.cancel()
+  }
+
+  private func emitConnectionRequestOnce(centralId: String, friendlyName: String, reason: String) {
+    if approvalUiEmittedCentrals.contains(centralId) {
+      logBle(
+        "Approval | Duplicate approval suppressed | source=BLE reason=\(reason) "
+          + "central=\(centralId) displayName=\(friendlyName)"
+      )
+      logBle(
+        "Approval | Approved entry metadata updated without new UI event "
+          + "central=\(centralId) displayName=\(friendlyName)"
+      )
+      return
+    }
+    approvalUiEmittedCentrals.insert(centralId)
+    logBle(
+      "Approval | Entry created | source=BLE central=\(centralId) "
+        + "displayName=\(friendlyName) reason=\(reason)"
+    )
+    notifyConnectionRequest(centralId: centralId, friendlyName: friendlyName)
+  }
+
+  private func stableConnectionAttemptId(for centralId: String) -> String {
+    if let existing = connectionAttemptIdByCentral[centralId], !existing.isEmpty {
+      return existing
+    }
+    let attemptId = "ble-\(Int(Date().timeIntervalSince1970 * 1000))"
+    connectionAttemptIdByCentral[centralId] = attemptId
+    logBle(
+      "Approval | New connectionAttemptId created reason=ble_first_notify "
+        + "central=\(centralId) connectionAttemptId=\(attemptId)"
+    )
+    return attemptId
+  }
+
+  private func notifyConnectionRequest(centralId: String, friendlyName: String) {
+    let attemptId = stableConnectionAttemptId(for: centralId)
+    logBle(
+      "approval requested central=\(centralId) friendlyName=\(friendlyName) "
+        + "connectionAttemptId=\(attemptId)"
+    )
+    DispatchQueue.main.async { [weak self] in
+      self?.logBle("approval dialog invoke notifyConnectionRequest central=\(centralId)")
+      self?.uiChannel.invokeMethod(
+        "notifyConnectionRequest",
+        arguments: [
+          "friendlyName": friendlyName,
+          "deviceAddress": centralId,
+          "connectionAttemptId": attemptId,
+        ]
+      )
+    }
+  }
+
   // MARK: - Guest handshake
 
   private func establishSecureHandshake(call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -183,10 +579,22 @@ final class BleTransportPlugin: NSObject {
       return
     }
 
+    let guestPeerId = (args["guestPeerId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? peerId
+    let guestDisplayName = (args["guestDisplayName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let clientHelloJson = (args["clientHelloJson"] as? String) ?? ""
+    if let data = clientHelloJson.data(using: .utf8), !clientHelloJson.isEmpty {
+      pendingGuestClientHelloData = data
+    } else {
+      let payload: [String: String] = [
+        "type": "client_hello",
+        "peer_id": guestPeerId,
+        "display_name": guestDisplayName.isEmpty ? "Guest" : guestDisplayName,
+      ]
+      pendingGuestClientHelloData = try? JSONSerialization.data(withJSONObject: payload)
+    }
     logBle(
-      "handshake start peerId=\(peerId) name=\(peripheral.name ?? "?") "
-        + "expected service=\(Self.serviceUuid.uuidString) "
-        + "handshake char=\(Self.handshakeCharacteristicUuid.uuidString)"
+      "ClientHello guestPeerId=\(guestPeerId) displayName=\(guestDisplayName) "
+        + "handshake start peerId=\(peerId) name=\(peripheral.name ?? "?")"
     )
     cancelHandshakeWait()
     handshakeDelivered = false
@@ -201,6 +609,53 @@ final class BleTransportPlugin: NSObject {
     logBle("ClientHello: connect + discover service \(Self.serviceUuid.uuidString)")
     centralManager.connect(peripheral, options: nil)
     scheduleHandshakeWait(for: peripheral)
+  }
+
+  private func readPeerEndpoint(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    guard let args = call.arguments as? [String: Any],
+          let peerId = (args["peerId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !peerId.isEmpty,
+          let peripheral = discoveredPeripherals[peerId]
+    else {
+      result(FlutterError(code: "peer_not_found", message: "Unable to resolve peer device.", details: nil))
+      return
+    }
+
+    endpointReadCompleted = false
+    pendingEndpointReadPeripheral = peripheral
+    pendingEndpointReadResult = result
+    peripheral.delegate = self
+    centralManager.connect(peripheral, options: nil)
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+      guard let self, !self.endpointReadCompleted else { return }
+      self.endpointReadCompleted = true
+      self.pendingEndpointReadResult?(
+        FlutterError(code: "endpoint_read_timeout", message: "Timed out reading peer endpoint.", details: nil)
+      )
+      if let peripheral = self.pendingEndpointReadPeripheral {
+        self.centralManager.cancelPeripheralConnection(peripheral)
+      }
+      self.pendingEndpointReadPeripheral = nil
+      self.pendingEndpointReadResult = nil
+    }
+  }
+
+  private func completeEndpointRead(_ value: [String: Any]?) {
+    guard !endpointReadCompleted else { return }
+    endpointReadCompleted = true
+    if let value {
+      pendingEndpointReadResult?(value)
+    } else {
+      pendingEndpointReadResult?(
+        FlutterError(code: "endpoint_read_failed", message: "Failed to read endpoint.", details: nil)
+      )
+    }
+    if let peripheral = pendingEndpointReadPeripheral {
+      centralManager.cancelPeripheralConnection(peripheral)
+    }
+    pendingEndpointReadPeripheral = nil
+    pendingEndpointReadResult = nil
   }
 
   private func trimmedString(_ json: [String: Any], _ key: String) -> String {
@@ -224,7 +679,10 @@ final class BleTransportPlugin: NSObject {
       return nil
     }
     let rawKeys = json.keys.sorted().joined(separator: ",")
-    logBle("ServerHello raw JSON keys=[\(rawKeys)] service=\(Self.serviceUuid.uuidString) handshake=\(Self.handshakeCharacteristicUuid.uuidString)")
+    logBle(
+      "ServerHello raw JSON keys=[\(rawKeys)] service=\(Self.serviceUuid.uuidString) "
+        + "handshake=\(Self.handshakeCharacteristicUuid.uuidString)"
+    )
     if !handshakePayloadIsReady(json) {
       if let preview = String(data: data, encoding: .utf8) {
         logBle("ServerHello not ready yet (awaiting host approval): \(preview.prefix(200))")
@@ -465,17 +923,28 @@ extension BleTransportPlugin: CBCentralManagerDelegate {
       "id": peerId,
       "friendlyName": friendlyName,
       "serviceUuid": Self.serviceUuid.uuidString,
+      "platform": "macos",
     ]
     emitScanPeers()
   }
 
   func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-    guard peripheral === activeGuestPeripheral else { return }
-    logBle("ClientHello: connected peer=\(peripheral.identifier.uuidString), discovering services")
-    peripheral.discoverServices([Self.serviceUuid])
+    if peripheral === activeGuestPeripheral {
+      logBle("ClientHello: connected peer=\(peripheral.identifier.uuidString), discovering services")
+      peripheral.discoverServices([Self.serviceUuid])
+      return
+    }
+    if peripheral === pendingEndpointReadPeripheral {
+      logBle("endpoint read: connected peer=\(peripheral.identifier.uuidString), discovering services")
+      peripheral.discoverServices([Self.serviceUuid])
+    }
   }
 
   func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+    if peripheral === pendingEndpointReadPeripheral, !endpointReadCompleted {
+      completeEndpointRead(nil)
+      return
+    }
     guard peripheral === activeGuestPeripheral, !handshakeDelivered else { return }
     failHandshake(
       code: "handshake_connect_failed",
@@ -489,6 +958,10 @@ extension BleTransportPlugin: CBCentralManagerDelegate {
     didDisconnectPeripheral peripheral: CBPeripheral,
     error: Error?
   ) {
+    if peripheral === pendingEndpointReadPeripheral, !endpointReadCompleted {
+      completeEndpointRead(nil)
+      return
+    }
     guard peripheral === activeGuestPeripheral, !handshakeDelivered, handshakeDeliveryResult != nil else {
       return
     }
@@ -505,6 +978,20 @@ extension BleTransportPlugin: CBCentralManagerDelegate {
 
 extension BleTransportPlugin: CBPeripheralDelegate {
   func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+    if peripheral === pendingEndpointReadPeripheral {
+      if let error {
+        logBle("endpoint read service discovery failed: \(error.localizedDescription)")
+        completeEndpointRead(nil)
+        return
+      }
+      guard let service = peripheral.services?.first(where: { $0.uuid == Self.serviceUuid }) else {
+        completeEndpointRead(nil)
+        return
+      }
+      peripheral.discoverCharacteristics([Self.endpointCharacteristicUuid], for: service)
+      return
+    }
+
     guard peripheral === activeGuestPeripheral else { return }
     if let error {
       failHandshake(
@@ -534,6 +1021,22 @@ extension BleTransportPlugin: CBPeripheralDelegate {
     didDiscoverCharacteristicsFor service: CBService,
     error: Error?
   ) {
+    if peripheral === pendingEndpointReadPeripheral {
+      if let error {
+        completeEndpointRead(nil)
+        logBle("endpoint characteristic discovery failed: \(error.localizedDescription)")
+        return
+      }
+      guard let endpointChar = service.characteristics?.first(where: {
+        $0.uuid == Self.endpointCharacteristicUuid
+      }) else {
+        completeEndpointRead(nil)
+        return
+      }
+      peripheral.readValue(for: endpointChar)
+      return
+    }
+
     guard peripheral === activeGuestPeripheral else { return }
     if let error {
       failHandshake(
@@ -560,9 +1063,33 @@ extension BleTransportPlugin: CBPeripheralDelegate {
       "handshake characteristic discovered uuid=\(handshakeChar.uuid.uuidString) "
         + "properties=\(handshakeChar.properties.rawValue)"
     )
+    if let hello = pendingGuestClientHelloData {
+      pendingGuestClientHelloData = nil
+      logBle("ClientHello: writing identity payload (\(hello.count) bytes)")
+      peripheral.writeValue(hello, for: handshakeChar, type: .withResponse)
+    } else {
+      logBle("ClientHello: subscribe notify + initial read on handshake characteristic")
+      peripheral.setNotifyValue(true, for: handshakeChar)
+      peripheral.readValue(for: handshakeChar)
+    }
+  }
+
+  func peripheral(
+    _ peripheral: CBPeripheral,
+    didWriteValueFor characteristic: CBCharacteristic,
+    error: Error?
+  ) {
+    guard peripheral === activeGuestPeripheral,
+          characteristic.uuid == Self.handshakeCharacteristicUuid
+    else { return }
+    if let error {
+      logBle("ClientHello write failed: \(error.localizedDescription); continuing handshake")
+    } else {
+      logBle("ClientHello written successfully")
+    }
     logBle("ClientHello: subscribe notify + initial read on handshake characteristic")
-    peripheral.setNotifyValue(true, for: handshakeChar)
-    peripheral.readValue(for: handshakeChar)
+    peripheral.setNotifyValue(true, for: characteristic)
+    peripheral.readValue(for: characteristic)
   }
 
   func peripheral(
@@ -570,6 +1097,22 @@ extension BleTransportPlugin: CBPeripheralDelegate {
     didUpdateValueFor characteristic: CBCharacteristic,
     error: Error?
   ) {
+    if peripheral === pendingEndpointReadPeripheral,
+       characteristic.uuid == Self.endpointCharacteristicUuid {
+      if let error {
+        logBle("endpoint read failed: \(error.localizedDescription)")
+        completeEndpointRead(nil)
+        return
+      }
+      let raw = String(data: characteristic.value ?? Data(), encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      let parts = raw.split(separator: ":")
+      let ip = parts.first.map(String.init) ?? ""
+      let port = parts.count > 1 ? Int(parts[1]) ?? 8080 : 8080
+      completeEndpointRead(["ip": ip, "port": port])
+      return
+    }
+
     guard peripheral === activeGuestPeripheral,
           characteristic.uuid == Self.handshakeCharacteristicUuid
     else { return }
@@ -610,6 +1153,191 @@ extension BleTransportPlugin: CBPeripheralDelegate {
       peripheral.readValue(for: characteristic)
     } else {
       logBle("handshake notifications disabled (isNotifying=false)")
+    }
+  }
+}
+
+// MARK: - CBPeripheralManagerDelegate (host)
+
+extension BleTransportPlugin: CBPeripheralManagerDelegate {
+  func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
+    logBle("peripheral manager state=\(peripheralStateLabel(peripheral.state))")
+    guard peripheral.state == .poweredOn else { return }
+    if let pending = pendingAdvertiseResult, let name = pendingAdvertiseFriendlyName {
+      pendingAdvertiseFriendlyName = nil
+      startHubAdvertising(
+        call: FlutterMethodCall(methodName: "startHubAdvertising", arguments: ["friendlyName": name]),
+        result: pending
+      )
+    }
+  }
+
+  func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
+    if let error {
+      gattServicePublished = false
+      logBle("didAdd service FAILED: \(error.localizedDescription)")
+      if let pending = pendingAdvertiseResult {
+        pendingAdvertiseResult = nil
+        pendingGattAdvertiseLabel = nil
+        pending(
+          FlutterError(
+            code: "gatt_service_add_failed",
+            message: error.localizedDescription,
+            details: nil
+          )
+        )
+      }
+      return
+    }
+    gattServicePublished = true
+    let charUuids = (service.characteristics ?? []).map { $0.uuid.uuidString }.joined(separator: ", ")
+    logBle("service created uuid=\(service.uuid.uuidString) characteristics=[\(charUuids)]")
+    startBleAdvertisingIfReady()
+  }
+
+  func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
+    if let error {
+      isAdvertising = false
+      logBle("advertising start FAILED: \(error.localizedDescription)")
+      return
+    }
+    logBle("advertising started (didStartAdvertising callback)")
+  }
+
+  func peripheralManager(
+    _ peripheral: CBPeripheralManager,
+    central: CBCentral,
+    didSubscribeTo characteristic: CBCharacteristic
+  ) {
+    logBle(
+      "central subscribed uuid=\(characteristic.uuid.uuidString) central=\(central.identifier.uuidString)"
+    )
+    if characteristic.uuid == Self.handshakeCharacteristicUuid {
+      if handshakePayload.isEmpty {
+        logBle(
+          "handshake subscribe before approval central=\(central.identifier.uuidString) "
+            + "— no ServerHello pushed"
+        )
+      } else if let char = handshakeCharacteristic {
+        let notified = peripheralManager.updateValue(
+          handshakePayload,
+          for: char,
+          onSubscribedCentrals: [central]
+        )
+        logBle(
+          "handshake subscribe after approval central=\(central.identifier.uuidString) "
+            + "notify_sent=\(notified) bytes=\(handshakePayload.count)"
+        )
+      }
+    }
+  }
+
+  func peripheralManager(
+    _ peripheral: CBPeripheralManager,
+    central: CBCentral,
+    didUnsubscribeFrom characteristic: CBCharacteristic
+  ) {
+    logBle(
+      "central unsubscribed uuid=\(characteristic.uuid.uuidString) central=\(central.identifier.uuidString)"
+    )
+  }
+
+  func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
+    let charUuid = request.characteristic.uuid.uuidString
+    logBle("didReceiveRead uuid=\(charUuid) central=\(request.central.identifier.uuidString)")
+
+    if request.characteristic.uuid == Self.endpointCharacteristicUuid {
+      let bytes = advertisedEndpoint.data(using: .utf8) ?? Data()
+      request.value = bytes
+      peripheral.respond(to: request, withResult: .success)
+      logBle("endpoint read response: \(advertisedEndpoint)")
+      return
+    }
+
+    guard request.characteristic.uuid == Self.handshakeCharacteristicUuid else {
+      peripheral.respond(to: request, withResult: .requestNotSupported)
+      return
+    }
+
+    if !handshakePayload.isEmpty {
+      request.value = handshakePayload
+      peripheral.respond(to: request, withResult: .success)
+      if let json = String(data: handshakePayload, encoding: .utf8) {
+        logBle("handshake read response (approved ServerHello): \(json.prefix(180))")
+      }
+      return
+    }
+
+    // Protected: empty until host approves. First empty read triggers Flutter approval UI.
+    let centralId = request.central.identifier.uuidString
+    if pendingApprovalCentralId == nil {
+      pendingApprovalCentralId = centralId
+      scheduleApprovalTimeout()
+    }
+    if let hello = clientHelloByCentralId[centralId] {
+      emitConnectionRequestOnce(
+        centralId: centralId,
+        friendlyName: hello.displayName,
+        reason: "empty_read_with_client_hello"
+      )
+    } else if !approvalUiEmittedCentrals.contains(centralId) {
+      cancelPendingApprovalNotify(centralId: centralId)
+      let work = DispatchWorkItem { [weak self] in
+        guard let self else { return }
+        self.pendingApprovalNotifyWorkItems.removeValue(forKey: centralId)
+        // Prefer ClientHello name when available; otherwise emit a reliable
+        // fallback so the host still gets exactly one approval request.
+        let name = self.clientHelloByCentralId[centralId]?.displayName ?? "Unknown Peer"
+        self.emitConnectionRequestOnce(
+          centralId: centralId,
+          friendlyName: name,
+          reason: name == "Unknown Peer" ? "empty_read_fallback" : "empty_read_after_client_hello"
+        )
+      }
+      pendingApprovalNotifyWorkItems[centralId] = work
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+      logBle("Approval | Deferring UI until ClientHello central=\(centralId)")
+    } else {
+      logBle("handshake read empty — approval UI already emitted central=\(centralId)")
+    }
+
+    request.value = Data()
+    peripheral.respond(to: request, withResult: .success)
+  }
+
+  func peripheralManager(
+    _ peripheral: CBPeripheralManager,
+    didReceiveWrite requests: [CBATTRequest]
+  ) {
+    for request in requests {
+      logBle("didReceiveWrite uuid=\(request.characteristic.uuid.uuidString)")
+      if request.characteristic.uuid == Self.handshakeCharacteristicUuid {
+        if let data = request.value, let hello = parseClientHello(data) {
+          let centralId = request.central.identifier.uuidString
+          clientHelloByCentralId[centralId] = hello
+          logBle(
+            "ClientHello displayName=\(hello.displayName) guestPeerId=\(hello.peerId) "
+              + "central=\(centralId)"
+          )
+          if pendingApprovalCentralId == nil {
+            pendingApprovalCentralId = centralId
+            scheduleApprovalTimeout()
+          }
+          cancelPendingApprovalNotify(centralId: centralId)
+          emitConnectionRequestOnce(
+            centralId: centralId,
+            friendlyName: hello.displayName,
+            reason: "client_hello_write"
+          )
+          peripheral.respond(to: request, withResult: .success)
+        } else {
+          peripheral.respond(to: request, withResult: .writeNotPermitted)
+        }
+      } else if request.characteristic.uuid == Self.endpointCharacteristicUuid {
+        peripheral.respond(to: request, withResult: .success)
+      } else {
+        peripheral.respond(to: request, withResult: .success)
+      }
     }
   }
 }

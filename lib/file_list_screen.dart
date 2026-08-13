@@ -69,6 +69,7 @@ class FileListScreen extends StatefulWidget {
     required this.hubPort,
     required this.modeTitle,
     this.isHubMode = false,
+    this.connectionAttemptId,
     super.key,
   });
 
@@ -76,6 +77,9 @@ class FileListScreen extends StatefulWidget {
   final int hubPort;
   final String modeTitle;
   final bool isHubMode;
+
+  /// Guest-side nonce for this connection attempt (dedupes host approval).
+  final String? connectionAttemptId;
 
   @override
   State<FileListScreen> createState() => _FileListScreenState();
@@ -102,6 +106,11 @@ class _FileListScreenState extends State<FileListScreen> {
 
   String? _localPeerId;
   String _localDisplayName = 'You';
+  late final String _connectionAttemptId =
+      widget.connectionAttemptId?.trim().isNotEmpty == true
+          ? widget.connectionAttemptId!.trim()
+          : 'attempt-${DateTime.now().millisecondsSinceEpoch}';
+  String? _accessToken;
   List<_StagedFile> _selectedFiles = [];
 
   // Download state
@@ -153,20 +162,24 @@ class _FileListScreenState extends State<FileListScreen> {
         if (_localPeerId != null)
           'x-airshare-requester-peer-id': _localPeerId!,
         'x-airshare-requester-role': widget.isHubMode ? 'host' : 'guest',
+        'x-airshare-connection-attempt-id': _connectionAttemptId,
+        // ignore: use_null_aware_elements
+        if (_accessToken != null && _accessToken!.isNotEmpty)
+          'x-airshare-access-token': _accessToken!,
       };
 
   Map<String, String> _uploadSenderHeaders() => {
+        ..._roomRequestHeaders(),
         // ignore: use_null_aware_elements
         if (_localPeerId != null) 'x-airshare-sender-id': _localPeerId!,
         'x-airshare-sender-name': _localDisplayName,
-        'x-airshare-requester-role': widget.isHubMode ? 'host' : 'guest',
       };
 
   // ── File list ─────────────────────────────────────────────────────────────
 
   Future<void> fetchFiles({bool silent = false}) async {
     try {
-      final response = await http.get(Uri.parse('$baseUrl/files'));
+      final response = await http.get(Uri.parse('$baseUrl/files'), headers: _roomRequestHeaders());
       if (response.statusCode == 200) {
         _consecutiveHostErrors = 0;
         final decoded = json.decode(response.body);
@@ -446,6 +459,7 @@ class _FileListScreenState extends State<FileListScreen> {
       );
 
       final request = http.Request('GET', uri);
+      request.headers.addAll(_roomRequestHeaders());
       final response = await client
           .send(request)
           .timeout(const Duration(minutes: 10));
@@ -1016,17 +1030,59 @@ class _FileListScreenState extends State<FileListScreen> {
       if (widget.isHubMode) {
         unawaited(SessionTeardown.runSenderTeardown());
       } else {
-        unawaited(SessionTeardown.runReceiverTeardown());
+        unawaited(_leaveRoomAndTeardown());
       }
     }
     super.dispose();
+  }
+
+  Future<void> _leaveRoomAndTeardown() async {
+    await _postLeaveNotification();
+    _accessToken = null;
+    _approvalPollTimer?.cancel();
+    _approvalPollTimer = null;
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    await SessionTeardown.runReceiverTeardown();
+  }
+
+  Future<void> _postLeaveNotification() async {
+    if (widget.isHubMode) return;
+    try {
+      await http
+          .post(
+            Uri.parse('$baseUrl/leave'),
+            headers: {
+              'Content-Type': 'application/json',
+              ..._roomRequestHeaders(),
+            },
+            body: jsonEncode({
+              'guestName': _localDisplayName,
+              'guestPeerId': _localPeerId ?? '',
+              'peerId': _localPeerId ?? '',
+              'connectionAttemptId': _connectionAttemptId,
+              'accessToken': _accessToken ?? '',
+            }),
+          )
+          .timeout(const Duration(seconds: 3));
+      await ConnectionLogger.instance.log(
+        'HTTP | Guest leave notified',
+        details:
+            'peer=${_localPeerId ?? "?"} attempt=$_connectionAttemptId',
+      );
+    } catch (e) {
+      await ConnectionLogger.instance.log(
+        'HTTP | Guest leave notify failed',
+        details: '$e',
+      );
+    }
   }
 
   // ── Transfer approval (receiver-side polling) ─────────────────────────────
 
   Future<void> _checkForPendingTransfer() async {
     try {
-      final response = await http.get(Uri.parse('$baseUrl/pending-transfer'));
+      final response = await http.get(Uri.parse('$baseUrl/pending-transfer'), headers: _roomRequestHeaders());
       if (!mounted || _approvalDialogShowing) return;
       if (response.statusCode == 200 && response.body.trim() != 'null') {
         final data = json.decode(response.body) as Map<String, dynamic>;
@@ -1152,7 +1208,10 @@ class _FileListScreenState extends State<FileListScreen> {
     try {
       await http.post(
         Uri.parse('$baseUrl/transfer-response'),
-        headers: {'Content-Type': 'application/json'},
+        headers: {
+          'Content-Type': 'application/json',
+          ..._roomRequestHeaders(),
+        },
         body: jsonEncode({'approved': approved ?? false}),
       );
     } catch (_) {}
@@ -1331,7 +1390,12 @@ class _FileListScreenState extends State<FileListScreen> {
           .post(
             Uri.parse('$baseUrl/join'),
             headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({'guestName': _localDisplayName}),
+            body: jsonEncode({
+              'guestName': _localDisplayName,
+              'guestPeerId': _localPeerId ?? '',
+              'peerId': _localPeerId ?? '',
+              'connectionAttemptId': _connectionAttemptId,
+            }),
           )
           .timeout(const Duration(seconds: 35));
 
@@ -1339,8 +1403,13 @@ class _FileListScreenState extends State<FileListScreen> {
 
       final body = json.decode(response.body) as Map<String, dynamic>?;
       final status = (body?['status'] as String?)?.trim() ?? 'approved';
+      final token = (body?['accessToken'] as String?)?.trim();
+      if (token != null && token.isNotEmpty && mounted) {
+        setState(() => _accessToken = token);
+      }
 
       if (status == 'declined') {
+        _accessToken = null;
         // Stop all hub-polling timers immediately — no further requests should
         // be sent to this host after a decline.
         _refreshTimer?.cancel();

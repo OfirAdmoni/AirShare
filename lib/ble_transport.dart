@@ -2,7 +2,10 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:air_share/air_share_constants.dart';
+import 'package:air_share/client_hello.dart';
+import 'package:air_share/connection_logger.dart';
 import 'package:air_share/handshake_trace.dart';
+import 'package:air_share/local_peer_identity.dart';
 import 'package:flutter/services.dart';
 
 class BlePeer {
@@ -248,20 +251,44 @@ class BleTransport {
   }
 
   /// Waits for host approval via GATT notification (no read polling).
+  ///
+  /// Resolves [LocalPeerIdentity] first and sends a ClientHello with the final
+  /// guestPeerId + displayName so the host's first approval UI has the real name.
   Future<HandshakePayload> establishSecureHandshake(BlePeer peer) async {
+    final identity = await LocalPeerIdentity.resolve();
+    await ConnectionLogger.instance.log(
+      'Guest | Identity resolved',
+      details: 'guestPeerId=${identity.peerId} displayName=${identity.displayName}',
+    );
+    final clientHelloJson = ClientHello.encode(
+      peerId: identity.peerId,
+      displayName: identity.displayName,
+    );
+    await ConnectionLogger.instance.log(
+      'ClientHello | Prepared',
+      details:
+          'guestPeerId=${identity.peerId} displayName=${identity.displayName}',
+    );
     final payload = await HandshakeTrace.run(
       'ClientHello→ServerHello (BLE notify handshake JSON)',
       () async {
         final raw = await _methodChannel.invokeMethod<Map<dynamic, dynamic>>(
           'establishSecureHandshake',
-          {'peerId': peer.id, 'serviceUuid': peer.serviceUuid},
+          {
+            'peerId': peer.id,
+            'serviceUuid': peer.serviceUuid,
+            'guestPeerId': identity.peerId,
+            'guestDisplayName': identity.displayName,
+            'clientHelloJson': clientHelloJson,
+          },
         );
         if (raw == null) {
           throw Exception('Secure handshake returned empty payload');
         }
         return HandshakePayload.fromMap(raw);
       },
-      extra: 'peerId=${peer.id} name=${peer.friendlyName}',
+      extra:
+          'peerId=${peer.id} guestPeerId=${identity.peerId} name=${identity.displayName}',
       hardTimeout: const Duration(seconds: 45),
     );
     return payload;

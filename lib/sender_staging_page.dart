@@ -123,7 +123,7 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
     required String ip,
     required int port,
   }) async {
-    if (!Platform.isAndroid && !Platform.isWindows && !Platform.isIOS) return;
+    if (!Platform.isAndroid && !Platform.isWindows && !Platform.isIOS && !Platform.isMacOS) return;
     try {
       await BleTransport.instance.updateHubEndpoint(ip: ip, port: port);
       await ConnectionLogger.instance.log(
@@ -257,9 +257,9 @@ class _SenderStagingPageState extends State<SenderStagingPage> {
                 : 'LAN ready — skipping automated hotspot and Wi‑Fi Direct',
           );
         }
-      } else if (Platform.isIOS) {
+      } else if (Platform.isIOS || Platform.isMacOS) {
         await ConnectionLogger.instance.log(
-          'Connection | iOS sender — LAN only (no offline hotspot host)',
+          'Connection | iOS/MacOS sender — LAN only (no offline hotspot host)',
           details: lanIp ?? 'no LAN IP',
         );
         if (mounted) {

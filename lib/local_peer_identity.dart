@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:air_share/ble_transport.dart';
+import 'package:air_share/connection_logger.dart';
 import 'package:air_share/device_branding.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -42,6 +44,12 @@ class LocalPeerIdentity {
     }
     final displayName = await DeviceBranding.effectiveAdvertisingName();
     _cached = LocalPeerIdentity._(peerId: peerId, displayName: displayName);
+    unawaited(
+      ConnectionLogger.instance.log(
+        'Guest | Identity resolved',
+        details: 'guestPeerId=$peerId displayName=$displayName',
+      ),
+    );
     return _cached!;
   }
 }

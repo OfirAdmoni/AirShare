@@ -43,6 +43,11 @@ final class BleTransportPlugin: NSObject {
   private var pendingHubPort = 8080
   private var hotspotActive = false
   private var pendingApprovalCentralId: String?
+  private var clientHelloByCentralId: [String: (peerId: String, displayName: String)] = [:]
+  private var approvalUiEmittedCentrals = Set<String>()
+  private var connectionAttemptIdByCentral: [String: String] = [:]
+  private var pendingApprovalNotifyWorkItems: [String: DispatchWorkItem] = [:]
+  private var pendingGuestClientHelloData: Data?
   private var approvalTimeoutWorkItem: DispatchWorkItem?
 
   // Guest handshake state
@@ -227,11 +232,11 @@ final class BleTransportPlugin: NSObject {
     // peripheral mode via didSubscribeTo. A manual CBMutableDescriptor with value: nil crashes at add().
     let handshakeChar = CBMutableCharacteristic(
       type: Self.handshakeCharacteristicUuid,
-      properties: [.read, .notify],
+      properties: [.read, .notify, .write],
       value: nil,
-      permissions: [.readable]
+      permissions: [.readable, .writeable]
     )
-    logBle("added handshake characteristic (read+notify, value=nil, no manual CCCD)")
+    logBle("added handshake characteristic (read+notify+write, value=nil, no manual CCCD)")
 
     // Match Android: endpoint is read+write with no cached value (served in didReceiveRead).
     let endpointChar = CBMutableCharacteristic(
@@ -283,6 +288,12 @@ final class BleTransportPlugin: NSObject {
     endpointCharacteristic = nil
     clearReleasedHandshakePayload(reason: "stopHubAdvertising")
     clearPendingApproval()
+    clientHelloByCentralId.removeAll()
+    approvalUiEmittedCentrals.removeAll()
+    connectionAttemptIdByCentral.removeAll()
+    for (_, work) in pendingApprovalNotifyWorkItems { work.cancel() }
+    pendingApprovalNotifyWorkItems.removeAll()
+    pendingGuestClientHelloData = nil
     result(nil)
   }
 
@@ -377,6 +388,21 @@ final class BleTransportPlugin: NSObject {
       result(FlutterError(code: "peer_not_found", message: "Unable to resolve peer device.", details: nil))
       return
     }
+
+    let guestPeerId = (args["guestPeerId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? peerId
+    let guestDisplayName = (args["guestDisplayName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let clientHelloJson = (args["clientHelloJson"] as? String) ?? ""
+    if let data = clientHelloJson.data(using: .utf8), !clientHelloJson.isEmpty {
+      pendingGuestClientHelloData = data
+    } else {
+      let payload: [String: String] = [
+        "type": "client_hello",
+        "peer_id": guestPeerId,
+        "display_name": guestDisplayName.isEmpty ? "Guest" : guestDisplayName,
+      ]
+      pendingGuestClientHelloData = try? JSONSerialization.data(withJSONObject: payload)
+    }
+    logBle("ClientHello guestPeerId=\(guestPeerId) displayName=\(guestDisplayName)")
 
     cancelHandshakeWait()
     handshakeDelivered = false
@@ -613,8 +639,62 @@ final class BleTransportPlugin: NSObject {
     cancelApprovalTimeout()
   }
 
+
+  private func parseClientHello(_ data: Data) -> (peerId: String, displayName: String)? {
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          (json["type"] as? String) == "client_hello"
+    else { return nil }
+    let displayName = (json["display_name"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !displayName.isEmpty else { return nil }
+    let peerId = (json["peer_id"] as? String)?
+      .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return (peerId: peerId, displayName: displayName)
+  }
+
+  private func cancelPendingApprovalNotify(centralId: String) {
+    pendingApprovalNotifyWorkItems.removeValue(forKey: centralId)?.cancel()
+  }
+
+  private func emitConnectionRequestOnce(centralId: String, friendlyName: String, reason: String) {
+    if approvalUiEmittedCentrals.contains(centralId) {
+      logBle(
+        "Approval | Duplicate approval suppressed | source=BLE reason=\(reason) "
+          + "central=\(centralId) displayName=\(friendlyName)"
+      )
+      logBle(
+        "Approval | Approved entry metadata updated without new UI event "
+          + "central=\(centralId) displayName=\(friendlyName)"
+      )
+      return
+    }
+    approvalUiEmittedCentrals.insert(centralId)
+    logBle(
+      "Approval | Entry created | source=BLE central=\(centralId) "
+        + "displayName=\(friendlyName) reason=\(reason)"
+    )
+    notifyConnectionRequest(centralId: centralId, friendlyName: friendlyName)
+  }
+
+  private func stableConnectionAttemptId(for centralId: String) -> String {
+    if let existing = connectionAttemptIdByCentral[centralId], !existing.isEmpty {
+      return existing
+    }
+    let attemptId = "ble-\(Int(Date().timeIntervalSince1970 * 1000))"
+    connectionAttemptIdByCentral[centralId] = attemptId
+    logBle(
+      "Approval | New connectionAttemptId created reason=ble_first_notify "
+        + "central=\(centralId) connectionAttemptId=\(attemptId)"
+    )
+    return attemptId
+  }
+
   private func notifyConnectionRequest(centralId: String, friendlyName: String) {
-    logBle("approval requested central=\(centralId) friendlyName=\(friendlyName)")
+    let attemptId = stableConnectionAttemptId(for: centralId)
+    logBle(
+      "approval requested central=\(centralId) friendlyName=\(friendlyName) "
+        + "connectionAttemptId=\(attemptId)"
+    )
     DispatchQueue.main.async { [weak self] in
       self?.logBle("approval dialog invoke notifyConnectionRequest central=\(centralId)")
       self?.uiChannel.invokeMethod(
@@ -622,6 +702,7 @@ final class BleTransportPlugin: NSObject {
         arguments: [
           "friendlyName": friendlyName,
           "deviceAddress": centralId,
+          "connectionAttemptId": attemptId,
         ]
       )
     }
@@ -813,8 +894,31 @@ extension BleTransportPlugin: CBPeripheralDelegate {
     }
 
     guestHandshakeCharacteristic = handshakeChar
-    peripheral.setNotifyValue(true, for: handshakeChar)
-    peripheral.readValue(for: handshakeChar)
+    if let hello = pendingGuestClientHelloData {
+      pendingGuestClientHelloData = nil
+      logBle("ClientHello: writing identity payload (\(hello.count) bytes)")
+      peripheral.writeValue(hello, for: handshakeChar, type: .withResponse)
+    } else {
+      peripheral.setNotifyValue(true, for: handshakeChar)
+      peripheral.readValue(for: handshakeChar)
+    }
+  }
+
+  func peripheral(
+    _ peripheral: CBPeripheral,
+    didWriteValueFor characteristic: CBCharacteristic,
+    error: Error?
+  ) {
+    guard peripheral === activeGuestPeripheral,
+          characteristic.uuid == Self.handshakeCharacteristicUuid
+    else { return }
+    if let error {
+      logBle("ClientHello write failed: \(error.localizedDescription); continuing")
+    } else {
+      logBle("ClientHello written successfully")
+    }
+    peripheral.setNotifyValue(true, for: characteristic)
+    peripheral.readValue(for: characteristic)
   }
 
   func peripheral(
@@ -964,10 +1068,32 @@ extension BleTransportPlugin: CBPeripheralManagerDelegate {
     if pendingApprovalCentralId == nil {
       pendingApprovalCentralId = centralId
       scheduleApprovalTimeout()
-      notifyConnectionRequest(centralId: centralId, friendlyName: "Unknown Peer")
-      logBle("handshake read empty — approval required central=\(centralId)")
+    }
+    if let hello = clientHelloByCentralId[centralId] {
+      emitConnectionRequestOnce(
+        centralId: centralId,
+        friendlyName: hello.displayName,
+        reason: "empty_read_with_client_hello"
+      )
+    } else if !approvalUiEmittedCentrals.contains(centralId) {
+      cancelPendingApprovalNotify(centralId: centralId)
+      let work = DispatchWorkItem { [weak self] in
+        guard let self else { return }
+        self.pendingApprovalNotifyWorkItems.removeValue(forKey: centralId)
+        // Prefer ClientHello name when available; otherwise emit a reliable
+        // fallback so the host still gets exactly one approval request.
+        let name = self.clientHelloByCentralId[centralId]?.displayName ?? "Unknown Peer"
+        self.emitConnectionRequestOnce(
+          centralId: centralId,
+          friendlyName: name,
+          reason: name == "Unknown Peer" ? "empty_read_fallback" : "empty_read_after_client_hello"
+        )
+      }
+      pendingApprovalNotifyWorkItems[centralId] = work
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+      logBle("Approval | Deferring UI until ClientHello central=\(centralId)")
     } else {
-      logBle("handshake read empty — approval already pending central=\(centralId)")
+      logBle("handshake read empty — approval UI already emitted central=\(centralId)")
     }
 
     request.value = Data()
@@ -981,7 +1107,27 @@ extension BleTransportPlugin: CBPeripheralManagerDelegate {
     for request in requests {
       logBle("didReceiveWrite uuid=\(request.characteristic.uuid.uuidString)")
       if request.characteristic.uuid == Self.handshakeCharacteristicUuid {
-        peripheral.respond(to: request, withResult: .writeNotPermitted)
+        if let data = request.value, let hello = parseClientHello(data) {
+          let centralId = request.central.identifier.uuidString
+          clientHelloByCentralId[centralId] = hello
+          logBle(
+            "ClientHello displayName=\(hello.displayName) guestPeerId=\(hello.peerId) "
+              + "central=\(centralId)"
+          )
+          if pendingApprovalCentralId == nil {
+            pendingApprovalCentralId = centralId
+            scheduleApprovalTimeout()
+          }
+          cancelPendingApprovalNotify(centralId: centralId)
+          emitConnectionRequestOnce(
+            centralId: centralId,
+            friendlyName: hello.displayName,
+            reason: "client_hello_write"
+          )
+          peripheral.respond(to: request, withResult: .success)
+        } else {
+          peripheral.respond(to: request, withResult: .writeNotPermitted)
+        }
       } else if request.characteristic.uuid == Self.endpointCharacteristicUuid {
         peripheral.respond(to: request, withResult: .success)
       } else {
