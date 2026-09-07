@@ -63,6 +63,11 @@ class FlutterWindow : public Win32Window {
                            flutter::MethodResult<flutter::EncodableValue>* result);
   void StopHubAdvertising(flutter::MethodResult<flutter::EncodableValue>* result);
   void StopHubAdvertisingInternal();
+  // Tear down provider/characteristics and wait for the radio ADV slot to free.
+  void ReleaseGattAdvertisingSession(const char* reason);
+  // Returns empty string on success, otherwise a stable error message.
+  std::string CreateAndStartGattAdvertisingOnce(
+      const flutter::EncodableMap* args, int attempt);
   void ApproveConnection(const flutter::EncodableMap& args,
                          flutter::MethodResult<flutter::EncodableValue>* result);
   void UpdateHubEndpoint(const flutter::EncodableMap& args,

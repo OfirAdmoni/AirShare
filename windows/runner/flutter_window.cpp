@@ -337,9 +337,26 @@ const wchar_t* GattAdvStatusName(
       return L"Started";
     case GattServiceProviderAdvertisementStatus::Aborted:
       return L"Aborted";
-    default:
+    default: {
+      // Newer SDKs: StartedWithoutAllAdvertisementData == 4
+      if (static_cast<int>(status) == 4) {
+        return L"StartedWithoutAllAdvertisementData";
+      }
       return L"Unknown";
+    }
   }
+}
+
+bool IsGattAdvertisingEffectivelyStarted(
+    winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::
+        GattServiceProviderAdvertisementStatus status) {
+  using winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::
+      GattServiceProviderAdvertisementStatus;
+  if (status == GattServiceProviderAdvertisementStatus::Started) {
+    return true;
+  }
+  // UUID present but OS may have omitted LocalName when PDU is full — still OK.
+  return static_cast<int>(status) == 4;
 }
 
 const wchar_t* BluetoothErrorName(
@@ -1307,9 +1324,22 @@ void FlutterWindow::StartHubAdvertising(
   using namespace winrt::Windows::Devices::Bluetooth;
   using namespace winrt::Windows::Devices::Bluetooth::GenericAttributeProfile;
   try {
-    if (gatt_provider_) {
-      result->Success(flutter::EncodableValue());
-      return;
+    // If a prior session is already Started, reuse it. Otherwise force a full
+    // teardown — a leftover provider that never reached Started used to make
+    // the next startHubAdvertising return Success without advertising.
+    if (gatt_provider_ && is_advertising_) {
+      const auto st = gatt_provider_.AdvertisementStatus();
+      if (IsGattAdvertisingEffectivelyStarted(st)) {
+        OutputDebugStringW(
+            L"[AirShareNative] startHubAdvertising: already Started — no-op.\n");
+        result->Success(flutter::EncodableValue());
+        return;
+      }
+      OutputDebugStringW(
+          (L"[AirShareNative] startHubAdvertising: stale provider status=" +
+           std::wstring(GattAdvStatusName(st)) +
+           L" — releasing before recreate.\n")
+              .c_str());
     }
 
     auto adapter = BluetoothAdapter::GetDefaultAsync().get();
@@ -1324,323 +1354,319 @@ void FlutterWindow::StartHubAdvertising(
       return;
     }
 
-    VerifyCanonicalServiceGuid(AirShareServiceGuid());
-    LogGuidDetails("Advertise | Service UUID for GattServiceProvider",
-                   AirShareServiceGuid());
-    LogGuidDetails("Advertise | Handshake characteristic UUID", HandshakeGuid());
-    LogGuidDetails("Advertise | Endpoint characteristic UUID", EndpointGuid());
+    // Always drop any previous provider/ADV handle before binding a new one.
+    ReleaseGattAdvertisingSession("startHubAdvertising:preflight");
 
-    const std::string service_uuid_str =
-        GuidToCanonicalString(AirShareServiceGuid());
-    {
-      const std::string wire_hex = GuidToMemoryHex(AirShareServiceGuid());
-      const std::wstring wlog =
-          L"[AirShareNative] Creating GattServiceProvider | ServiceUuids "
-          L"canonical=" +
-          std::wstring(service_uuid_str.begin(), service_uuid_str.end()) +
-          L" | guid_mem/ble_wire_hex=[" +
-          std::wstring(wire_hex.begin(), wire_hex.end()) + L"]\n";
-      OutputDebugStringW(wlog.c_str());
-    }
-
-    auto async = GattServiceProvider::CreateAsync(AirShareServiceGuid());
-    auto provider_result = async.get();
-    if (provider_result.Error() != BluetoothError::Success) {
-      result->Error("gatt_provider_failed", "Unable to create GATT service provider.");
-      return;
-    }
-    gatt_provider_ = provider_result.ServiceProvider();
-
-    GattLocalCharacteristicParameters params;
-    params.CharacteristicProperties(GattCharacteristicProperties::Read |
-                                    GattCharacteristicProperties::Notify |
-                                    GattCharacteristicProperties::Write);
-    params.UserDescription(L"Secure handshake payload");
-
-    auto char_result =
-        gatt_provider_.Service()
-            .CreateCharacteristicAsync(HandshakeGuid(), params)
-            .get();
-    if (char_result.Error() != BluetoothError::Success) {
-      result->Error("gatt_characteristic_failed",
-                    "Unable to create handshake characteristic.");
-      return;
-    }
-    gatt_handshake_ = char_result.Characteristic();
-
-    handshake_write_token_ = gatt_handshake_.WriteRequested(
-        [this](GattLocalCharacteristic const&,
-               GattWriteRequestedEventArgs args) {
-          auto deferral = args.GetDeferral();
-          try {
-            auto request = args.GetRequestAsync().get();
-            const auto session_id =
-                WinrtStringToUtf8(args.Session().DeviceId().Id());
-            const auto buffer = request.Value();
-            winrt::Windows::Storage::Streams::DataReader reader =
-                winrt::Windows::Storage::Streams::DataReader::FromBuffer(buffer);
-            const uint32_t len = reader.UnconsumedBufferLength();
-            std::string json(len, '\0');
-            if (len > 0) {
-              reader.ReadBytes(
-                  winrt::array_view<uint8_t>(
-                      reinterpret_cast<uint8_t*>(json.data()), len));
-            }
-            std::string peer_id;
-            std::string display_name;
-            if (TryParseClientHello(json, &peer_id, &display_name)) {
-              std::lock_guard<std::mutex> lock(approval_mutex_);
-              client_hello_by_session_[session_id] = {peer_id, display_name};
-              OutputDebugStringW(
-                  (L"[AirShareNative] ClientHello session=" +
-                   std::wstring(session_id.begin(), session_id.end()) +
-                   L" name=" +
-                   std::wstring(display_name.begin(), display_name.end()) +
-                   L"\n")
-                      .c_str());
-            }
-            request.Respond();
-          } catch (...) {
-          }
-          deferral.Complete();
-        });
-
-    GattLocalCharacteristicParameters endpoint_params;
-    endpoint_params.CharacteristicProperties(GattCharacteristicProperties::Read |
-                                             GattCharacteristicProperties::Write);
-    endpoint_params.UserDescription(L"Hub endpoint");
-    auto endpoint_result =
-        gatt_provider_.Service()
-            .CreateCharacteristicAsync(EndpointGuid(), endpoint_params)
-            .get();
-    if (endpoint_result.Error() != BluetoothError::Success) {
-      result->Error("gatt_characteristic_failed",
-                    "Unable to create endpoint characteristic.");
-      return;
-    }
-    gatt_endpoint_ = endpoint_result.Characteristic();
-    endpoint_read_token_ = gatt_endpoint_.ReadRequested(
-        [this](GattLocalCharacteristic const&, GattReadRequestedEventArgs args) {
-          auto deferral = args.GetDeferral();
-          try {
-            auto request = args.GetRequestAsync().get();
-            request.RespondWithValue(BuildEndpointBuffer());
-          } catch (...) {
-          }
-          deferral.Complete();
-        });
-
-    handshake_read_token_ = gatt_handshake_.ReadRequested(
-        [this](GattLocalCharacteristic const&,
-               GattReadRequestedEventArgs args) {
-          auto deferral = args.GetDeferral();
-          try {
-            auto request = args.GetRequestAsync().get();
-            std::string session_id;
-            {
-              std::lock_guard<std::mutex> lock(approval_mutex_);
-              if (pending_read_request_) {
-                try {
-                  request.RespondWithValue(nullptr);
-                } catch (...) {
-                }
-                deferral.Complete();
-                return;
-              }
-
-              pending_read_deferral_ =
-                  deferral.as<winrt::Windows::Foundation::IDeferral>();
-              pending_read_request_ = request;
-              pending_gatt_session_ = args.Session();
-              pending_session_id_ =
-                  WinrtStringToUtf8(args.Session().DeviceId().Id());
-              session_id = pending_session_id_;
-            }
-            OutputDebugStringW(
-                L"[AirShareNative] Peer Handshake Blocked - Waiting for UI Approval\n");
-            NotifyFlutterConnectionRequest(
-                ResolveGuestDisplayName(session_id), session_id);
-            ScheduleApprovalTimeout();
-            return;
-          } catch (...) {
-            deferral.Complete();
-          }
-        });
-
-    constexpr int kBleAdvPduMax = 31;
-    constexpr int kPrimaryFlagsAnd128UuidEstimate = 3 + 18;
-    static_assert(kPrimaryFlagsAnd128UuidEstimate <= 31,
-                  "primary advertisement flags + 128-bit UUID must fit legacy 31-byte PDU");
-    try {
-      std::string friendly_u8;
-      if (args) {
-        const auto it = args->find(flutter::EncodableValue("friendlyName"));
-        if (it != args->end()) {
-          try {
-            friendly_u8 = std::get<std::string>(it->second);
-          } catch (...) {
-          }
-        }
+    constexpr int kMaxAttempts = 3;
+    std::string last_error;
+    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+      {
+        const std::wstring msg =
+            L"[AirShareNative] GATT advertise attempt " +
+            std::to_wstring(attempt) + L"/" + std::to_wstring(kMaxAttempts) +
+            L"\n";
+        OutputDebugStringW(msg.c_str());
       }
-      TrimAsciiWhitespace(friendly_u8);
-      if (friendly_u8.empty()) {
-        friendly_u8 = GetHostComputerNameUtf8();
-        TrimAsciiWhitespace(friendly_u8);
+      if (attempt > 1) {
+        ReleaseGattAdvertisingSession("startHubAdvertising:retry");
       }
-      if (friendly_u8.empty()) {
-        friendly_u8 = "Windows";
-      }
-      // Store the FULL resolved name for injection into the GATT handshake
-      // payload — this is how the receiver learns the correct custom name,
-      // because WinRT GattServiceProviderAdvertisingParameters has no API for
-      // setting the BLE local name (the OS always uses the computer name).
-      pending_friendly_name_ = friendly_u8;
 
-      // PDU size check: WinRT uses the OS BT device name for the scan
-      // response, not our friendly_u8, so this is informational only.
-      winrt::hstring h_label = winrt::to_hstring(friendly_u8);
-      std::wstring wname(h_label.c_str());
-      while (wname.size() > 1) {
-        const std::string u8 =
-            WinrtStringToUtf8(winrt::hstring(wname.c_str()));
-        const int scan_est = static_cast<int>(2 + u8.size());
-        if (scan_est <= kBleAdvPduMax) {
-          break;
-        }
-        wname.pop_back();
-      }
-      const std::string u8_final =
-          wname.empty() ? std::string()
-                        : WinrtStringToUtf8(winrt::hstring(wname.c_str()));
-      const int scan_ad_estimate =
-          u8_final.empty() ? 0 : static_cast<int>(2 + u8_final.size());
-      const std::wstring wlog =
-          L"[AirShareNative] BLE adv: friendly_name=\"" +
-          std::wstring(h_label.c_str()) +
-          L"\", scan_response_name=<OS BT device name>, scan_est~" +
-          std::to_wstring(scan_ad_estimate) + L"B, primary~" +
-          std::to_wstring(kPrimaryFlagsAnd128UuidEstimate) +
-          L"B (flags+service UUID)\n";
-      OutputDebugStringW(wlog.c_str());
-    } catch (...) {
-      OutputDebugStringW(
-          L"[AirShareNative] BLE adv verify: name check skipped.\n");
-    }
-
-    gatt_adv_status_token_.reset();
-    struct AdvStatusWait {
-      std::mutex mutex;
-      std::condition_variable cv;
-      bool terminal = false;
-      winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::
-          GattServiceProviderAdvertisementStatus status{};
-      winrt::Windows::Devices::Bluetooth::BluetoothError error{};
-    };
-    auto adv_wait = std::make_shared<AdvStatusWait>();
-
-    gatt_adv_status_token_ = gatt_provider_.AdvertisementStatusChanged(
-        [adv_wait](GattServiceProvider const& provider,
-                   GattServiceProviderAdvertisementStatusChangedEventArgs const&
-                       args) {
-          const auto status = args.Status();
-          const auto error = args.Error();
-          const std::wstring msg =
-              L"[AirShareNative] GATT AdvertisementStatusChanged | status=" +
-              std::wstring(GattAdvStatusName(status)) + L" (" +
-              std::to_wstring(static_cast<int>(status)) + L") error=" +
-              std::wstring(BluetoothErrorName(error)) + L" (" +
-              std::to_wstring(static_cast<int>(error)) + L") providerStatus=" +
-              std::wstring(GattAdvStatusName(provider.AdvertisementStatus())) +
-              L"\n";
-          OutputDebugStringW(msg.c_str());
-          using winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::
-              GattServiceProviderAdvertisementStatus;
-          if (status == GattServiceProviderAdvertisementStatus::Started ||
-              status == GattServiceProviderAdvertisementStatus::Aborted ||
-              status == GattServiceProviderAdvertisementStatus::Stopped) {
-            std::lock_guard<std::mutex> lock(adv_wait->mutex);
-            adv_wait->status = status;
-            adv_wait->error = error;
-            adv_wait->terminal = true;
-            adv_wait->cv.notify_all();
-          }
-        });
-
-    // SINGLE advertising path: GattServiceProvider only.
-    // A concurrent BluetoothLEAdvertisementPublisher contends for the same
-    // legacy ADV slot; on Oria's machine the publisher was dropped and nRF
-    // Connect only saw an unrelated OS advertisement
-    // (name=PF59LAZJ, UUID=3e1d50cd-..., 0x180A Device Information) — NOT our
-    // 6E400001-... payload. Do not start a second publisher.
-    //
-    // Both IsConnectable and IsDiscoverable are required so WinRT embeds THIS
-    // provider's service UUID (from CreateAsync) into the legacy ADV packet.
-    GattServiceProviderAdvertisingParameters adv_params;
-    adv_params.IsConnectable(true);
-    adv_params.IsDiscoverable(true);
-    {
-      const std::wstring wlog =
-          L"[AirShareNative] Starting GATT advertising ONLY (no standalone "
-          L"Publisher) | IsConnectable=1 IsDiscoverable=1 | Service UUID that "
-          L"MUST appear in nRF Connect=" +
-          std::wstring(service_uuid_str.begin(), service_uuid_str.end()) +
-          L" | friendly_name(GATT handshake)=" +
-          std::wstring(pending_friendly_name_.begin(),
-                       pending_friendly_name_.end()) +
-          L" | OS BT LocalName may still show computer name (e.g. PF59LAZJ)\n";
-      OutputDebugStringW(wlog.c_str());
-    }
-    gatt_provider_.StartAdvertising(adv_params);
-
-    {
-      using winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::
-          GattServiceProviderAdvertisementStatus;
-      std::unique_lock<std::mutex> lock(adv_wait->mutex);
-      const bool got = adv_wait->cv.wait_for(
-          lock, std::chrono::seconds(5),
-          [&] { return adv_wait->terminal; });
-      const auto final_status =
-          got ? adv_wait->status : gatt_provider_.AdvertisementStatus();
-      const auto final_error =
-          got ? adv_wait->error
-              : winrt::Windows::Devices::Bluetooth::BluetoothError::OtherError;
-      const std::wstring summary =
-          L"[AirShareNative] GATT advertising settle | got_event=" +
-          std::wstring(got ? L"yes" : L"no/timeout") + L" status=" +
-          std::wstring(GattAdvStatusName(final_status)) + L" error=" +
-          std::wstring(BluetoothErrorName(final_error)) + L"\n";
-      OutputDebugStringW(summary.c_str());
-
-      if (final_status != GattServiceProviderAdvertisementStatus::Started) {
-        StopHubAdvertisingInternal();
-        result->Error(
-            "ble_advertise_aborted",
-            std::string("GATT advertising did not reach Started (status=") +
-                std::to_string(static_cast<int>(final_status)) + " error=" +
-                std::to_string(static_cast<int>(final_error)) +
-                "). Another advertiser may own the radio (OS profile UUID "
-                "3e1d50cd-... / Device Information). Close other BLE peripherals "
-                "and retry.");
+      last_error = CreateAndStartGattAdvertisingOnce(args, attempt);
+      if (last_error.empty()) {
+        is_advertising_ = true;
+        OutputDebugStringW(
+            L"[AirShareNative] Hub BLE advertising Started. External scanner "
+            L"must show Service UUID 6E400001-B5A3-F393-E0A9-E50E24DCCA9E.\n");
+        OutputDebugStringW(
+            L"[AirShareNative] Firewall hint: allow inbound TCP 8080 "
+            L"(example: netsh advfirewall firewall add rule name=\"AirShare "
+            L"8080\" dir=in action=allow protocol=TCP localport=8080).\n");
+        result->Success(flutter::EncodableValue());
         return;
       }
+
+      OutputDebugStringW(
+          (L"[AirShareNative] GATT advertise attempt failed: " +
+           std::wstring(last_error.begin(), last_error.end()) + L"\n")
+              .c_str());
     }
 
-    is_advertising_ = true;
-    OutputDebugStringW(
-        L"[AirShareNative] Hub BLE advertising Started. External scanner must "
-        L"show Service UUID 6E400001-B5A3-F393-E0A9-E50E24DCCA9E (not "
-        L"3e1d50cd-... OS filler).\n");
-    OutputDebugStringW(
-        L"[AirShareNative] Firewall hint: allow inbound TCP 8080 (example: netsh advfirewall firewall add rule name=\"AirShare 8080\" dir=in action=allow protocol=TCP localport=8080).\n");
-    result->Success(flutter::EncodableValue());
+    ReleaseGattAdvertisingSession("startHubAdvertising:exhausted");
+    result->Error("ble_advertise_aborted", last_error);
   } catch (const winrt::hresult_error& e) {
+    ReleaseGattAdvertisingSession("startHubAdvertising:exception");
     result->Error("ble_advertise_failed", WinrtStringToUtf8(e.message()));
+  } catch (...) {
+    ReleaseGattAdvertisingSession("startHubAdvertising:exception");
+    result->Error("ble_advertise_failed", "Unknown advertising failure.");
+  }
+}
+
+void FlutterWindow::ReleaseGattAdvertisingSession(const char* reason) {
+  OutputDebugStringW(
+      (L"[AirShareNative] ReleaseGattAdvertisingSession(" +
+       std::wstring(reason, reason + std::strlen(reason)) + L")\n")
+          .c_str());
+  StopHubAdvertisingInternal();
+  // Radio ADV handles are released asynchronously after StopAdvertising +
+  // destroying the provider. Brief grace so the next CreateAsync/StartAdvertising
+  // does not immediately Aborted(status=3) on a still-busy adapter.
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+}
+
+std::string FlutterWindow::CreateAndStartGattAdvertisingOnce(
+    const flutter::EncodableMap* args, int attempt) {
+  using namespace winrt::Windows::Devices::Bluetooth;
+  using namespace winrt::Windows::Devices::Bluetooth::GenericAttributeProfile;
+
+  VerifyCanonicalServiceGuid(AirShareServiceGuid());
+  LogGuidDetails("Advertise | Service UUID for GattServiceProvider",
+                 AirShareServiceGuid());
+
+  const std::string service_uuid_str =
+      GuidToCanonicalString(AirShareServiceGuid());
+  {
+    const std::wstring wlog =
+        L"[AirShareNative] Creating GattServiceProvider attempt=" +
+        std::to_wstring(attempt) + L" | Service UUID=" +
+        std::wstring(service_uuid_str.begin(), service_uuid_str.end()) + L"\n";
+    OutputDebugStringW(wlog.c_str());
+  }
+
+  auto provider_result =
+      GattServiceProvider::CreateAsync(AirShareServiceGuid()).get();
+  if (provider_result.Error() != BluetoothError::Success) {
+    return std::string("Unable to create GATT service provider (error=") +
+           std::to_string(static_cast<int>(provider_result.Error())) + ")";
+  }
+  gatt_provider_ = provider_result.ServiceProvider();
+
+  GattLocalCharacteristicParameters params;
+  params.CharacteristicProperties(GattCharacteristicProperties::Read |
+                                  GattCharacteristicProperties::Notify |
+                                  GattCharacteristicProperties::Write);
+  params.UserDescription(L"Secure handshake payload");
+
+  auto char_result = gatt_provider_.Service()
+                         .CreateCharacteristicAsync(HandshakeGuid(), params)
+                         .get();
+  if (char_result.Error() != BluetoothError::Success) {
+    ReleaseGattAdvertisingSession("handshake_char_failed");
+    return "Unable to create handshake characteristic.";
+  }
+  gatt_handshake_ = char_result.Characteristic();
+
+  handshake_write_token_ = gatt_handshake_.WriteRequested(
+      [this](GattLocalCharacteristic const&, GattWriteRequestedEventArgs args) {
+        auto deferral = args.GetDeferral();
+        try {
+          auto request = args.GetRequestAsync().get();
+          const auto session_id =
+              WinrtStringToUtf8(args.Session().DeviceId().Id());
+          const auto buffer = request.Value();
+          winrt::Windows::Storage::Streams::DataReader reader =
+              winrt::Windows::Storage::Streams::DataReader::FromBuffer(buffer);
+          const uint32_t len = reader.UnconsumedBufferLength();
+          std::string json(len, '\0');
+          if (len > 0) {
+            reader.ReadBytes(winrt::array_view<uint8_t>(
+                reinterpret_cast<uint8_t*>(json.data()), len));
+          }
+          std::string peer_id;
+          std::string display_name;
+          if (TryParseClientHello(json, &peer_id, &display_name)) {
+            std::lock_guard<std::mutex> lock(approval_mutex_);
+            client_hello_by_session_[session_id] = {peer_id, display_name};
+            OutputDebugStringW(
+                (L"[AirShareNative] ClientHello session=" +
+                 std::wstring(session_id.begin(), session_id.end()) +
+                 L" name=" +
+                 std::wstring(display_name.begin(), display_name.end()) +
+                 L"\n")
+                    .c_str());
+          }
+          request.Respond();
+        } catch (...) {
+        }
+        deferral.Complete();
+      });
+
+  GattLocalCharacteristicParameters endpoint_params;
+  endpoint_params.CharacteristicProperties(GattCharacteristicProperties::Read |
+                                           GattCharacteristicProperties::Write);
+  endpoint_params.UserDescription(L"Hub endpoint");
+  auto endpoint_result =
+      gatt_provider_.Service()
+          .CreateCharacteristicAsync(EndpointGuid(), endpoint_params)
+          .get();
+  if (endpoint_result.Error() != BluetoothError::Success) {
+    ReleaseGattAdvertisingSession("endpoint_char_failed");
+    return "Unable to create endpoint characteristic.";
+  }
+  gatt_endpoint_ = endpoint_result.Characteristic();
+  endpoint_read_token_ = gatt_endpoint_.ReadRequested(
+      [this](GattLocalCharacteristic const&, GattReadRequestedEventArgs args) {
+        auto deferral = args.GetDeferral();
+        try {
+          auto request = args.GetRequestAsync().get();
+          request.RespondWithValue(BuildEndpointBuffer());
+        } catch (...) {
+        }
+        deferral.Complete();
+      });
+
+  handshake_read_token_ = gatt_handshake_.ReadRequested(
+      [this](GattLocalCharacteristic const&, GattReadRequestedEventArgs args) {
+        auto deferral = args.GetDeferral();
+        try {
+          auto request = args.GetRequestAsync().get();
+          std::string session_id;
+          {
+            std::lock_guard<std::mutex> lock(approval_mutex_);
+            if (pending_read_request_) {
+              try {
+                request.RespondWithValue(nullptr);
+              } catch (...) {
+              }
+              deferral.Complete();
+              return;
+            }
+
+            pending_read_deferral_ =
+                deferral.as<winrt::Windows::Foundation::IDeferral>();
+            pending_read_request_ = request;
+            pending_gatt_session_ = args.Session();
+            pending_session_id_ =
+                WinrtStringToUtf8(args.Session().DeviceId().Id());
+            session_id = pending_session_id_;
+          }
+          OutputDebugStringW(
+              L"[AirShareNative] Peer Handshake Blocked - Waiting for UI "
+              L"Approval\n");
+          NotifyFlutterConnectionRequest(ResolveGuestDisplayName(session_id),
+                                         session_id);
+          ScheduleApprovalTimeout();
+          return;
+        } catch (...) {
+          deferral.Complete();
+        }
+      });
+
+  try {
+    std::string friendly_u8;
+    if (args) {
+      const auto it = args->find(flutter::EncodableValue("friendlyName"));
+      if (it != args->end()) {
+        try {
+          friendly_u8 = std::get<std::string>(it->second);
+        } catch (...) {
+        }
+      }
+    }
+    TrimAsciiWhitespace(friendly_u8);
+    if (friendly_u8.empty()) {
+      friendly_u8 = GetHostComputerNameUtf8();
+      TrimAsciiWhitespace(friendly_u8);
+    }
+    if (friendly_u8.empty()) {
+      friendly_u8 = "Windows";
+    }
+    pending_friendly_name_ = friendly_u8;
+  } catch (...) {
+    pending_friendly_name_ = "Windows";
+  }
+
+  struct AdvStatusWait {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool terminal = false;
+    GattServiceProviderAdvertisementStatus status{};
+    BluetoothError error{};
+  };
+  auto adv_wait = std::make_shared<AdvStatusWait>();
+
+  gatt_adv_status_token_ = gatt_provider_.AdvertisementStatusChanged(
+      [adv_wait](GattServiceProvider const& provider,
+                 GattServiceProviderAdvertisementStatusChangedEventArgs const&
+                     args) {
+        const auto status = args.Status();
+        const auto error = args.Error();
+        const std::wstring msg =
+            L"[AirShareNative] GATT AdvertisementStatusChanged | status=" +
+            std::wstring(GattAdvStatusName(status)) + L" (" +
+            std::to_wstring(static_cast<int>(status)) + L") error=" +
+            std::wstring(BluetoothErrorName(error)) + L" (" +
+            std::to_wstring(static_cast<int>(error)) + L") providerStatus=" +
+            std::wstring(GattAdvStatusName(provider.AdvertisementStatus())) +
+            L"\n";
+        OutputDebugStringW(msg.c_str());
+        if (IsGattAdvertisingEffectivelyStarted(status) ||
+            status == GattServiceProviderAdvertisementStatus::Aborted ||
+            status == GattServiceProviderAdvertisementStatus::Stopped) {
+          std::lock_guard<std::mutex> lock(adv_wait->mutex);
+          adv_wait->status = status;
+          adv_wait->error = error;
+          adv_wait->terminal = true;
+          adv_wait->cv.notify_all();
+        }
+      });
+
+  // Single advertiser: GattServiceProvider only (no BluetoothLEAdvertisementPublisher).
+  GattServiceProviderAdvertisingParameters adv_params;
+  adv_params.IsConnectable(true);
+  adv_params.IsDiscoverable(true);
+  {
+    const std::wstring wlog =
+        L"[AirShareNative] StartAdvertising | IsConnectable=1 IsDiscoverable=1 "
+        L"| Service UUID=" +
+        std::wstring(service_uuid_str.begin(), service_uuid_str.end()) +
+        L" | handshake_friendly_name=" +
+        std::wstring(pending_friendly_name_.begin(),
+                     pending_friendly_name_.end()) +
+        L"\n";
+    OutputDebugStringW(wlog.c_str());
+  }
+
+  try {
+    gatt_provider_.StartAdvertising(adv_params);
+  } catch (const winrt::hresult_error& e) {
+    const std::string err = WinrtStringToUtf8(e.message());
+    ReleaseGattAdvertisingSession("StartAdvertising_exception");
+    return std::string("StartAdvertising threw: ") + err;
+  }
+
+  {
+    std::unique_lock<std::mutex> lock(adv_wait->mutex);
+    const bool got = adv_wait->cv.wait_for(
+        lock, std::chrono::seconds(5), [&] { return adv_wait->terminal; });
+    const auto final_status =
+        got ? adv_wait->status : gatt_provider_.AdvertisementStatus();
+    const auto final_error =
+        got ? adv_wait->error : BluetoothError::OtherError;
+    const std::wstring summary =
+        L"[AirShareNative] GATT advertising settle | attempt=" +
+        std::to_wstring(attempt) + L" got_event=" +
+        std::wstring(got ? L"yes" : L"no/timeout") + L" status=" +
+        std::wstring(GattAdvStatusName(final_status)) + L" error=" +
+        std::wstring(BluetoothErrorName(final_error)) + L"\n";
+    OutputDebugStringW(summary.c_str());
+
+    if (IsGattAdvertisingEffectivelyStarted(final_status)) {
+      return {};
+    }
+
+    // Leave provider destroyed so the next retry starts clean.
+    ReleaseGattAdvertisingSession("advertise_not_started");
+    return std::string("GATT advertising did not reach Started (status=") +
+           std::to_string(static_cast<int>(final_status)) + " error=" +
+           std::to_string(static_cast<int>(final_error)) +
+           "). Released radio session and will retry if attempts remain.";
   }
 }
 
 void FlutterWindow::StopHubAdvertising(
     flutter::MethodResult<flutter::EncodableValue>* result) {
-  StopHubAdvertisingInternal();
+  ReleaseGattAdvertisingSession("stopHubAdvertising");
   result->Success(flutter::EncodableValue());
 }
 
@@ -1648,18 +1674,30 @@ void FlutterWindow::StopHubAdvertisingInternal() {
   CancelApprovalTimeout();
   ClearPendingReadState();
   if (gatt_provider_ && gatt_adv_status_token_) {
-    gatt_provider_.AdvertisementStatusChanged(*gatt_adv_status_token_);
+    try {
+      gatt_provider_.AdvertisementStatusChanged(*gatt_adv_status_token_);
+    } catch (...) {
+    }
   }
   gatt_adv_status_token_.reset();
   if (gatt_handshake_ && handshake_read_token_) {
-    gatt_handshake_.ReadRequested(*handshake_read_token_);
+    try {
+      gatt_handshake_.ReadRequested(*handshake_read_token_);
+    } catch (...) {
+    }
   }
   if (gatt_endpoint_ && endpoint_read_token_) {
-    gatt_endpoint_.ReadRequested(*endpoint_read_token_);
+    try {
+      gatt_endpoint_.ReadRequested(*endpoint_read_token_);
+    } catch (...) {
+    }
   }
   handshake_read_token_.reset();
   if (gatt_handshake_ && handshake_write_token_) {
-    gatt_handshake_.WriteRequested(*handshake_write_token_);
+    try {
+      gatt_handshake_.WriteRequested(*handshake_write_token_);
+    } catch (...) {
+    }
   }
   handshake_write_token_.reset();
   endpoint_read_token_.reset();
@@ -1671,9 +1709,18 @@ void FlutterWindow::StopHubAdvertisingInternal() {
   gatt_endpoint_ = nullptr;
   if (gatt_provider_) {
     try {
+      OutputDebugStringW(
+          L"[AirShareNative] StopAdvertising() on GattServiceProvider.\n");
       gatt_provider_.StopAdvertising();
+    } catch (const winrt::hresult_error& e) {
+      OutputDebugStringW(
+          (L"[AirShareNative] StopAdvertising exception: " +
+           std::wstring(e.message().c_str()) + L"\n")
+              .c_str());
     } catch (...) {
     }
+    // Drop the WinRT object so the OS can reclaim the peripheral ADV session
+    // before a subsequent CreateAsync.
     gatt_provider_ = nullptr;
   }
   is_advertising_ = false;
