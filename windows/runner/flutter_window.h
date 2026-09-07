@@ -7,6 +7,7 @@
 #include <flutter/method_channel.h>
 #include <flutter/standard_method_codec.h>
 #include <winrt/base.h>
+#include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
 #include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h>
 #include <winrt/Windows.Foundation.h>
 
@@ -124,6 +125,8 @@ class FlutterWindow : public Win32Window {
 
   winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattServiceProvider
       gatt_provider_{nullptr};
+  winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementPublisher
+      ble_uuid_publisher_{nullptr};
   winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattLocalCharacteristic
       gatt_handshake_{nullptr};
   winrt::Windows::Devices::Bluetooth::GenericAttributeProfile::GattLocalCharacteristic
@@ -132,6 +135,7 @@ class FlutterWindow : public Win32Window {
   std::optional<winrt::event_token> handshake_write_token_;
   std::optional<winrt::event_token> endpoint_read_token_;
   std::optional<winrt::event_token> gatt_adv_status_token_;
+  std::optional<winrt::event_token> publisher_status_token_;
   bool is_advertising_ = false;
 
   winrt::Windows::Foundation::IDeferral pending_read_deferral_{nullptr};

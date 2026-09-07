@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -159,28 +160,75 @@ constexpr char kBleScanEventsChannel[] = "air_share/ble_scan_events";
 constexpr char kBleUiChannel[] = "air_share/ble_ui";
 constexpr char kWlanLinkChannel[] = "air_share/wlan_link";
 
-// Canonical AirShare UUIDs (must match lib/air_share_constants.dart + Android/iOS).
-// Constructed as Windows GUID components — NEVER from a raw 16-byte BLE wire
-// buffer. Windows GUID layout is mixed-endian (Data1/2/3 little-endian integers,
-// Data4 byte array in UUID-string order). Hardcoded components make
-// advertising/scanning immune to accidental byte-array endian swaps.
-const winrt::guid kAirShareServiceGuid{
-    0x6E400001u,
-    0xB5A3u,
-    0xF393u,
-    {0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E}};
-const winrt::guid kHandshakeGuid{
-    0x6E400002u,
-    0xB5A3u,
-    0xF393u,
-    {0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E}};
-const winrt::guid kEndpointGuid{
-    0x6E400003u,
-    0xB5A3u,
-    0xF393u,
-    {0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E}};
+// Canonical UUID string — must match lib/air_share_constants.dart + Android/iOS.
+constexpr wchar_t kAirShareServiceUuidW[] =
+    L"6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr wchar_t kHandshakeUuidW[] = L"6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr wchar_t kEndpointUuidW[] = L"6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr char kAirShareServiceUuidUtf8[] =
     "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+
+// ---------------------------------------------------------------------------
+// UUID byte-order ground truth for 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+//
+// RFC / string octet order (how humans write the UUID):
+//   6E 40 00 01  B5 A3  F3 93  E0 A9 E5 0E 24 DC CA 9E
+//
+// Windows GUID struct (winrt::guid / GUID) on little-endian x86/x64:
+//   Data1=0x6E400001 → mem 01 00 40 6E
+//   Data2=0xB5A3     → mem A3 B5
+//   Data3=0xF393     → mem 93 F3
+//   Data4            → mem E0 A9 E5 0E 24 DC CA 9E
+//   Full GUID memory: 01 00 40 6E A3 B5 93 F3 E0 A9 E5 0E 24 DC CA 9E
+//
+// Bluetooth Core Spec AD types 0x06/0x07 (128-bit Service UUID list):
+//   multipacket UUID fields are little-endian = REVERSE of the RFC octets.
+//   BLE on-air AD payload: 9E CA DC 24 0E E5 A9 E0 93 F3 A3 B5 01 00 40 6E
+//
+// IMPORTANT: GUID memory ≠ BLE AD payload. ServiceUuids().Append(guid) asks
+// WinRT/the radio stack to convert; some Intel vs Realtek/Qualcomm stacks have
+// been observed to emit GUID memory bytes (or a partial swap) on the air,
+// which 3rd-party scanners then display as a mutated UUID. We therefore publish
+// the Service UUID via an explicit AD DataSection (type 0x07) with the BLE
+// little-endian payload below — not via ServiceUuids.Append.
+// ---------------------------------------------------------------------------
+constexpr uint8_t kAirShareServiceUuidBleAdLe[16] = {
+    0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0,
+    0x93, 0xF3, 0xA3, 0xB5, 0x01, 0x00, 0x40, 0x6E,
+};
+
+// Expected Windows GUID mixed-endian components (for CreateAsync / GATT ATT).
+constexpr uint32_t kServiceData1 = 0x6E400001u;
+constexpr uint16_t kServiceData2 = 0xB5A3u;
+constexpr uint16_t kServiceData3 = 0xF393u;
+constexpr uint8_t kServiceData4[8] = {0xE0, 0xA9, 0xE5, 0x0E,
+                                      0x24, 0xDC, 0xCA, 0x9E};
+
+const winrt::guid& AirShareServiceGuid() {
+  // GATT ATT database must use the canonical Windows GUID (string-parsed).
+  static const winrt::guid g{winrt::guid(kAirShareServiceUuidW)};
+  return g;
+}
+const winrt::guid& HandshakeGuid() {
+  static const winrt::guid g{winrt::guid(kHandshakeUuidW)};
+  return g;
+}
+const winrt::guid& EndpointGuid() {
+  static const winrt::guid g{winrt::guid(kEndpointUuidW)};
+  return g;
+}
+
+std::string BytesToHex(const uint8_t* bytes, size_t n) {
+  std::string out;
+  out.reserve(n * 3);
+  char tmp[4];
+  for (size_t i = 0; i < n; ++i) {
+    if (i) out.push_back(' ');
+    std::snprintf(tmp, sizeof(tmp), "%02X", bytes[i]);
+    out += tmp;
+  }
+  return out;
+}
 
 std::string GuidToCanonicalString(const winrt::guid& g) {
   char buf[64];
@@ -190,6 +238,96 @@ std::string GuidToCanonicalString(const winrt::guid& g) {
       g.Data1, g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
       g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
   return buf;
+}
+
+// Windows GUID in-memory layout (NOT Bluetooth AD payload).
+void GuidToMemoryBytes(const winrt::guid& g, uint8_t out[16]) {
+  out[0] = static_cast<uint8_t>(g.Data1 & 0xFF);
+  out[1] = static_cast<uint8_t>((g.Data1 >> 8) & 0xFF);
+  out[2] = static_cast<uint8_t>((g.Data1 >> 16) & 0xFF);
+  out[3] = static_cast<uint8_t>((g.Data1 >> 24) & 0xFF);
+  out[4] = static_cast<uint8_t>(g.Data2 & 0xFF);
+  out[5] = static_cast<uint8_t>((g.Data2 >> 8) & 0xFF);
+  out[6] = static_cast<uint8_t>(g.Data3 & 0xFF);
+  out[7] = static_cast<uint8_t>((g.Data3 >> 8) & 0xFF);
+  for (int i = 0; i < 8; ++i) out[8 + i] = g.Data4[i];
+}
+
+std::string GuidToMemoryHex(const winrt::guid& g) {
+  uint8_t bytes[16];
+  GuidToMemoryBytes(g, bytes);
+  return BytesToHex(bytes, 16);
+}
+
+// Interpret 16 AD payload bytes the way a BLE-spec scanner does (reverse of
+// RFC octets) → UUID string a 3rd-party scanner should display.
+std::string BleAdLeBytesToUuidString(const uint8_t le[16]) {
+  char buf[64];
+  std::snprintf(
+      buf, sizeof(buf),
+      "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+      le[15], le[14], le[13], le[12], le[11], le[10], le[9], le[8], le[7],
+      le[6], le[5], le[4], le[3], le[2], le[1], le[0]);
+  return buf;
+}
+
+void LogGuidDetails(const char* label, const winrt::guid& g) {
+  uint8_t mem[16];
+  GuidToMemoryBytes(g, mem);
+  const std::string canon = GuidToCanonicalString(g);
+  const std::string mem_hex = BytesToHex(mem, 16);
+  const std::string ble_hex = BytesToHex(kAirShareServiceUuidBleAdLe, 16);
+  const std::string if_mem_on_air = BleAdLeBytesToUuidString(mem);
+  const std::string if_ble_on_air =
+      BleAdLeBytesToUuidString(kAirShareServiceUuidBleAdLe);
+  const std::wstring msg =
+      L"[AirShareNative] " +
+      std::wstring(label, label + std::strlen(label)) + L"\n"
+      L"  canonical_string=" +
+      std::wstring(canon.begin(), canon.end()) + L"\n"
+      L"  guid_memory_hex=[" +
+      std::wstring(mem_hex.begin(), mem_hex.end()) + L"]  "
+      L"(Windows GUID layout — must NOT be raw AD payload)\n"
+      L"  ble_ad_le_hex=[" +
+      std::wstring(ble_hex.begin(), ble_hex.end()) + L"]  "
+      L"(AD type 0x07 payload we emit)\n"
+      L"  scanner_if_guid_memory_leaked=" +
+      std::wstring(if_mem_on_air.begin(), if_mem_on_air.end()) + L"\n"
+      L"  scanner_if_ble_ad_correct=" +
+      std::wstring(if_ble_on_air.begin(), if_ble_on_air.end()) + L"\n";
+  OutputDebugStringW(msg.c_str());
+}
+
+bool VerifyCanonicalServiceGuid(const winrt::guid& g) {
+  bool ok = g.Data1 == kServiceData1 && g.Data2 == kServiceData2 &&
+            g.Data3 == kServiceData3;
+  for (int i = 0; i < 8; ++i) {
+    ok = ok && (g.Data4[i] == kServiceData4[i]);
+  }
+  const std::string canon = GuidToCanonicalString(g);
+  ok = ok && (canon == kAirShareServiceUuidUtf8);
+  // Sanity: BLE AD LE bytes must decode back to the canonical string.
+  const std::string from_ble =
+      BleAdLeBytesToUuidString(kAirShareServiceUuidBleAdLe);
+  ok = ok && (_stricmp(from_ble.c_str(), kAirShareServiceUuidUtf8) == 0);
+  if (!ok) {
+    OutputDebugStringW(
+        L"[AirShareNative] FATAL: Service UUID canonical/BLE-AD mapping broken.\n");
+    LogGuidDetails("UUID Verify FAIL", g);
+  } else {
+    OutputDebugStringW(
+        L"[AirShareNative] UUID Verify OK: GUID components + BLE AD LE "
+        L"payload both map to 6E400001-B5A3-F393-E0A9-E50E24DCCA9E.\n");
+  }
+  return ok;
+}
+
+winrt::Windows::Storage::Streams::IBuffer BuildBleUuid128AdSectionBuffer() {
+  winrt::Windows::Storage::Streams::DataWriter writer;
+    writer.WriteBytes(winrt::array_view<const uint8_t>(
+      kAirShareServiceUuidBleAdLe,
+      sizeof(kAirShareServiceUuidBleAdLe) / sizeof(kAirShareServiceUuidBleAdLe[0])));
+  return writer.DetachBuffer();
 }
 
 bool TryGetEncodableString(const flutter::EncodableMap& args,
@@ -320,11 +458,7 @@ void FlutterWindow::OnDestroy() {
     ClearPendingReadState();
   }
   CancelApprovalTimeout();
-  if (gatt_provider_) {
-    gatt_provider_.StopAdvertising();
-    gatt_provider_ = nullptr;
-  }
-  gatt_handshake_ = nullptr;
+  StopHubAdvertisingInternal();
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
@@ -364,18 +498,9 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
 }
 
 void FlutterWindow::InitializeNativeChannels() {
-  const std::string service_uuid = GuidToCanonicalString(kAirShareServiceGuid);
-  const std::string handshake_uuid = GuidToCanonicalString(kHandshakeGuid);
-  const std::wstring uuid_log =
-      L"[AirShareNative] Native | UUID Verify | Service: " +
-      std::wstring(service_uuid.begin(), service_uuid.end()) +
-      L" | Characteristic: " +
-      std::wstring(handshake_uuid.begin(), handshake_uuid.end()) + L"\n";
-  OutputDebugStringW(uuid_log.c_str());
-  if (service_uuid != kAirShareServiceUuidUtf8) {
-    OutputDebugStringW(
-        L"[AirShareNative] FATAL UUID mismatch vs canonical string constant.\n");
-  }
+  VerifyCanonicalServiceGuid(AirShareServiceGuid());
+  LogGuidDetails("UUID Verify | Service", AirShareServiceGuid());
+  LogGuidDetails("UUID Verify | Handshake char", HandshakeGuid());
   auto messenger = flutter_controller_->engine()->messenger();
   auto codec = &flutter::StandardMethodCodec::GetInstance();
 
@@ -591,6 +716,8 @@ void FlutterWindow::StartBleScanning(
     g_watcher = BluetoothLEAdvertisementWatcher();
     g_watcher.ScanningMode(BluetoothLEScanningMode::Active);
 
+    LogGuidDetails("Scan | filter target Service UUID", AirShareServiceGuid());
+
     watcher_received_token_ = g_watcher.Received([this](
                                                      auto&&,
                                                      const BluetoothLEAdvertisementReceivedEventArgs&
@@ -604,14 +731,77 @@ void FlutterWindow::StartBleScanning(
         uuids.push_back(uuid);
       }
 
+      const std::string friendly_name =
+          WinrtStringToUtf8(args.Advertisement().LocalName());
+
+      // MUST-HAVE: log every advertisement's UUIDs before filtering so we can
+      // compare on-air bytes against the canonical Service UUID.
+      {
+        std::wstring uuid_list;
+        if (uuids.empty()) {
+          uuid_list = L"(none)";
+        } else {
+          for (size_t i = 0; i < uuids.size(); ++i) {
+            if (i) uuid_list += L" ; ";
+            const std::string s = GuidToCanonicalString(uuids[i]);
+            const std::string hx = GuidToMemoryHex(uuids[i]);
+            uuid_list += std::wstring(s.begin(), s.end()) + L" hex=[" +
+                         std::wstring(hx.begin(), hx.end()) + L"]";
+          }
+        }
+        // Also dump raw 128-bit UUID AD sections (types 0x06/0x07) when present.
+        std::wstring raw_sections;
+        try {
+          for (const auto& section : args.Advertisement().DataSections()) {
+            const uint8_t dtype = section.DataType();
+            if (dtype != 0x06 && dtype != 0x07) continue;
+            auto buf = section.Data();
+            winrt::Windows::Storage::Streams::DataReader reader =
+                winrt::Windows::Storage::Streams::DataReader::FromBuffer(buf);
+            const uint32_t len = reader.UnconsumedBufferLength();
+            std::vector<uint8_t> raw(len);
+            if (len > 0) reader.ReadBytes(raw);
+            raw_sections += L" type=0x";
+            wchar_t tb[8];
+            std::swprintf(tb, 8, L"%02X", dtype);
+            raw_sections += tb;
+            raw_sections += L" bytes=[";
+            for (uint32_t i = 0; i < len; ++i) {
+              if (i) raw_sections += L" ";
+              std::swprintf(tb, 8, L"%02X", raw[i]);
+              raw_sections += tb;
+            }
+            raw_sections += L"]";
+            if (len >= 16) {
+              const std::string decoded = BleAdLeBytesToUuidString(raw.data());
+              raw_sections += L" decoded_as=" +
+                              std::wstring(decoded.begin(), decoded.end());
+            }
+          }
+        } catch (...) {
+        }
+        if (raw_sections.empty()) raw_sections = L" (no 0x06/0x07 AD)";
+
+        // Log ads that carry Service UUIDs always; also log named ads with no
+        // UUID (helps catch hosts whose UUID was crowded out of the PDU).
+        if (!uuids.empty() || !friendly_name.empty()) {
+          std::wstringstream addr;
+          addr << std::hex << bt_addr;
+          OutputDebugStringW(
+              (L"[AirShareNative] Scan | ADV addr=0x" + addr.str() +
+               L" name=\"" +
+               std::wstring(friendly_name.begin(), friendly_name.end()) +
+               L"\" serviceUuids=" + uuid_list + L" raw128=" + raw_sections +
+               L"\n")
+                  .c_str());
+        }
+      }
+
       const bool is_known_peer =
           (discovered_peers_.find(bt_addr) != discovered_peers_.end());
 
       // Unknown device with no AirShare service UUID → not our peer, skip.
       if (!IsAirShareService(uuids) && !is_known_peer) return;
-
-      const std::string friendly_name =
-          WinrtStringToUtf8(args.Advertisement().LocalName());
 
       if (is_known_peer) {
         // Scan-response (or repeat advertisement): update the stored name only
@@ -633,6 +823,9 @@ void FlutterWindow::StartBleScanning(
         discovered_peers_[bt_addr] = {
             peer_id,
             friendly_name.empty() ? "AirShare Device" : friendly_name};
+        OutputDebugStringW(
+            L"[AirShareNative] Scan | AirShare peer MATCHED canonical Service "
+            L"UUID — publishing to Flutter.\n");
         PublishDiscoveredPeers();
       }
     });
@@ -710,7 +903,7 @@ void FlutterWindow::EstablishSecureHandshake(
           peer_w + L"\n";
       OutputDebugStringW(discovery_msg.c_str());
 
-    auto service_uuid = kAirShareServiceGuid;
+    auto service_uuid = AirShareServiceGuid();
     GattDeviceServicesResult services_result{nullptr};
     bool service_available = false;
     for (int attempt = 1; attempt <= 3; ++attempt) {
@@ -738,7 +931,7 @@ void FlutterWindow::EstablishSecureHandshake(
       return;
     }
 
-    auto handshake_uuid = kHandshakeGuid;
+    auto handshake_uuid = HandshakeGuid();
     auto chars_result = services_result.Services().GetAt(0)
                             .GetCharacteristicsForUuidAsync(handshake_uuid)
                             .get();
@@ -966,7 +1159,7 @@ void FlutterWindow::ReadPeerEndpoint(
         return;
       }
 
-    auto service_uuid = kAirShareServiceGuid;
+    auto service_uuid = AirShareServiceGuid();
     auto services_result = ble_device.GetGattServicesForUuidAsync(service_uuid).get();
     if (services_result.Status() != GattCommunicationStatus::Success ||
         services_result.Services().Size() == 0) {
@@ -980,7 +1173,7 @@ void FlutterWindow::ReadPeerEndpoint(
       return;
     }
 
-    auto endpoint_uuid = kEndpointGuid;
+    auto endpoint_uuid = EndpointGuid();
     auto chars_result = services_result.Services().GetAt(0)
                             .GetCharacteristicsForUuidAsync(endpoint_uuid)
                             .get();
@@ -1090,15 +1283,26 @@ void FlutterWindow::StartHubAdvertising(
       return;
     }
 
-    const std::string service_uuid_str = GuidToCanonicalString(kAirShareServiceGuid);
+    VerifyCanonicalServiceGuid(AirShareServiceGuid());
+    LogGuidDetails("Advertise | Service UUID for GattServiceProvider",
+                   AirShareServiceGuid());
+    LogGuidDetails("Advertise | Handshake characteristic UUID", HandshakeGuid());
+    LogGuidDetails("Advertise | Endpoint characteristic UUID", EndpointGuid());
+
+    const std::string service_uuid_str =
+        GuidToCanonicalString(AirShareServiceGuid());
     {
+      const std::string wire_hex = GuidToMemoryHex(AirShareServiceGuid());
       const std::wstring wlog =
-          L"[AirShareNative] Creating GattServiceProvider with canonical UUID " +
-          std::wstring(service_uuid_str.begin(), service_uuid_str.end()) + L"\n";
+          L"[AirShareNative] Creating GattServiceProvider | ServiceUuids "
+          L"canonical=" +
+          std::wstring(service_uuid_str.begin(), service_uuid_str.end()) +
+          L" | guid_mem/ble_wire_hex=[" +
+          std::wstring(wire_hex.begin(), wire_hex.end()) + L"]\n";
       OutputDebugStringW(wlog.c_str());
     }
 
-    auto async = GattServiceProvider::CreateAsync(kAirShareServiceGuid);
+    auto async = GattServiceProvider::CreateAsync(AirShareServiceGuid());
     auto provider_result = async.get();
     if (provider_result.Error() != BluetoothError::Success) {
       result->Error("gatt_provider_failed", "Unable to create GATT service provider.");
@@ -1114,7 +1318,7 @@ void FlutterWindow::StartHubAdvertising(
 
     auto char_result =
         gatt_provider_.Service()
-            .CreateCharacteristicAsync(kHandshakeGuid, params)
+            .CreateCharacteristicAsync(HandshakeGuid(), params)
             .get();
     if (char_result.Error() != BluetoothError::Success) {
       result->Error("gatt_characteristic_failed",
@@ -1166,7 +1370,7 @@ void FlutterWindow::StartHubAdvertising(
     endpoint_params.UserDescription(L"Hub endpoint");
     auto endpoint_result =
         gatt_provider_.Service()
-            .CreateCharacteristicAsync(kEndpointGuid, endpoint_params)
+            .CreateCharacteristicAsync(EndpointGuid(), endpoint_params)
             .get();
     if (endpoint_result.Error() != BluetoothError::Success) {
       result->Error("gatt_characteristic_failed",
@@ -1292,20 +1496,97 @@ void FlutterWindow::StartHubAdvertising(
           OutputDebugStringW(msg.c_str());
         });
 
-    // Both flags required so WinRT includes the 128-bit service UUID in the
-    // primary advertisement (best-effort within the 31-byte legacy PDU).
+    // GATT: connectable peripheral for ATT. IsDiscoverable=false so the stack
+    // does NOT auto-insert Service UUID into the ADV (that path is what mutates
+    // on some radios when it serializes winrt::guid). Local name + Service UUID
+    // are published explicitly via BluetoothLEAdvertisementPublisher below.
     GattServiceProviderAdvertisingParameters adv_params;
     adv_params.IsConnectable(true);
-    adv_params.IsDiscoverable(true);
+    adv_params.IsDiscoverable(false);
     {
       const std::wstring wlog =
-          L"[AirShareNative] Starting GATT advertising with primary packet "
-          L"carrying service UUID " +
+          L"[AirShareNative] Starting GATT advertising | IsConnectable=1 "
+          L"IsDiscoverable=0 (suppress auto Service UUID AD) | ATT service=" +
           std::wstring(service_uuid_str.begin(), service_uuid_str.end()) +
-          L".\n";
+          L"\n";
       OutputDebugStringW(wlog.c_str());
     }
     gatt_provider_.StartAdvertising(adv_params);
+
+    // Explicit Publisher with AD type 0x07 + exact BLE little-endian UUID bytes.
+    // We intentionally do NOT call ServiceUuids().Append(guid) — that path is
+    // what mutates on some Windows Bluetooth stacks.
+    try {
+      using namespace winrt::Windows::Devices::Bluetooth::Advertisement;
+      using namespace winrt::Windows::Storage::Streams;
+
+      ble_uuid_publisher_ = BluetoothLEAdvertisementPublisher();
+      ble_uuid_publisher_.Advertisement().ServiceUuids().Clear();
+      ble_uuid_publisher_.Advertisement().DataSections().Clear();
+
+      BluetoothLEAdvertisementDataSection uuid_section;
+      uuid_section.DataType(0x07);  // Complete List of 128-bit Service UUIDs
+      uuid_section.Data(BuildBleUuid128AdSectionBuffer());
+      ble_uuid_publisher_.Advertisement().DataSections().Append(uuid_section);
+
+      // Keep a discoverable name on the publisher path (protocol name preserved).
+      if (!pending_friendly_name_.empty()) {
+        try {
+          ble_uuid_publisher_.Advertisement().LocalName(
+              winrt::to_hstring(pending_friendly_name_));
+        } catch (...) {
+        }
+      }
+
+      {
+        const std::string ble_hex =
+            BytesToHex(kAirShareServiceUuidBleAdLe, 16);
+        const std::string expect =
+            BleAdLeBytesToUuidString(kAirShareServiceUuidBleAdLe);
+        uint8_t mem[16];
+        GuidToMemoryBytes(AirShareServiceGuid(), mem);
+        const std::string mutated_if_guid_mem =
+            BleAdLeBytesToUuidString(mem);
+        const std::wstring wlog =
+            L"[AirShareNative] Advertise | Publisher DataSection type=0x07 "
+            L"BEFORE Start()\n"
+            L"  on_air_bytes=[" +
+            std::wstring(ble_hex.begin(), ble_hex.end()) +
+            L"]\n"
+            L"  external_scanner_MUST_show=" +
+            std::wstring(expect.begin(), expect.end()) +
+            L"\n"
+            L"  (if scanner instead shows " +
+            std::wstring(mutated_if_guid_mem.begin(), mutated_if_guid_mem.end()) +
+            L" then the stack leaked GUID memory onto the AD)\n";
+        OutputDebugStringW(wlog.c_str());
+      }
+
+      publisher_status_token_ = ble_uuid_publisher_.StatusChanged(
+          [](BluetoothLEAdvertisementPublisher const& pub,
+             BluetoothLEAdvertisementPublisherStatusChangedEventArgs const&
+                 args) {
+            const std::wstring msg =
+                L"[AirShareNative] Publisher status=" +
+                std::to_wstring(static_cast<int>(args.Status())) + L" error=" +
+                std::to_wstring(static_cast<int>(args.Error())) + L"\n";
+            OutputDebugStringW(msg.c_str());
+            (void)pub;
+          });
+      ble_uuid_publisher_.Start();
+      OutputDebugStringW(
+          L"[AirShareNative] BLE UUID publisher Start() invoked (DataSection "
+          L"0x07, no ServiceUuids.Append).\n");
+    } catch (const winrt::hresult_error& e) {
+      OutputDebugStringW(
+          (L"[AirShareNative] BLE UUID publisher failed: " +
+           std::wstring(e.message().c_str()) +
+           L" — discovery may see mutated UUID from GattServiceProvider "
+           L"auto-ADV on this radio.\n")
+              .c_str());
+      ble_uuid_publisher_ = nullptr;
+    }
+
     is_advertising_ = true;
     OutputDebugStringW(L"[AirShareNative] Hub BLE advertising started (GATT server).\n");
     OutputDebugStringW(
@@ -1325,6 +1606,17 @@ void FlutterWindow::StopHubAdvertising(
 void FlutterWindow::StopHubAdvertisingInternal() {
   CancelApprovalTimeout();
   ClearPendingReadState();
+  if (ble_uuid_publisher_) {
+    try {
+      if (publisher_status_token_) {
+        ble_uuid_publisher_.StatusChanged(*publisher_status_token_);
+      }
+      ble_uuid_publisher_.Stop();
+    } catch (...) {
+    }
+  }
+  publisher_status_token_.reset();
+  ble_uuid_publisher_ = nullptr;
   if (gatt_provider_ && gatt_adv_status_token_) {
     gatt_provider_.AdvertisementStatusChanged(*gatt_adv_status_token_);
   }
@@ -1787,7 +2079,7 @@ void FlutterWindow::PublishDiscoveredPeers() {
 }
 
 bool FlutterWindow::IsAirShareService(const std::vector<winrt::guid>& uuids) const {
-  const auto& target = kAirShareServiceGuid;
+  const auto& target = AirShareServiceGuid();
   const auto bswap32 = [](uint32_t v) -> uint32_t {
     return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
            ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
@@ -1799,17 +2091,20 @@ bool FlutterWindow::IsAirShareService(const std::vector<winrt::guid>& uuids) con
     if (uuid == target) {
       return true;
     }
-    // Defensive: also accept a Data1/2/3 byte-swapped variant in case a peer
-    // published from a raw little-endian wire buffer without GUID remapping.
+    // Defensive: accept Data1/2/3 byte-swapped variant (raw BLE bytes wrongly
+    // interpreted as a Windows GUID on some peers/drivers).
     const winrt::guid swapped{bswap32(uuid.Data1), bswap16(uuid.Data2),
                               bswap16(uuid.Data3),
                               {uuid.Data4[0], uuid.Data4[1], uuid.Data4[2],
                                uuid.Data4[3], uuid.Data4[4], uuid.Data4[5],
                                uuid.Data4[6], uuid.Data4[7]}};
     if (swapped == target) {
+      const std::string seen = GuidToCanonicalString(uuid);
       OutputDebugStringW(
-          L"[AirShareNative] Matched AirShare UUID via endianness-swapped "
-          L"Data1/2/3 (peer likely published raw BLE bytes as GUID).\n");
+          (L"[AirShareNative] Matched AirShare UUID via endianness-swapped "
+           L"Data1/2/3; seen string=" +
+           std::wstring(seen.begin(), seen.end()) + L"\n")
+              .c_str());
       return true;
     }
   }
