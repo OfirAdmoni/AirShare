@@ -241,13 +241,6 @@ class BleTransport {
     required int hubPort,
     String tlsCertSha256 = '',
   }) async {
-    if (Platform.isWindows) {
-      final primary = lanIp.isNotEmpty
-          ? lanIp
-          : (p2pIp.isNotEmpty ? p2pIp : hotspotHubIp);
-      await updateHubEndpoint(ip: primary, port: hubPort);
-      return;
-    }
     await _methodChannel.invokeMethod('updateConnectionEndpoints', {
       'lanIp': lanIp,
       'p2pIp': p2pIp,

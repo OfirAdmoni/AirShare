@@ -67,6 +67,9 @@ class FlutterWindow : public Win32Window {
                          flutter::MethodResult<flutter::EncodableValue>* result);
   void UpdateHubEndpoint(const flutter::EncodableMap& args,
                          flutter::MethodResult<flutter::EncodableValue>* result);
+  void UpdateConnectionEndpoints(
+      const flutter::EncodableMap& args,
+      flutter::MethodResult<flutter::EncodableValue>* result);
   void GetLocalPeerId(
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void IsBluetoothEnabled(
@@ -78,6 +81,7 @@ class FlutterWindow : public Win32Window {
   void PublishDiscoveredPeers();
   bool IsAirShareService(const std::vector<winrt::guid>& uuids) const;
   std::string WinrtStringToUtf8(const winrt::hstring& value) const;
+  void ApplyLanIpFromDart(const std::string& lan_ip, const char* reason);
   void NotifyFlutterConnectionRequest(const std::string& friendly_name,
                                       const std::string& session_id);
   // Runs on the Win32 message-thread (same thread Flutter expects for channels).
@@ -127,6 +131,7 @@ class FlutterWindow : public Win32Window {
   std::optional<winrt::event_token> handshake_read_token_;
   std::optional<winrt::event_token> handshake_write_token_;
   std::optional<winrt::event_token> endpoint_read_token_;
+  std::optional<winrt::event_token> gatt_adv_status_token_;
   bool is_advertising_ = false;
 
   winrt::Windows::Foundation::IDeferral pending_read_deferral_{nullptr};
@@ -143,6 +148,13 @@ class FlutterWindow : public Win32Window {
   std::string pending_ssid_;
   std::string pending_password_;
   std::string pending_hub_ip_;
+  std::string pending_lan_ip_;
+  std::string pending_p2p_ip_;
+  std::string pending_p2p_mac_;
+  std::string pending_hotspot_ssid_;
+  std::string pending_hotspot_pass_;
+  std::string pending_hotspot_hub_ip_;
+  std::string pending_tls_cert_sha256_;
   int pending_hub_port_ = 8080;
   std::string pending_friendly_name_;
 };

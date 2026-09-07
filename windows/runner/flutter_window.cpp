@@ -11,7 +11,9 @@
 #include <winrt/Windows.Storage.Streams.h>
 
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -70,9 +72,17 @@ int ExtractJsonIntField(const std::string& key, const std::string& json, int def
 flutter::EncodableMap HandshakeJsonToEncodableMap(const std::string& json) {
   const int hub_port = ExtractJsonIntField("hub_port", json,
                                            ExtractJsonIntField("hubPort", json, 8080));
+  std::string lan = ExtractJsonStringField("lan_ip", json);
+  const std::string hub_ip = ExtractJsonStringField("hubIp", json);
+  const std::string hotspot_ssid = ExtractJsonStringField("hotspot_ssid", json);
+  const std::string ssid = ExtractJsonStringField("ssid", json);
+  // Older Windows hosts only sent hubIp. Promote to lan_ip when no hotspot
+  // credentials are present (matches Android guest parse fallback).
+  if (lan.empty() && !hub_ip.empty() && hotspot_ssid.empty() && ssid.empty()) {
+    lan = hub_ip;
+  }
   return {
-      {flutter::EncodableValue("lan_ip"),
-       flutter::EncodableValue(ExtractJsonStringField("lan_ip", json))},
+      {flutter::EncodableValue("lan_ip"), flutter::EncodableValue(lan)},
       {flutter::EncodableValue("p2p_ip"),
        flutter::EncodableValue(ExtractJsonStringField("p2p_ip", json))},
       {flutter::EncodableValue("p2p_mac"),
@@ -80,17 +90,15 @@ flutter::EncodableMap HandshakeJsonToEncodableMap(const std::string& json) {
       {flutter::EncodableValue("p2pMac"),
        flutter::EncodableValue(ExtractJsonStringField("p2pMac", json))},
       {flutter::EncodableValue("hotspot_ssid"),
-       flutter::EncodableValue(ExtractJsonStringField("hotspot_ssid", json))},
-      {flutter::EncodableValue("ssid"),
-       flutter::EncodableValue(ExtractJsonStringField("ssid", json))},
+       flutter::EncodableValue(hotspot_ssid)},
+      {flutter::EncodableValue("ssid"), flutter::EncodableValue(ssid)},
       {flutter::EncodableValue("hotspot_pass"),
        flutter::EncodableValue(ExtractJsonStringField("hotspot_pass", json))},
       {flutter::EncodableValue("password"),
        flutter::EncodableValue(ExtractJsonStringField("password", json))},
       {flutter::EncodableValue("hotspot_hub_ip"),
        flutter::EncodableValue(ExtractJsonStringField("hotspot_hub_ip", json))},
-      {flutter::EncodableValue("hubIp"),
-       flutter::EncodableValue(ExtractJsonStringField("hubIp", json))},
+      {flutter::EncodableValue("hubIp"), flutter::EncodableValue(hub_ip)},
       {flutter::EncodableValue("hub_port"), flutter::EncodableValue(hub_port)},
       {flutter::EncodableValue("hubPort"), flutter::EncodableValue(hub_port)},
       {flutter::EncodableValue("tls_cert_sha256"),
@@ -150,9 +158,97 @@ constexpr char kBleTransportChannel[] = "air_share/ble_transport";
 constexpr char kBleScanEventsChannel[] = "air_share/ble_scan_events";
 constexpr char kBleUiChannel[] = "air_share/ble_ui";
 constexpr char kWlanLinkChannel[] = "air_share/wlan_link";
-constexpr wchar_t kAirShareServiceUuid[] = L"6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-constexpr wchar_t kHandshakeUuid[] = L"6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
-constexpr wchar_t kEndpointUuid[] = L"6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+
+// Canonical AirShare UUIDs (must match lib/air_share_constants.dart + Android/iOS).
+// Constructed as Windows GUID components — NEVER from a raw 16-byte BLE wire
+// buffer. Windows GUID layout is mixed-endian (Data1/2/3 little-endian integers,
+// Data4 byte array in UUID-string order). Hardcoded components make
+// advertising/scanning immune to accidental byte-array endian swaps.
+const winrt::guid kAirShareServiceGuid{
+    0x6E400001u,
+    0xB5A3u,
+    0xF393u,
+    {0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E}};
+const winrt::guid kHandshakeGuid{
+    0x6E400002u,
+    0xB5A3u,
+    0xF393u,
+    {0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E}};
+const winrt::guid kEndpointGuid{
+    0x6E400003u,
+    0xB5A3u,
+    0xF393u,
+    {0xE0, 0xA9, 0xE5, 0x0E, 0x24, 0xDC, 0xCA, 0x9E}};
+constexpr char kAirShareServiceUuidUtf8[] =
+    "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+
+std::string GuidToCanonicalString(const winrt::guid& g) {
+  char buf[64];
+  std::snprintf(
+      buf, sizeof(buf),
+      "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+      g.Data1, g.Data2, g.Data3, g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+      g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+  return buf;
+}
+
+bool TryGetEncodableString(const flutter::EncodableMap& args,
+                           const char* key,
+                           std::string* out) {
+  const auto it = args.find(flutter::EncodableValue(key));
+  if (it == args.end()) {
+    return false;
+  }
+  try {
+    *out = std::get<std::string>(it->second);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool TryGetEncodableInt(const flutter::EncodableMap& args,
+                        const char* key,
+                        int* out) {
+  const auto it = args.find(flutter::EncodableValue(key));
+  if (it == args.end()) {
+    return false;
+  }
+  if (const auto p = std::get_if<int>(&it->second)) {
+    *out = *p;
+    return true;
+  }
+  if (const auto p64 = std::get_if<int64_t>(&it->second)) {
+    *out = static_cast<int>(*p64);
+    return true;
+  }
+  return false;
+}
+
+void AppendJsonStringField(std::ostringstream& oss,
+                           bool* first,
+                           const char* key,
+                           const std::string& value) {
+  if (value.empty()) {
+    return;
+  }
+  if (!*first) {
+    oss << ',';
+  }
+  *first = false;
+  oss << '"' << key << "\":\"" << value << '"';
+}
+
+void AppendJsonIntField(std::ostringstream& oss,
+                        bool* first,
+                        const char* key,
+                        int value) {
+  if (!*first) {
+    oss << ',';
+  }
+  *first = false;
+  oss << '"' << key << "\":" << value;
+}
 
 winrt::Windows::Devices::Bluetooth::Advertisement::BluetoothLEAdvertisementWatcher
     g_watcher{nullptr};
@@ -268,11 +364,18 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
 }
 
 void FlutterWindow::InitializeNativeChannels() {
+  const std::string service_uuid = GuidToCanonicalString(kAirShareServiceGuid);
+  const std::string handshake_uuid = GuidToCanonicalString(kHandshakeGuid);
   const std::wstring uuid_log =
       L"[AirShareNative] Native | UUID Verify | Service: " +
-      std::wstring(kAirShareServiceUuid) + L" | Characteristic: " +
-      std::wstring(kHandshakeUuid) + L"\n";
+      std::wstring(service_uuid.begin(), service_uuid.end()) +
+      L" | Characteristic: " +
+      std::wstring(handshake_uuid.begin(), handshake_uuid.end()) + L"\n";
   OutputDebugStringW(uuid_log.c_str());
+  if (service_uuid != kAirShareServiceUuidUtf8) {
+    OutputDebugStringW(
+        L"[AirShareNative] FATAL UUID mismatch vs canonical string constant.\n");
+  }
   auto messenger = flutter_controller_->engine()->messenger();
   auto codec = &flutter::StandardMethodCodec::GetInstance();
 
@@ -341,6 +444,17 @@ void FlutterWindow::InitializeNativeChannels() {
             return;
           }
           UpdateHubEndpoint(*args, result.get());
+          return;
+        }
+        if (call.method_name() == "updateConnectionEndpoints") {
+          const auto* args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          if (!args) {
+            result->Error("invalid_args",
+                          "Connection endpoint arguments are missing.");
+            return;
+          }
+          UpdateConnectionEndpoints(*args, result.get());
           return;
         }
         if (call.method_name() == "getLocalPeerId") {
@@ -596,7 +710,7 @@ void FlutterWindow::EstablishSecureHandshake(
           peer_w + L"\n";
       OutputDebugStringW(discovery_msg.c_str());
 
-    auto service_uuid = winrt::guid(kAirShareServiceUuid);
+    auto service_uuid = kAirShareServiceGuid;
     GattDeviceServicesResult services_result{nullptr};
     bool service_available = false;
     for (int attempt = 1; attempt <= 3; ++attempt) {
@@ -624,7 +738,7 @@ void FlutterWindow::EstablishSecureHandshake(
       return;
     }
 
-    auto handshake_uuid = winrt::guid(kHandshakeUuid);
+    auto handshake_uuid = kHandshakeGuid;
     auto chars_result = services_result.Services().GetAt(0)
                             .GetCharacteristicsForUuidAsync(handshake_uuid)
                             .get();
@@ -852,7 +966,7 @@ void FlutterWindow::ReadPeerEndpoint(
         return;
       }
 
-    auto service_uuid = winrt::guid(kAirShareServiceUuid);
+    auto service_uuid = kAirShareServiceGuid;
     auto services_result = ble_device.GetGattServicesForUuidAsync(service_uuid).get();
     if (services_result.Status() != GattCommunicationStatus::Success ||
         services_result.Services().Size() == 0) {
@@ -866,7 +980,7 @@ void FlutterWindow::ReadPeerEndpoint(
       return;
     }
 
-    auto endpoint_uuid = winrt::guid(kEndpointUuid);
+    auto endpoint_uuid = kEndpointGuid;
     auto chars_result = services_result.Services().GetAt(0)
                             .GetCharacteristicsForUuidAsync(endpoint_uuid)
                             .get();
@@ -963,7 +1077,28 @@ void FlutterWindow::StartHubAdvertising(
       result->Success(flutter::EncodableValue());
       return;
     }
-    auto async = GattServiceProvider::CreateAsync(winrt::guid(kAirShareServiceUuid));
+
+    auto adapter = BluetoothAdapter::GetDefaultAsync().get();
+    if (!adapter) {
+      result->Error("no_adapter", "Bluetooth adapter unavailable.");
+      return;
+    }
+    if (!adapter.IsPeripheralRoleSupported()) {
+      result->Error(
+          "peripheral_unsupported",
+          "This Bluetooth adapter does not support BLE peripheral / GATT server.");
+      return;
+    }
+
+    const std::string service_uuid_str = GuidToCanonicalString(kAirShareServiceGuid);
+    {
+      const std::wstring wlog =
+          L"[AirShareNative] Creating GattServiceProvider with canonical UUID " +
+          std::wstring(service_uuid_str.begin(), service_uuid_str.end()) + L"\n";
+      OutputDebugStringW(wlog.c_str());
+    }
+
+    auto async = GattServiceProvider::CreateAsync(kAirShareServiceGuid);
     auto provider_result = async.get();
     if (provider_result.Error() != BluetoothError::Success) {
       result->Error("gatt_provider_failed", "Unable to create GATT service provider.");
@@ -979,7 +1114,7 @@ void FlutterWindow::StartHubAdvertising(
 
     auto char_result =
         gatt_provider_.Service()
-            .CreateCharacteristicAsync(winrt::guid(kHandshakeUuid), params)
+            .CreateCharacteristicAsync(kHandshakeGuid, params)
             .get();
     if (char_result.Error() != BluetoothError::Success) {
       result->Error("gatt_characteristic_failed",
@@ -1031,7 +1166,7 @@ void FlutterWindow::StartHubAdvertising(
     endpoint_params.UserDescription(L"Hub endpoint");
     auto endpoint_result =
         gatt_provider_.Service()
-            .CreateCharacteristicAsync(winrt::guid(kEndpointUuid), endpoint_params)
+            .CreateCharacteristicAsync(kEndpointGuid, endpoint_params)
             .get();
     if (endpoint_result.Error() != BluetoothError::Success) {
       result->Error("gatt_characteristic_failed",
@@ -1147,11 +1282,29 @@ void FlutterWindow::StartHubAdvertising(
           L"[AirShareNative] BLE adv verify: name check skipped.\n");
     }
 
+    gatt_adv_status_token_ = gatt_provider_.AdvertisementStatusChanged(
+        [](GattServiceProvider const&,
+           GattServiceProviderAdvertisementStatusChangedEventArgs const& args) {
+          const std::wstring msg =
+              L"[AirShareNative] GATT advertisement status=" +
+              std::to_wstring(static_cast<int>(args.Status())) + L" error=" +
+              std::to_wstring(static_cast<int>(args.Error())) + L"\n";
+          OutputDebugStringW(msg.c_str());
+        });
+
+    // Both flags required so WinRT includes the 128-bit service UUID in the
+    // primary advertisement (best-effort within the 31-byte legacy PDU).
     GattServiceProviderAdvertisingParameters adv_params;
     adv_params.IsConnectable(true);
     adv_params.IsDiscoverable(true);
-    OutputDebugStringW(
-        L"[AirShareNative] Starting GATT advertising with primary packet carrying service UUID 6E400001-B5A3-F393-E0A9-E50E24DCCA9E.\n");
+    {
+      const std::wstring wlog =
+          L"[AirShareNative] Starting GATT advertising with primary packet "
+          L"carrying service UUID " +
+          std::wstring(service_uuid_str.begin(), service_uuid_str.end()) +
+          L".\n";
+      OutputDebugStringW(wlog.c_str());
+    }
     gatt_provider_.StartAdvertising(adv_params);
     is_advertising_ = true;
     OutputDebugStringW(L"[AirShareNative] Hub BLE advertising started (GATT server).\n");
@@ -1172,6 +1325,10 @@ void FlutterWindow::StopHubAdvertising(
 void FlutterWindow::StopHubAdvertisingInternal() {
   CancelApprovalTimeout();
   ClearPendingReadState();
+  if (gatt_provider_ && gatt_adv_status_token_) {
+    gatt_provider_.AdvertisementStatusChanged(*gatt_adv_status_token_);
+  }
+  gatt_adv_status_token_.reset();
   if (gatt_handshake_ && handshake_read_token_) {
     gatt_handshake_.ReadRequested(*handshake_read_token_);
   }
@@ -1207,6 +1364,14 @@ void FlutterWindow::ApproveConnection(
     return;
   }
   const bool approved = std::get<bool>(approved_it->second);
+
+  // Apply approve-time lan_ip before sealing the ServerHello (matches Android).
+  std::string lan_from_dart;
+  if (TryGetEncodableString(args, "lanIp", &lan_from_dart) ||
+      TryGetEncodableString(args, "lan_ip", &lan_from_dart)) {
+    ApplyLanIpFromDart(lan_from_dart, "approveConnection");
+  }
+
   if (!approved) {
     CancelApprovalTimeout();
     try {
@@ -1240,6 +1405,29 @@ void FlutterWindow::ApproveConnection(
       return;
     }
     const auto buffer = BuildHandshakeBuffer();
+    {
+      winrt::Windows::Storage::Streams::DataReader preview_reader =
+          winrt::Windows::Storage::Streams::DataReader::FromBuffer(buffer);
+      const uint32_t len = preview_reader.UnconsumedBufferLength();
+      std::string preview(len, '\0');
+      if (len > 0) {
+        preview_reader.ReadBytes(winrt::array_view<uint8_t>(
+            reinterpret_cast<uint8_t*>(preview.data()), len));
+      }
+      std::string log_preview = preview;
+      if (log_preview.size() > 220) {
+        log_preview = log_preview.substr(0, 220) + "...";
+      }
+      OutputDebugStringW(
+          (L"[AirShareNative] ServerHello release JSON: " +
+           std::wstring(log_preview.begin(), log_preview.end()) + L"\n")
+              .c_str());
+      if (ExtractJsonStringField("lan_ip", preview).empty() &&
+          pending_lan_ip_.empty() && pending_hub_ip_.empty()) {
+        OutputDebugStringW(
+            L"[AirShareNative] WARNING: ServerHello has empty lan_ip/hubIp.\n");
+      }
+    }
     pending_read_request_.RespondWithValue(buffer);
     if (pending_read_deferral_) {
       pending_read_deferral_.Complete();
@@ -1257,6 +1445,23 @@ void FlutterWindow::ApproveConnection(
   result->Success(flutter::EncodableValue());
 }
 
+void FlutterWindow::ApplyLanIpFromDart(const std::string& lan_ip,
+                                       const char* reason) {
+  std::string trimmed = lan_ip;
+  TrimAsciiWhitespace(trimmed);
+  if (trimmed.empty()) {
+    return;
+  }
+  pending_lan_ip_ = trimmed;
+  // Keep legacy hubIp in sync for endpoint characteristic + older guests.
+  pending_hub_ip_ = trimmed;
+  const std::wstring msg =
+      L"[AirShareNative] ApplyLanIpFromDart(" +
+      std::wstring(reason, reason + std::strlen(reason)) + L"): " +
+      std::wstring(trimmed.begin(), trimmed.end()) + L"\n";
+  OutputDebugStringW(msg.c_str());
+}
+
 void FlutterWindow::UpdateHubEndpoint(
     const flutter::EncodableMap& args,
     flutter::MethodResult<flutter::EncodableValue>* result) {
@@ -1266,13 +1471,89 @@ void FlutterWindow::UpdateHubEndpoint(
     return;
   }
   const auto port_it = args.find(flutter::EncodableValue("port"));
-  pending_hub_ip_ = std::get<std::string>(ip_it->second);
+  std::string ip;
+  try {
+    ip = std::get<std::string>(ip_it->second);
+  } catch (...) {
+    result->Error("invalid_endpoint", "ip must be a string.");
+    return;
+  }
+  ApplyLanIpFromDart(ip, "updateHubEndpoint");
   if (port_it != args.end()) {
     if (const auto p = std::get_if<int>(&port_it->second)) {
       pending_hub_port_ = *p;
     } else if (const auto p64 = std::get_if<int64_t>(&port_it->second)) {
       pending_hub_port_ = static_cast<int>(*p64);
     }
+  }
+  result->Success(flutter::EncodableValue());
+}
+
+void FlutterWindow::UpdateConnectionEndpoints(
+    const flutter::EncodableMap& args,
+    flutter::MethodResult<flutter::EncodableValue>* result) {
+  std::string lan_ip;
+  if (TryGetEncodableString(args, "lanIp", &lan_ip) ||
+      TryGetEncodableString(args, "lan_ip", &lan_ip)) {
+    ApplyLanIpFromDart(lan_ip, "updateConnectionEndpoints");
+  }
+
+  std::string value;
+  if (TryGetEncodableString(args, "p2pIp", &value) ||
+      TryGetEncodableString(args, "p2p_ip", &value)) {
+    TrimAsciiWhitespace(value);
+    if (!value.empty()) {
+      pending_p2p_ip_ = value;
+    }
+  }
+  if (TryGetEncodableString(args, "p2pMac", &value) ||
+      TryGetEncodableString(args, "p2p_mac", &value)) {
+    TrimAsciiWhitespace(value);
+    if (!value.empty()) {
+      pending_p2p_mac_ = value;
+    }
+  }
+  if (TryGetEncodableString(args, "hotspotSsid", &value) ||
+      TryGetEncodableString(args, "hotspot_ssid", &value)) {
+    TrimAsciiWhitespace(value);
+    pending_hotspot_ssid_ = value;
+    pending_ssid_ = value;
+  }
+  if (TryGetEncodableString(args, "hotspotPass", &value) ||
+      TryGetEncodableString(args, "hotspot_pass", &value)) {
+    TrimAsciiWhitespace(value);
+    pending_hotspot_pass_ = value;
+    pending_password_ = value;
+  }
+  if (TryGetEncodableString(args, "hotspotHubIp", &value) ||
+      TryGetEncodableString(args, "hotspot_hub_ip", &value)) {
+    TrimAsciiWhitespace(value);
+    if (!value.empty()) {
+      pending_hotspot_hub_ip_ = value;
+    }
+  }
+  if (TryGetEncodableString(args, "tlsCertSha256", &value) ||
+      TryGetEncodableString(args, "tls_cert_sha256", &value)) {
+    TrimAsciiWhitespace(value);
+    pending_tls_cert_sha256_ = value;
+  }
+  int port = 0;
+  if (TryGetEncodableInt(args, "hubPort", &port) ||
+      TryGetEncodableInt(args, "hub_port", &port)) {
+    pending_hub_port_ = port;
+  }
+
+  {
+    const std::wstring msg =
+        L"[AirShareNative] updateConnectionEndpoints: lan_ip=" +
+        std::wstring(pending_lan_ip_.begin(), pending_lan_ip_.end()) +
+        L" p2p_ip=" +
+        std::wstring(pending_p2p_ip_.begin(), pending_p2p_ip_.end()) +
+        L" hotspot_hub_ip=" +
+        std::wstring(pending_hotspot_hub_ip_.begin(),
+                     pending_hotspot_hub_ip_.end()) +
+        L" hub_port=" + std::to_wstring(pending_hub_port_) + L"\n";
+    OutputDebugStringW(msg.c_str());
   }
   result->Success(flutter::EncodableValue());
 }
@@ -1355,14 +1636,64 @@ std::string FlutterWindow::ResolveGuestDisplayName(
 }
 
 winrt::Windows::Storage::Streams::IBuffer FlutterWindow::BuildHandshakeBuffer() const {
-  std::ostringstream oss;
-  oss << "{\"ssid\":\"" << pending_ssid_ << "\",\"password\":\"" << pending_password_
-      << "\",\"hubIp\":\"" << pending_hub_ip_ << "\",\"hubPort\":" << pending_hub_port_;
-  if (!pending_friendly_name_.empty()) {
-    oss << ",\"friendly_name\":\"" << pending_friendly_name_ << "\"";
+  // Match Android/iOS ServerHello: explicit lan_ip (never rely on hubIp alias).
+  std::string lan = pending_lan_ip_;
+  TrimAsciiWhitespace(lan);
+  const std::string p2p = pending_p2p_ip_;
+  const std::string ssid = pending_hotspot_ssid_.empty() ? pending_ssid_
+                                                        : pending_hotspot_ssid_;
+  const std::string password = pending_hotspot_pass_.empty()
+                                   ? pending_password_
+                                   : pending_hotspot_pass_;
+  const std::string p2p_mac = pending_p2p_mac_;
+  const std::string hotspot_hub = pending_hotspot_hub_ip_;
+
+  if (lan.empty()) {
+    std::string hub_fallback = pending_hub_ip_;
+    TrimAsciiWhitespace(hub_fallback);
+    // Only promote hubIp → lan_ip when no hotspot credentials (same as Android).
+    if (!hub_fallback.empty() && ssid.empty()) {
+      lan = hub_fallback;
+    }
   }
-  oss << "}";
+
+  const std::string primary_legacy = !lan.empty()           ? lan
+                                     : !p2p.empty()         ? p2p
+                                     : !hotspot_hub.empty() ? hotspot_hub
+                                                            : pending_hub_ip_;
+
+  std::ostringstream oss;
+  oss << '{';
+  bool first = true;
+  AppendJsonStringField(oss, &first, "lan_ip", lan);
+  AppendJsonStringField(oss, &first, "p2p_ip", p2p);
+  AppendJsonStringField(oss, &first, "p2p_mac", p2p_mac);
+  AppendJsonStringField(oss, &first, "p2pMac", p2p_mac);
+  AppendJsonStringField(oss, &first, "hotspot_ssid", ssid);
+  AppendJsonStringField(oss, &first, "hotspot_pass", password);
+  AppendJsonStringField(oss, &first, "hotspot_hub_ip", hotspot_hub);
+  AppendJsonIntField(oss, &first, "hub_port", pending_hub_port_);
+  AppendJsonStringField(oss, &first, "hubIp", primary_legacy);
+  AppendJsonIntField(oss, &first, "hubPort", pending_hub_port_);
+  if (!ssid.empty()) {
+    AppendJsonStringField(oss, &first, "ssid", ssid);
+    AppendJsonStringField(oss, &first, "password", password);
+  }
+  AppendJsonStringField(oss, &first, "friendly_name", pending_friendly_name_);
+  AppendJsonStringField(oss, &first, "tls_cert_sha256", pending_tls_cert_sha256_);
+  oss << '}';
+
   const std::string json = oss.str();
+  {
+    std::string preview = json;
+    if (preview.size() > 220) {
+      preview = preview.substr(0, 220) + "...";
+    }
+    OutputDebugStringW(
+        (L"[AirShareNative] Handshake JSON built | " +
+         std::wstring(preview.begin(), preview.end()) + L"\n")
+            .c_str());
+  }
   winrt::Windows::Storage::Streams::DataWriter writer;
   writer.WriteString(winrt::to_hstring(json));
   return writer.DetachBuffer();
@@ -1446,7 +1777,7 @@ void FlutterWindow::PublishDiscoveredPeers() {
         {flutter::EncodableValue("friendlyName"),
          flutter::EncodableValue(peer.second)},
         {flutter::EncodableValue("serviceUuid"),
-         flutter::EncodableValue("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")},
+         flutter::EncodableValue(kAirShareServiceUuidUtf8)},
     }));
   }
   DispatchToPlatformThread([this, peers = std::move(peers)]() mutable {
@@ -1456,9 +1787,31 @@ void FlutterWindow::PublishDiscoveredPeers() {
 }
 
 bool FlutterWindow::IsAirShareService(const std::vector<winrt::guid>& uuids) const {
-  const auto target = winrt::guid(kAirShareServiceUuid);
+  const auto& target = kAirShareServiceGuid;
+  const auto bswap32 = [](uint32_t v) -> uint32_t {
+    return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
+           ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
+  };
+  const auto bswap16 = [](uint16_t v) -> uint16_t {
+    return static_cast<uint16_t>(((v & 0x00FFu) << 8) | ((v & 0xFF00u) >> 8));
+  };
   for (const auto& uuid : uuids) {
-    if (uuid == target) return true;
+    if (uuid == target) {
+      return true;
+    }
+    // Defensive: also accept a Data1/2/3 byte-swapped variant in case a peer
+    // published from a raw little-endian wire buffer without GUID remapping.
+    const winrt::guid swapped{bswap32(uuid.Data1), bswap16(uuid.Data2),
+                              bswap16(uuid.Data3),
+                              {uuid.Data4[0], uuid.Data4[1], uuid.Data4[2],
+                               uuid.Data4[3], uuid.Data4[4], uuid.Data4[5],
+                               uuid.Data4[6], uuid.Data4[7]}};
+    if (swapped == target) {
+      OutputDebugStringW(
+          L"[AirShareNative] Matched AirShare UUID via endianness-swapped "
+          L"Data1/2/3 (peer likely published raw BLE bytes as GUID).\n");
+      return true;
+    }
   }
   return false;
 }
